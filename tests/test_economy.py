@@ -640,7 +640,10 @@ def test_sim_tick_refreshes_economy_before_asking_the_model():
     """取数必须发生在活动决策之前，否则这一轮的提示词拿不到「手头紧」。"""
 
     async def run():
-        module, plugin, host = _make_plugin()
+        # skip_when_forced 默认开启，新状态未满最短停留期时会整轮跳过模型提问，
+        # _ask_activity 根本不会被调（那是插件省调用的正确行为，不是缺陷）。
+        # 本测试要验证的是「取数 → 决策」的先后顺序，必须把跳过关掉。
+        module, plugin, host = _make_plugin(activity={"llm": {"skip_when_forced": False}})
         host.api_returns[TARGET] = budget_payload(spend=29.0)
         order: list[str] = []
 

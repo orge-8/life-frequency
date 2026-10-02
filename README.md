@@ -438,8 +438,11 @@ work_scene = "在电台值守，盯着频谱图"   # 冷启动/规则表的「�
 ```
 send.text  chat.get_all_streams  frequency.set_adjust
 frequency.get_adjust  frequency.get_current_talk_value
-maisaka.proactive.trigger  llm.generate  config.get
+maisaka.proactive.trigger  llm.generate  config.get  api.call
 ```
+
+`api.call` 只用于可选联动（经济 / 社交经历）里**只读**调用 budget-pacer / better-diary
+的公开 API；对方未安装时相应维度自动降级，不影响其余功能。
 
 ---
 
@@ -731,6 +734,10 @@ digest = await self.ctx.api.call(
 
 ## 自检与门禁
 
+这一节是**开发侧门禁，不是插件的运行时逻辑**：MaiBot 加载插件时不会执行
+`check_plugin.py` / `run_gates.py` / `tests/`。它们的运行时机是**改动 manifest 或代码之后、
+发布 / 真机部署之前**，由人手动跑一遍做回归确认（审查者也可用来复现检查）。
+
 在插件目录里跑（**SKIP ≠ PASS**）：
 
 ```bash
@@ -766,6 +773,20 @@ $env:LF_MAIBOT_SRC = "D:\repos\MaiBot"      # 或把检出放在仓库的 repos/
   **manifest 授权、真实 adapter 行为、LLM 的真实输出质量，以及「她真的变安静了」
   这类端到端效果都没有被验证过**，只有本地三道门禁绿（v1.1.1 起 L3 的随机红已修掉，
   连跑多次稳定全绿）。请按上面「故障排查」逐条手验。
+- **版本区间与宿主内部行为的适配边界**：manifest 声明 `1.2.3 ~ 1.99.99`，但**实测基线是
+  宿主 1.3.1**（L3 真值校验按该版本源码逐点对拍；版本历史里 1.3.1 / 1.3.2 的真机事故
+  修复记录也来自它）。下限另做过**源码级核对**：对照 v1.2.3 标签源码，9 项能力全部在
+  `plugin_runtime/capabilities` 注册表，单标量（`runtime.py:178`）、无 chat 静默 no-op
+  （`heartflow_manager.py:103`，`get_adjust` 对无 chat 返回 1.0）、heartflow chat 懒创建
+  与两个钩子事件的派发点逐一确认，门控公式对 1.2.3 源码 L3 真值校验 61 项全过；
+  SDK 下限 2.8.0 用**真实 SDK 包**跑满 65 项冒烟（2.8.0→2.8.2 仅有 `llm.py` 增量可选
+  参数）。但**没有在 1.2.3 的真实实例上端到端运行过**。插件确实依赖三条宿主**内部行为**——heartflow chat 懒创建、
+  `set_adjust` 对没有 heartflow chat 的会话**静默 no-op**、每会话只有**单一频率标量**
+  （后写覆盖先写）——这些是我们按 1.3.1 源码适配的现状，**不是宿主承诺的 API**，
+  未来版本不保证不变。设计上的兜底：写不进去时自证读回走**指数退避**（单会话最长
+  24 小时重试一次），不会反复空转 RPC，也不会把坏值写进宿主；宿主语义若真的变了，
+  最先出现的症状是 `/生活 频率` 里的「写不进去（退避中）」诊断与
+  「宿主侧实测倍率 ≠ 下发倍率」提示，而不是静默污染其它插件的倍率。
 - 门控公式（`T`、必要性系数、内容分随批次长度增长、`adjust=0` 走静默轮、
   `@` 在静默时穿透不了）都是**读源码**得到的结论，未在运行时实测。
 - **命令写法**：`/生活` 必须写在消息最前面（可以带 `@麦麦 ` 前缀、也可以是 `／生活`）。
