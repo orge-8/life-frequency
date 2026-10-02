@@ -616,7 +616,7 @@ digest = await self.ctx.api.call(
 | 面 | 结论 |
 |---|---|
 | 命令 | 双向扫描过 19 个插件的 **66 条** `@Command`：别人截胡本插件 0 条；本插件截胡别人**曾经 31 条**（`/点歌 生活`、`/卡片 生活`…），已改掉。详见下条 |
-| 命令正则 | 宿主的命令匹配是 `pattern.search()` 且**第一个命中的插件赢**（`component_query.py:665-679`），所以本插件的 `/生活` 必须锚在消息开头——否则别的命令把「生活」当参数时会被本插件整条截胡、对方命令永不执行。代价：**「生活」必须在消息最前面**（可带 `@麦麦 ` 前缀），`今天 生活 好累` 这类普通聊天不再误触。验证脚本 `compat-audit/commands.py` |
+| 命令正则 | 宿主的命令匹配是 `pattern.search()` 且**第一个命中的插件赢**（`component_query.py:665-679`），所以本插件的 `/生活` 必须锚在消息开头——否则别的命令把「生活」当参数时会被本插件整条截胡、对方命令永不执行。代价：**「生活」必须在消息最前面**（可带 `@麦麦 ` 前缀），`今天 生活 好累` 这类普通聊天不再误触。验证脚本 `compat-audit/commands.py`（作者本地工具，未随本仓库分发） |
 | `maisaka.replyer.before_request` | 只有本插件用。别的插件（bilibili-video-parser / cv_lyric_context / file-reader / character-recognizer）**全在 `before_model_request` 上改 `items`** —— 两条链、两个字段，天然不争用。宿主确实消费 `extra_prompt`（`maisaka_generator_base.py:1128-1131` 折进「额外回复要求」） |
 | `chat.receive.after_process` | 8 个插件共用，由宿主 dispatcher 串行处理，互不干扰。本插件的旁路记录是 **BLOCKING + EARLY**：blocking 一律先于 observe，而 `music-request` 是 blocking 且会 `abort`（发完音乐卡片就丢弃该消息，`bot.py:790`）——observe 模式会被它整条跳过。本插件在该 Hook 上排第 2（前面是同样 BLOCKING+EARLY 的 `cv_lyric_context`，它从不 abort） |
 | 命令链 | 静默**不影响**任何插件的命令：命令派发在 `bot.py:260-361` 的入站管线里，与 Maisaka 的回复门控完全无关。`/预算`、`/日记`、`/点歌` 在睡眠期间照常响应 |
@@ -797,9 +797,9 @@ $env:LF_MAIBOT_SRC = "D:\repos\MaiBot"      # 或把检出放在仓库的 repos/
 - **与 `budget-pacer` 的合成未做真机联调**：单标量覆盖、`get_adjust` 纯读、
   「没有 heartflow chat 就静默 no-op」、卸载时对方不自愈，这几条都是读源码 + FakeHost
   复刻验证的，没有在跑着两个插件的真实 MaiBot 上观测过。第一次上机时请开日志看几轮
-  `已把 N 个会话的频率归还给外部基数`，以及 `/生活 频率` 里的「外部基数」。`COMPAT.md`
-  附了按真机语义建模的对抗性复现脚本（`compat-audit/probe_v2.py` 等）——
-  **那些脚本在仓库根目录 `compat-audit/`，不在插件目录里**，目录级安装后无法直接复现。
+  `已把 N 个会话的频率归还给外部基数`，以及 `/生活 频率` 里的「外部基数」。按真机语义
+  建模的对抗性复现脚本（`compat-audit/probe_v2.py` 等）是作者本地的验证工具，
+  **未随本仓库分发**，目录级安装后无法直接复现。
 - **对账记忆的边界**：`life_state.json` 与 `adjust_memory.json` **同时**损坏/被删时，
   记忆彻底丢失，下一次巡检会把「外部基数 × 我们的因子」当成外部基数再乘一次
   （这是信息论上的极限，没有外部存储就无从分辨）。真发生就用 `/生活 重锚` 一次修好。
@@ -845,7 +845,7 @@ $env:LF_MAIBOT_SRC = "D:\repos\MaiBot"      # 或把检出放在仓库的 repos/
 | 1.1.3 | 私聊频率显示修正：宿主的基础频率按会话类型取键（`utils_config.py:601-608`，私聊用 `chat.reply_timing.private_talk_value`），v1.1.2 及以前一律按群聊的 `talk_value` 算，私聊卡上的「生效频率」与「纯闲聊要几条」都是错的。现在按会话类型取基础频率，并优先用宿主实测值反推显示（基础频率由宿主实测反推，避免群/私聊取错键） |
 | 1.1.2 | **真机反馈驱动的改动**：真机上 `chat.get_all_streams` 返回 41 个历史会话，加载后第一轮巡检对它们逐个写入，宿主各回一条「无法调整频率，未找到 session_id=… 的聊天流」（静默 no-op），插件要等到第二轮才发现并进退避 —— 既有日志噪音也是空转 RPC。新增 `[apply].only_active_sessions`（默认 `true`）：只干预「见过消息（`state.sessions`）或本来就在管（`applied`/`unbacked`）」的会话，冷启动不再对纯历史会话写入；会话一有消息就在下一轮（≤ `apply.interval_seconds`）被纳入。⚠ 代价：一个从未在本插件运行期间发过消息的会话，它的**第一条**消息会用未调整的宿主频率评估（睡眠/静默因此可能漏过那一两条）。想恢复旧行为把它设成 `false`。另：`/生活 状态` 与 `/生活 频率` 现在显示「写不进去（退避中）：N 个会话（最早约 X 分钟后重试）」，频率卡在「宿主侧实测倍率 ≠ 下发倍率」时给出明确诊断；「死会话退避」日志降为 `info`，连续 3 轮重试都写不进去才升级成一次 `warning` |
 | 1.1.1 | **上线前全检修复**（详见本节末的清单）：① 真机启动路径不再丢掉对账记忆（v1.1.0 会让生活倍率被乘两次且永久留存）；② 连续睡眠上限跨「生活日边界」失效（12h 实际睡成 21h）；③ 状态文件里一个坏条目不再让 `settle`/倍率同步永久抛错（`from_dict` 条目级净化 + 不抛取数）；④ `/生活 频率` 的「纯闲聊要几条」改为按整批长度算内容分（v1.1.0 印错，说 0.58/0.45 不可达，其实 13/21 条）；⑤ `filter_mode` 写错值不再静默失效（告警 + `/生活` 显示命中会话数）；⑥ L3 的随机红修掉（退避用例改比窗口长度，不再是掷骰子）；⑦ `check_plugin.py` 的 `config_version` 与 `dependencies` 两项真空检查改成 AST/类型判定；⑧ `[date].date_factors` 死配置接上（按名称覆盖节日倍率）；⑨ 裁剪守卫改为看全部记忆表 + `state.sessions` 加上界（死会话不再无限增长）；⑩ `nan/inf` 配置不再被静默接受；⑪ 提示词净化补上 `【】「」`；⑫ 裸写「生活 好累」不再被换成用法卡；⑬ `max_adjust` 不再被 `min_adjust`/`silence_floor` 击穿；⑭ 生日格式错/`sleep_window` 解析失败会告警；`*_keep=0` 语义修正、`last_tick_at` 在未来时重新锚定 |
-| 1.1.0 | 与桌面插件集做适配：与 `budget-pacer` 的倍率**乘性合成**（卸载/暂停时归还外部基数而不是写 1.0）、对账记忆单独落盘（`adjust_memory.json`）、「写不进去」的会话自证 + 指数退避、`/生活 重锚` 覆盖离范围的已记忆会话、新增 `[frequency] silence_floor`、`/生活` 正则在两个方向上都不与别的插件互相截胡、`note_session` 改 `BLOCKING+EARLY`。附全部 20 个桌面插件的审计报告 [COMPAT.md](COMPAT.md) |
+| 1.1.0 | 与桌面插件集做适配：与 `budget-pacer` 的倍率**乘性合成**（卸载/暂停时归还外部基数而不是写 1.0）、对账记忆单独落盘（`adjust_memory.json`）、「写不进去」的会话自证 + 指数退避、`/生活 重锚` 覆盖离范围的已记忆会话、新增 `[frequency] silence_floor`、`/生活` 正则在两个方向上都不与别的插件互相截胡、`note_session` 改 `BLOCKING+EARLY`。附全部 20 个桌面插件的审计报告（COMPAT.md，该文件后已移出仓库） |
 | 1.0.0 | 首个版本：作息活动（LLM）/ 情绪体力 / 身体 / 日期节日四维 → 倍率 → `frequency.set_adjust`；两套触发模式的曲线自适应；52 条事件库；主动开口（默认关闭） |
 
 ## 许可
