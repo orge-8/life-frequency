@@ -558,7 +558,7 @@ def test_nested_config_objects_become_dotted_path_sections():
         "min_interval_seconds", "fail_streak_limit", "cooldown_minutes",
         "recent_events_in_prompt", "recent_near_hours", "recent_mid_hours",
         "recent_far_days", "persona_max_chars", "skip_when_forced",
-        "recent_pick_mode", "recent_max_per_label",
+        "recent_pick_mode", "recent_max_per_label", "recent_events_keep",
     }
 
     for path in ("emotion_energy.curves.frequency", "emotion_energy.curves.necessity"):
@@ -742,6 +742,23 @@ def test_plugin_config_maps_into_sim_config():
     assert schedule.lunch_window == (720, 780)
     assert schedule.commute_minutes == 45
     assert plugin._sim_config().schedule == schedule
+
+
+def test_recent_events_keep_maps_into_sim_config():
+    """``[activity.llm] recent_events_keep`` → ``SimConfig.recent_events_keep``。
+
+    默认 300（≈ 15.9 天事件量，足够喂饱「远（14 天内）」层）；
+    负数与垃圾值夹到 0（0 = `_sweep` 不保留任何经历，语义见 `_keep_tail`）。
+    """
+
+    _module, plugin, _host = _make_plugin()
+    assert plugin._sim_config().recent_events_keep == 300
+
+    plugin.config.activity.llm.recent_events_keep = 500
+    assert plugin._sim_config().recent_events_keep == 500
+
+    plugin.config.activity.llm.recent_events_keep = -3
+    assert plugin._sim_config().recent_events_keep == 0
 
 
 def test_plugin_warns_once_on_bad_workdays():

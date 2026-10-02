@@ -266,7 +266,10 @@ class SimConfig:
 
     fire_probability: float = 0.4
     material_ttl_hours: float = 6.0
-    recent_events_keep: int = 40
+    #: 经历留存条数。与 ``[activity.llm] recent_events_keep`` 同源（plugin.py 接线），
+    #: 300 条 ≈ 15.9 天的事件量（约 18.9 条/日），足够喂饱「远（14 天内）」层；
+    #: v1.4.0 及以前固定 40 条 ≈ 2.1 天，远层永远拿不到内容。
+    recent_events_keep: int = 300
     materials_keep: int = 20
 
     birthday: str = ""
@@ -1456,8 +1459,9 @@ def recent_event_tiers(
 
     ``pick`` 决定**怎么挑**（见 ``_select_tier_items``）：默认 ``smart`` =
     显著性排序 + 标签去重 + 空层配额回收；``recent`` = v1.3.x 的旧行为，可一键回退。
-    已知限制：留存只有 ``recent_events_keep`` 条（默认 40，约 2.1 天的事件量），
-    所以「远」层在默认配置下**永远拿不到内容**——要让它名副其实得先调大留存。
+    留存条数 ``recent_events_keep`` 可配（``[activity.llm]``，默认 300 ≈ 15.9 天的
+    事件量）：v1.4.0 及以前固定 40 条（≈ 2.1 天）时「远」层永远拿不到内容，
+    调大留存即可喂饱它。
     """
 
     if limit <= 0:
