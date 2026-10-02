@@ -664,6 +664,75 @@ def test_webui_schema_override_never_breaks_the_page():
     assert schema["sections"]["activity"]["fields"], "回退后连普通字段都没了"
 
 
+def test_webui_visual_mode_shows_field_guidance_as_hints():
+    """可视化模式只渲染 label/hint/placeholder，**从不渲染 description**。
+
+    ``FieldRenderer``（``dashboard/src/routes/plugin-config.tsx:163-361``）按
+    ``ui_type`` 分支里只输出这三样；本插件所有字段的填法说明都写在 description
+    里，不抄进 hint 用户在配置页上一个字都看不到。有 description 的字段必须带
+    hint（内容与 description 一致）。
+    """
+
+    module = _load()
+    sections = _webui_schema(module)
+    missing = []
+    for section_name, section in sections.items():
+        for field_name, field in (section.get("fields") or {}).items():
+            if field.get("description") and field.get("hint") != field["description"]:
+                missing.append(f"[{section_name}] {field_name}")
+    assert missing == [], f"这些字段的说明在可视化模式下看不见：{missing}"
+
+
+def test_webui_optional_sections_collapsed_by_default():
+    """默认关闭的可选功能节默认收起：标题与说明仍可见，点开即用。
+
+    可视化模式所有节默认展开，整页十几张卡片会淹没常用配置；只收起
+    ``proactive`` / ``schedule`` / ``social`` 这三个默认关闭的集成。
+    """
+
+    module = _load()
+    sections = _webui_schema(module)
+    for name in ("proactive", "schedule", "social"):
+        assert sections[name]["collapsed"] is True, f"[{name}] 应默认收起"
+    expanded = [n for n, s in sections.items() if n not in ("proactive", "schedule", "social")
+                and s.get("collapsed")]
+    assert expanded == [], f"不该收起的节被收起了：{expanded}"
+
+
+def test_webui_free_text_fields_use_textarea():
+    """成句的自由文本字段用多行输入框（textarea 占满整行宽，比单行输入好编辑）。
+
+    ``x-widget: "textarea"`` 经 SDK 映射成 ``ui_type=textarea``；
+    ``FieldRenderer`` 的 textarea 分支用 ``rows`` 决定高度。
+    """
+
+    module = _load()
+    sections = _webui_schema(module)
+    for section_name, field_name in (
+        ("schedule", "duty"),
+        ("schedule", "work_scene"),
+        ("date", "birthday_material"),
+    ):
+        field = sections[section_name]["fields"][field_name]
+        assert field["ui_type"] == "textarea", (section_name, field_name, field["ui_type"])
+        assert field["rows"] >= 2, (section_name, field_name)
+
+
+def test_webui_enum_like_text_fields_keep_labels_short_and_hinted():
+    """枚举型 text 字段不再把可选值塞进 label（会被截断），可选值挪进 hint/placeholder。
+
+    ``filter_mode`` 的旧 label 「过滤模式（all/whitelist/blacklist）」在卡片里显示不全；
+    label 收短后，可选值由 hint（= description）与 placeholder 表达。
+    """
+
+    module = _load()
+    sections = _webui_schema(module)
+    assert sections["frequency"]["fields"]["mode_source"]["label"] == "模式来源"
+    assert sections["apply"]["fields"]["filter_mode"]["label"] == "过滤模式"
+    assert sections["apply"]["fields"]["filter_mode"]["placeholder"] == "all"
+    assert sections["activity.llm"]["fields"]["recent_pick_mode"]["placeholder"] == "smart"
+
+
 def test_plugin_config_maps_into_sim_config():
     _module, plugin, _host = _make_plugin()
     schedule = plugin._schedule_config()

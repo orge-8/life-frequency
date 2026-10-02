@@ -306,7 +306,7 @@ OLD_NINE = [
 ]
 
 
-def _make_plugin(factor_lines=None, schedule=None):
+def _make_plugin(factor_lines=None, schedule=None, factors_mode=None):
     module = _load()
     plugin = module.create_plugin()
     host = FakeHost(module.__plugin_id__, paths=FakePaths())
@@ -315,6 +315,8 @@ def _make_plugin(factor_lines=None, schedule=None):
     config["frequency"]["quiet_hours"] = []
     if factor_lines is not None:
         config["activity"]["activity_factors"] = list(factor_lines)
+    if factors_mode is not None:
+        config["activity"]["factors_mode"] = factors_mode
     if schedule is not None:
         entry = dict(config.get("schedule") or {})
         entry.update(schedule)
@@ -371,6 +373,81 @@ def test_empty_factor_table_still_falls_back_to_builtin():
     module, plugin = _make_plugin([])
     factors = plugin._factor_config().activity_factors
     assert factors == module._default_activity_factors(), "整表被清空时应整体回退内置表"
+
+
+# ================= E2. replace 模式：删除内置因子后不再补齐 =================
+
+
+def test_replace_mode_keeps_deleted_builtin_deleted():
+    """replace 模式：删掉的内置因子保持删除（该活动按 1.0），缺键只告警不补齐。
+
+    merge 模式（默认）会把删掉的行按内置默认填回来——防的是升级丢因子与手滑；
+    用户显式切到 replace 就是声明「这张表是整张表」，删除必须生效。
+    """
+
+    module, plugin = _make_plugin(OLD_NINE, factors_mode="replace")
+    with _Capture(module) as cap:
+        factors = plugin._factor_config().activity_factors
+        first = cap.warnings()
+        plugin._factor_config()
+        second = cap.warnings()
+
+    assert "work" not in factors, "replace 模式下被删的内置因子不该被补回来"
+    assert "commute" not in factors and "overtime" not in factors
+    assert factors["music"] == pytest.approx(0.9), "留下的行要原样生效"
+    assert any("work" in msg and "commute" in msg for msg in first), first
+    assert "不再补齐" in first[0] or "按 1.0" in first[0], first[0]
+    assert len(second) == len(first), f"缺键提醒不该每轮刷：{second}"
+
+
+def test_replace_mode_flags_missing_sleep_hard_gate():
+    """replace 模式删掉 sleep=0：睡觉不再静音，这是硬闸，必须单独点名。"""
+
+    module, plugin = _make_plugin(
+        [line for line in OLD_NINE if not line.startswith("sleep=")],
+        factors_mode="replace",
+    )
+    with _Capture(module) as cap:
+        factors = plugin._factor_config().activity_factors
+    assert "sleep" not in factors
+    joined = " | ".join(cap.warnings())
+    assert "睡觉" in joined and "静音" in joined, cap.warnings()
+
+
+def test_replace_mode_empty_table_is_all_neutral_not_defaults():
+    """replace + 空表 = 用户明确的「全部按 1.0」，不许落回内置表（merge 才回退）。"""
+
+    module, plugin = _make_plugin([], factors_mode="replace")
+    with _Capture(module) as cap:
+        factors = plugin._factor_config().activity_factors
+    assert factors == {}
+    assert any("列表为空" in msg for msg in cap.warnings()), cap.warnings()
+
+
+def test_unknown_factors_mode_falls_back_to_merge():
+    module, plugin = _make_plugin(OLD_NINE, factors_mode="bogus")
+    with _Capture(module) as cap:
+        factors = plugin._factor_config().activity_factors
+    assert factors["work"] == pytest.approx(0.75), "未知模式应按 merge 补齐"
+    assert any("merge/replace" in msg for msg in cap.warnings()), cap.warnings()
+
+
+def test_replace_mode_deleted_activity_is_neutral_at_compute():
+    """端到端：replace 模式删掉 work=0.75 后，work 与 daily 的倍率一致（因子 1.0）。"""
+
+    from life_factors import FactorConfig, compute_adjust
+
+    module, plugin = _make_plugin(OLD_NINE, factors_mode="replace")
+    factors = plugin._factor_config().activity_factors
+
+    def adjust_with(activity: str) -> float:
+        return compute_adjust(
+            activity=activity, emotion=5.0, energy=5.0, sick=False, sleep_debt_nights=0,
+            date_factor=1.0, material_count=0, now_minutes=12 * 60,
+            config=FactorConfig(activity_factors=factors),
+        ).adjust
+
+    assert adjust_with(A.WORK) == pytest.approx(adjust_with(A.DAILY))
 
 
 # ================= F. 行为：在岗真的比日常更安静 =================

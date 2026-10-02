@@ -476,6 +476,7 @@ class ActivityLLMConfig(PluginConfigBase):
     )
     temperature: float = Field(
         default=0.8,
+        description="采样温度；越高越发散、越低越稳定（0 ≈ 确定）。参考设定 0.8",
         json_schema_extra={"label": "温度", "order": 1, "step": 0.1},
     )
     max_tokens: int = Field(
@@ -561,7 +562,7 @@ class ActivityLLMConfig(PluginConfigBase):
         json_schema_extra={
             "label": "经历挑法",
             "order": 13,
-            "options": ["smart", "recent"],
+            "placeholder": "smart",
         },
     )
     recent_max_per_label: int = Field(
@@ -618,12 +619,12 @@ class ScheduleConfigModel(PluginConfigBase):
     duty: str = Field(
         default="",
         description="岗位/职责，写进活动提示词（例如「共鸣电台无线电技术员：观测共鸣、搜集与推送歌曲」）；留空则不提工作内容",
-        json_schema_extra={"label": "岗位/职责", "order": 5, "rows": 2},
+        json_schema_extra={"label": "岗位/职责", "order": 5, "rows": 2, "x-widget": "textarea"},
     )
     work_scene: str = Field(
         default="",
         description="冷启动 / 规则表在「在岗」相位使用的场景文本；留空用通用的「在工作」",
-        json_schema_extra={"label": "在岗场景（可选）", "order": 6},
+        json_schema_extra={"label": "在岗场景（可选）", "order": 6, "rows": 2, "x-widget": "textarea"},
     )
 
 
@@ -666,7 +667,11 @@ class ActivityConfig(PluginConfigBase):
     )
     activity_factors: list[str] = Field(
         default_factory=lambda: list(DEFAULT_ACTIVITY_FACTOR_LINES),
-        description='活动 → 频率因子，每行一组 "活动=因子"；缺键会按内置默认补齐并告警',
+        description=(
+            '活动 → 频率因子，每行一组 "活动=因子"。merge 模式（默认）缺键按内置'
+            "默认补齐并告警；replace 模式以本列表为准——删掉某个内置因子后它保持"
+            "删除，该活动按 1.0。注意 sleep=0 是「睡觉即静音」的硬闸，删掉前想清楚"
+        ),
         json_schema_extra={
             "label": "活动因子（每行一组）",
             "order": 5,
@@ -674,10 +679,20 @@ class ActivityConfig(PluginConfigBase):
             "placeholder": "music=0.9",
         },
     )
+    factors_mode: str = Field(
+        default="merge",
+        description=(
+            "活动因子表的模式：merge = 配置与内置默认合并，缺的键按内置补齐并告警"
+            "（防升级丢因子、防手滑删行）；replace = 以本列表为准、不再与内置合并——"
+            "删掉的内置因子保持删除，该活动按 1.0，内置有而列表没写的键会告警提醒"
+            "一次。填其它值按 merge 处理"
+        ),
+        json_schema_extra={"label": "因子表模式", "order": 6, "placeholder": "merge"},
+    )
     llm: ActivityLLMConfig = Field(
         default_factory=ActivityLLMConfig,
         description="活动决策的模型调用参数；留空 task_name 走宿主的默认插件任务",
-        json_schema_extra={"label": "活动模型调用参数", "order": 6},
+        json_schema_extra={"label": "活动模型调用参数", "order": 7},
     )
 
     _norm_activity_factors = _str_list_validator("activity_factors")
@@ -768,7 +783,7 @@ class FrequencyConfig(PluginConfigBase):
     mode_source: str = Field(
         default="auto",
         description="auto = 读宿主的 reply_trigger_mode 自动选曲线；也可强制 frequency / reply_necessity",
-        json_schema_extra={"label": "模式来源（auto/...）", "order": 0, "placeholder": "auto"},
+        json_schema_extra={"label": "模式来源", "order": 0, "placeholder": "auto"},
     )
     max_adjust: float = Field(
         default=2.0,
@@ -898,7 +913,7 @@ class DateConfig(PluginConfigBase):
     birthday_material: str = Field(
         default="今天是我生日",
         description="生日当天产出的「想跟你说的素材」",
-        json_schema_extra={"label": "生日素材", "order": 3},
+        json_schema_extra={"label": "生日素材", "order": 3, "rows": 2, "x-widget": "textarea"},
     )
     festivals: list[str] = Field(
         default_factory=list,
@@ -925,12 +940,13 @@ class EventsConfig(PluginConfigBase):
     extra: list[str] = Field(
         default_factory=list,
         description='追加/覆盖事件，每行 "标签|activities=..|emotion=..|energy=..|weight=..|material=..|ttl=.."',
-        json_schema_extra={"label": "追加事件（每行一组）", "order": 0, "rows": 3},
+        json_schema_extra={"label": "追加事件（每行一组）", "order": 0, "rows": 3,
+                           "placeholder": "期中考试|activities=sleep|emotion=-1|energy=-1"},
     )
     disabled: list[str] = Field(
         default_factory=list,
         description="要停用的事件标签",
-        json_schema_extra={"label": "停用事件标签", "order": 1, "rows": 2},
+        json_schema_extra={"label": "停用事件标签", "order": 1, "rows": 2, "placeholder": "加班"},
     )
     fire_probability: float = Field(
         default=0.4,
@@ -966,7 +982,7 @@ class ApplyConfig(PluginConfigBase):
     filter_mode: str = Field(
         default="all",
         description="all = 所有会话；whitelist = 只在 target_chats 里；blacklist = 排除 target_chats",
-        json_schema_extra={"label": "过滤模式（all/whitelist/blacklist）", "order": 2},
+        json_schema_extra={"label": "过滤模式", "order": 2, "placeholder": "all"},
     )
     target_chats: list[str] = Field(
         default_factory=list,
@@ -1045,7 +1061,8 @@ class ProactiveConfigModel(PluginConfigBase):
     quiet_hours: list[str] = Field(
         default_factory=lambda: list(DEFAULT_PROACTIVE_QUIET_LINES),
         description='主动开口的静默时段，每行 "HH:MM-HH:MM"',
-        json_schema_extra={"label": "静默时段（每行一组）", "order": 6, "rows": 2},
+        json_schema_extra={"label": "静默时段（每行一组）", "order": 6, "rows": 2,
+                           "placeholder": "23:30-08:00"},
     )
 
     _norm_proactive_quiet = _str_list_validator("quiet_hours")
@@ -1080,7 +1097,8 @@ class SecurityConfig(PluginConfigBase):
     admin_ids: list[str] = Field(
         default_factory=list,
         description='管理员 QQ，每行一个。留空 = 只有本机控制台操作者能改状态（fail-closed）',
-        json_schema_extra={"label": "管理员 QQ（每行一个）", "order": 0, "rows": 3},
+        json_schema_extra={"label": "管理员 QQ（每行一个）", "order": 0, "rows": 3,
+                           "placeholder": "123456"},
     )
 
     _norm_admin_ids = _str_list_validator("admin_ids")
@@ -1538,7 +1556,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         schema = super().get_webui_config_schema(**kwargs)
         try:
-            return _promote_nested_config_sections(schema, type(self).get_config_model())
+            promoted = _promote_nested_config_sections(schema, type(self).get_config_model())
+            return _apply_webui_display_polish(promoted)
         except Exception:  # noqa: BLE001 —— 渲染修正失败绝不能让配置页变空白
             logger.exception("修正 WebUI 配置 Schema 失败，回退 SDK 原样输出")
             return schema
@@ -1765,10 +1784,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             date_factor_overrides=dict(getattr(self, "_date_factor_overrides", {}) or {}),
         )
 
-    def _fill_missing_activity_factors(self, factors: dict[str, float]) -> dict[str, float]:
-        """活动因子表缺键时按内置默认补齐，并告警一次。
+    def _fill_missing_activity_factors(
+        self, factors: dict[str, float], mode: str
+    ) -> dict[str, float]:
+        """按 ``[activity] factors_mode`` 处理活动因子表的缺键。
 
-        两个真实场景：
+        **merge（默认）**：缺键按内置默认补齐，并告警一次。防两个真实场景——
 
         1. **升级**：`config.toml` 是 v1.3.0 之前生成的，里面只有 9 个学生作息因子。
            新加的工作表活动（`work` / `commute` / …）不在表里 ⇒ `compute_adjust` 的
@@ -1778,11 +1799,39 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         所以这里回填内置默认值，并明确告诉用户补了哪些键——显式配置永远优先，
         想让她某个活动按 1.0 就写 `x=1.0`。
+
+        **replace**：以配置列表为准，**不再补齐**——用户删掉的内置因子保持删除，
+        对应活动按 1.0。但内置有而列表缺的键要告警提醒一次：一是防手滑，二是防
+        未来版本新增活动在本模式下静默失效。其中 `sleep` 因子是「睡觉即静音」的
+        硬闸，缺失时单独点名强提醒；空表同理。
         """
 
+        defaults = _default_activity_factors()
+
+        if mode == "replace":
+            if not factors:
+                self._warn_once(
+                    "activity_factor_replace_empty",
+                    "⚠ 因子表模式为 replace 且列表为空：所有活动都按 1.0 处理，"
+                    "**包括 sleep——她睡觉将不再静音**。确认是有意为之可忽略；"
+                    "想恢复请把因子行加回 [activity] activity_factors",
+                )
+                return {}
+            absent = [key for key in defaults if key not in factors]
+            if absent:
+                hard = "sleep" in absent
+                self._warn_once(
+                    "activity_factor_replace_absent",
+                    "因子表模式为 replace：内置活动 %s 没有因子，将按 1.0 处理%s"
+                    "（确认是有意删除可忽略；想恢复请把它们加回 [activity] activity_factors）",
+                    "、".join(absent),
+                    "；**其中 sleep 缺失意味着她睡觉不再静音**" if hard else "",
+                )
+            return factors
+
+        # merge
         if not factors:
             return factors  # 整表为空 ⇒ 调用方会整体回退内置表
-        defaults = _default_activity_factors()
         missing = [key for key in ALLOWED_ACTIVITIES if key not in factors and key in defaults]
         if not missing:
             return factors
@@ -1792,7 +1841,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         self._warn_once(
             "activity_factor_missing",
             "活动因子表缺少 %s 的因子，已按内置默认补齐（%s）；"
-            "想自定义请在 [activity] activity_factors 里显式写出，想保持中性就写 x=1.0",
+            "想自定义请在 [activity] activity_factors 里显式写出，想保持中性就写 x=1.0；"
+            "想彻底删除某项请把 [activity] factors_mode 设为 replace",
             "、".join(missing),
             "、".join(f"{key}={defaults[key]}" for key in missing),
         )
@@ -1801,6 +1851,14 @@ class LifeFrequencyPlugin(MaiBotPlugin):
     def _factor_config(self) -> FactorConfig:
         """配置 → ``FactorConfig``（含两套曲线与静默时段）。"""
 
+        raw_mode = str(self.config.activity.factors_mode or "merge").strip().lower()
+        if raw_mode not in ("merge", "replace"):
+            self._warn_once(
+                "activity_factor_mode_invalid",
+                "factors_mode=%r 不是合法值（可选 merge/replace），已按 merge 处理",
+                self.config.activity.factors_mode,
+            )
+            raw_mode = "merge"
         activity_factors, activity_warnings = parse_factor_lines(
             self.config.activity.activity_factors,
             known_keys=ALLOWED_ACTIVITIES,
@@ -1808,7 +1866,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         )
         for item in activity_warnings:
             self._warn_once(f"activity_factor:{item}", "活动因子告警：%s", item)
-        activity_factors = self._fill_missing_activity_factors(activity_factors)
+        activity_factors = self._fill_missing_activity_factors(activity_factors, raw_mode)
         health_factors, health_warnings = parse_factor_lines(
             self.config.health.health_factors,
             known_keys=("healthy", "cold", "sleep_deprived"),
@@ -1819,8 +1877,13 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         curves = self.config.emotion_energy.curves
         min_adjust, max_adjust, silence_floor = self._checked_adjust_bounds()
+        # replace 模式下空表是用户明确的「全部按 1.0」，不能落回内置表
+        if raw_mode == "replace":
+            factor_table = dict(activity_factors)
+        else:
+            factor_table = activity_factors or _default_activity_factors()
         return FactorConfig(
-            activity_factors=activity_factors or _default_activity_factors(),
+            activity_factors=factor_table,
             health_factors=health_factors or _default_health_factors(),
             curves_frequency=self._curve_set(curves.frequency),
             curves_necessity=self._curve_set(curves.necessity),
@@ -4090,6 +4153,33 @@ def _resolve_nested_class(root_class: Any, section_path: str, field_name: str) -
             return None
         current = nested
     return _field_annotation_model(current, field_name)
+
+
+#: 默认折叠的 section：默认关闭的可选功能。可视化模式下所有节默认展开，
+#: 整页十几张卡片全开会淹没常用的配置；这三节的标题自带「默认关闭」，
+#: 收起后标题与说明仍然可见，点开即可启用。
+_WEBUI_COLLAPSED_SECTIONS = frozenset({"proactive", "schedule", "social"})
+
+
+def _apply_webui_display_polish(schema: dict[str, Any]) -> dict[str, Any]:
+    """WebUI 可视化模式的显示层补丁（只改展示元数据，不碰任何配置键）。
+
+    为什么要把 description 抄进 hint：可视化模式的 ``FieldRenderer``
+    （``dashboard/src/routes/plugin-config.tsx:163-361``）按 ``ui_type``
+    渲染控件时**只输出 label / hint / placeholder，从不渲染 description**——
+    而本插件全部字段的填法说明都写在 description 里，不搬进 hint，
+    用户在配置页上一个字都看不到（源代码模式才见得到）。
+    """
+
+    for section in (schema.get("sections") or {}).values():
+        if not isinstance(section, dict):
+            continue
+        if section.get("name") in _WEBUI_COLLAPSED_SECTIONS:
+            section["collapsed"] = True
+        for field in (section.get("fields") or {}).values():
+            if isinstance(field, dict) and not field.get("hint") and field.get("description"):
+                field["hint"] = field["description"]
+    return schema
 
 
 # ---------------------------------------------------------------- 默认因子表
