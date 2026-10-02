@@ -1,0 +1,6 @@
+/config.toml
+__pycache__/
+data/
+*.pyc
+.pytest_cache/
+.maibot-release.json
