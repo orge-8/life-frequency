@@ -450,8 +450,7 @@ maisaka.proactive.trigger  llm.generate  config.get  api.call
 
 MaiBot 里**每个会话只有一个频率倍率标量**（`runtime.py:183` 的 `_talk_frequency_adjust`），
 `frequency.set_adjust` 是**后写覆盖先写**，宿主不提供任何仲裁或 provider 机制。
-所以只要还有别的插件写它，就会互相抹掉。本插件对桌面上的 19 个可运行插件
-（外加 1 个备份目录）做过逐项审计（结论见 [COMPAT.md](COMPAT.md)），真正需要处理的只有两条：
+所以只要还有别的插件写它，就会互相抹掉。真正需要处理的只有两条：
 
 ### 1. 与 `budget-pacer` 乘性合成（默认开启）
 
