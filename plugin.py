@@ -575,6 +575,17 @@ class ActivityLLMConfig(PluginConfigBase):
         ),
         json_schema_extra={"label": "每层同标签上限", "order": 14, "step": 1},
     )
+    recent_events_keep: int = Field(
+        default=300,
+        description=(
+            "状态文件里保留多少条「近期经历」（事件库与社交经历共用这个池子），"
+            "提示词的近/中/远三层都从这里取。按事件约 18.9 条/日估算：300 条 ≈ 15.9 天，"
+            "足够喂饱「远（14 天内）」层——v1.4.0 及以前固定 40 条 ≈ 2.1 天，"
+            "远层永远拿不到内容。0 = 不保留任何经历（近层也会跟着空）。"
+            "调大只多占一点状态文件空间（每条约 0.2KB），不影响倍率"
+        ),
+        json_schema_extra={"label": "经历留存条数", "order": 15, "step": 10},
+    )
 
 
 class ScheduleConfigModel(PluginConfigBase):
@@ -1776,6 +1787,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             cold_sleep_debt_risk=max(0.0, min(1.0, float(health.cold_sleep_debt_risk))),
             fire_probability=max(0.0, min(1.0, float(events.fire_probability))),
             material_ttl_hours=max(0.5, float(events.material_ttl_hours)),
+            recent_events_keep=max(0, int(activity.llm.recent_events_keep)),
             birthday=str(date.birthday or ""),
             birthday_factor=max(0.2, min(5.0, float(date.birthday_factor))),
             birthday_emotion=max(-5.0, min(5.0, float(date.birthday_emotion))),
