@@ -244,6 +244,9 @@ class SimConfig:
     min_awake_hours_per_day: float = 8.0
     min_dwell_minutes: int = 60
     min_sleep_minutes: int = 180
+    #: 睡眠中体力恢复到上限且睡满最短时长就强制唤醒（「睡觉的目的是恢复体力，
+    #: 满了继续睡只是空转」）。默认开；关掉则回到「模型提议醒 / 睡满每日上限」两条路。
+    energy_full_wake: bool = True
 
     inertia_minutes: int = 40
     recover_per_tick: float = 0.2
@@ -266,6 +269,11 @@ class SimConfig:
 
     fire_probability: float = 0.4
     material_ttl_hours: float = 6.0
+    #: 素材「最佳保鲜相位」（G2）：TTL 的前 `material_best_ratio` 段是全额权重，
+    #: 之后线性衰减到 `material_decay_floor`、到过期触底——衰减而非清零，让放旧的
+    #: 念头自然排到候选队尾。ratio=1 或 floor=1 都退回「全额到过期」的旧行为。
+    material_best_ratio: float = 0.5
+    material_decay_floor: float = 0.25
     #: 经历留存条数。与 ``[activity.llm] recent_events_keep`` 同源（plugin.py 接线），
     #: 300 条 ≈ 15.9 天的事件量（约 18.9 条/日），足够喂饱「远（14 天内）」层；
     #: v1.4.0 及以前固定 40 条 ≈ 2.1 天，远层永远拿不到内容。
@@ -301,6 +309,7 @@ def build_enforce_policy(config: SimConfig) -> EnforcePolicy:
         min_awake_hours_per_day=config.min_awake_hours_per_day,
         min_dwell_minutes=config.min_dwell_minutes,
         min_sleep_minutes=config.min_sleep_minutes,
+        energy_full_wake=config.energy_full_wake,
         schedule=config.schedule,
     )
 
@@ -557,7 +566,7 @@ class LifeState:
         state.unbacked = _sanitize_adjust_map(state.unbacked)
         state.unbacked_target = _sanitize_adjust_map(state.unbacked_target)
         state.materials = _sanitize_records(
-            state.materials, fields=("created_at", "expires_at", "weight")
+            state.materials, fields=("created_at", "expires_at", "best_until", "weight")
         )
         state.recent_events = _sanitize_records(
             state.recent_events, fields=("at", "emotion", "energy")
@@ -679,6 +688,7 @@ def activity_facts(state: LifeState, now: float) -> ActivityFacts:
         now_minutes=0,  # 由 settle / plugin 用本地时间覆盖
         emotion=state.emotion,
         energy=state.energy,
+        energy_cap=state.energy_cap,
         sick=is_cold(state, now),
         sleep_minutes_today=state.sleep_minutes_today,
         awake_minutes_today=state.awake_minutes_today,
@@ -740,13 +750,18 @@ def _apply_event(
 
     text = sanitize_text(event.material, max_chars=80)
     if text:
+        ttl_seconds = float(event.ttl_hours) * 3600.0
+        ratio = max(0.0, min(1.0, float(config.material_best_ratio)))
         state.materials.append(
             {
                 "label": event.label,
                 "text": text,
                 "weight": float(event.weight),
                 "created_at": float(now),
-                "expires_at": float(now) + float(event.ttl_hours) * 3600.0,
+                "expires_at": float(now) + ttl_seconds,
+                # 「最佳保鲜相位」：TTL 的前 ratio 段全额权重，之后线性衰减
+                # （见 material_freshness）。ratio=1 时与 expires_at 重合 = 旧行为。
+                "best_until": float(now) + ttl_seconds * ratio,
             }
         )
     state.recent_events.append(
@@ -1508,8 +1523,56 @@ def recent_event_tiers(
     return tuple(tiers)
 
 
-def active_materials(state: LifeState, now: float) -> list[dict[str, Any]]:
-    """还没过期的素材（按权重降序，供主动开口挑选）。"""
+def material_freshness(item: Mapping[str, Any], *, now: float, floor: float = 0.25) -> float:
+    """素材时效系数：``best_until`` 前恒为 1.0，之后线性衰减到 ``floor``（过期触底）。
+
+    「最佳保鲜相位」（G2）：一个念头刚冒出来时最想说，放久了就该低价值化——
+    但**衰减而非清零**，让它自然排到候选队尾，而不是占着榜首直到过期那一刻
+    突然消失。没有 ``best_until`` 的旧条目视为「全额新鲜到过期」（向后兼容：
+    老状态文件里的素材行为与此功能加入前完全一致）。坏时间戳 / 区间倒挂一律
+    按 1.0 处理：宁可高估新鲜度，也不静默吞掉素材。
+    """
+
+    expires = _as_float(item.get("expires_at"), 0.0) or 0.0
+    if expires <= 0.0 or float(now) >= expires:
+        return 0.0
+    best = _as_float(item.get("best_until"), 0.0) or 0.0
+    if best <= 0.0 or float(now) <= best:
+        return 1.0
+    span = expires - best
+    if span <= 0.0:
+        return 1.0
+    progress = (float(now) - best) / span
+    floored = min(1.0, max(0.0, float(floor)))
+    return 1.0 - (1.0 - floored) * min(1.0, max(0.0, progress))
+
+
+def material_effective_count(state: LifeState, now: float, *, floor: float = 0.25) -> float:
+    """素材的「有效条数」：各条时效系数之和（供素材加成使用）。
+
+    素材加成原来是按条数计（每条 +0.15、封顶 +0.45）；有了保鲜相位后，过了
+    ``best_until`` 的素材按衰减比例折算——全新鲜时与旧行为完全一致，放旧的
+    素材让加成**先于过期平滑下降**。
+    """
+
+    return float(
+        sum(
+            material_freshness(item, now=now, floor=floor)
+            for item in state.materials
+            if isinstance(item, dict)
+            and (_as_float(item.get("expires_at"), 0.0) or 0.0) > float(now)
+        )
+    )
+
+
+def active_materials(
+    state: LifeState, now: float, *, floor: float = 0.25
+) -> list[dict[str, Any]]:
+    """还没过期的素材（按**有效权重**降序，供主动开口挑选与状态卡展示）。
+
+    有效权重 = 原始权重 × 时效系数：放旧的念头自然排到队尾（「重新挑」），
+    而不是按原始权重一直排在最前。
+    """
 
     items = [
         item
@@ -1517,7 +1580,13 @@ def active_materials(state: LifeState, now: float) -> list[dict[str, Any]]:
         if isinstance(item, dict)
         and (_as_float(item.get("expires_at"), 0.0) or 0.0) > float(now)
     ]
-    items.sort(key=lambda item: _as_float(item.get("weight"), 0.0) or 0.0, reverse=True)
+    items.sort(
+        key=lambda item: (
+            max(0.0, _as_float(item.get("weight"), 0.0) or 0.0)
+            * material_freshness(item, now=now, floor=floor)
+        ),
+        reverse=True,
+    )
     return items
 
 
@@ -1576,8 +1645,10 @@ def is_awake_activity(activity: str) -> bool:
     return is_awake(activity)
 
 
-def iter_material_texts(state: LifeState, now: float) -> Iterable[str]:
-    for item in active_materials(state, now):
+def iter_material_texts(
+    state: LifeState, now: float, *, floor: float = 0.25
+) -> Iterable[str]:
+    for item in active_materials(state, now, floor=floor):
         text = sanitize_text(item.get("text", ""), max_chars=80)
         if text:
             yield text

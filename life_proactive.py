@@ -33,9 +33,11 @@ from typing import Any, Mapping, Sequence
 try:  # 包式加载（Runner 真机）
     from .life_activity import SLEEP, in_window
     from .life_events import sanitize_text
+    from .life_sim import material_freshness
 except ImportError:  # 平铺兜底（脚本直跑 / 测试）
     from life_activity import SLEEP, in_window
     from life_events import sanitize_text
+    from life_sim import material_freshness
 
 REASON_OK = "ok"
 REASON_DISABLED = "disabled"
@@ -76,6 +78,16 @@ class ProactiveConfig:
     energy_bias_floor: float = 4.0
     mood_bias_scale: float = 0.12
     mood_bias_cap: float = 0.15
+    #: 未回应退避（G1，仅私聊）：对方连续不回应时，最小间隔按 factor^连击 拉长，
+    #: 连击封顶 max_streak。默认 2^4 = 16 倍（180 分钟 → 48 小时）：封顶必须**大于**
+    #: 「每天一次」的自然节奏（24h），否则在默认 ``daily_max=1`` 下退避永远不是约束
+    #: 条件（实测：封顶 24h 时间隔恒为 24h，与不开退避逐位相同），而且刚好卡在
+    #: ``elapsed < interval`` 的边界上、行为取决于当天开口的钟点。48h 让「隔天一次」
+    #: 成为确定性结果。factor ≤ 1 视为关闭；对方一回话，连击判定立即失效。
+    unanswered_backoff_factor: float = 2.0
+    unanswered_backoff_max_streak: int = 4
+    #: 素材保鲜衰减下限（与 ``life_sim.material_freshness`` 同一口径）
+    material_decay_floor: float = 0.25
     baseline_emotion: float = 5.0
 
     def quiet(self, now_minutes: int) -> bool:
@@ -92,6 +104,10 @@ class ProactiveDecision:
     material: dict[str, Any] | None = None
     intent: str = ""
     detail: str = ""
+    #: 未回应退避档位（G1）：``1.0`` = 没有退避。只有 ``interval`` 闸会带上它，
+    #: 供沉默台账按档位分桶——``/生活 为什么`` 因此能答出「退避到了第几级」，
+    #: 而不是只显示一个笼统的「距上次主动太近」。
+    backoff: float = 1.0
 
     @property
     def reason_label(self) -> str:
@@ -172,13 +188,14 @@ def score_of(
 def select_material(
     materials: Sequence[Mapping[str, Any]],
     now: float,
+    floor: float = 0.25,
 ) -> dict[str, Any] | None:
-    """挑一条未过期、权重最高的素材。
+    """挑一条未过期、**有效权重**最高的素材。
 
-    **必须有可用的文本**：素材的意义就是「她攒了一句想说的话」，没有文本时
-    ``build_intent`` 只能退回模板句，等于让她在没有素材的情况下主动开话
-    （宿主那边只能凭空发挥）。这类空素材只可能来自被外部写坏的 ``life_state.json``，
-    但既然消费点能判出来，就不该放它过去（消费点自判，不依赖写入侧的守卫）。
+    有效权重 = 原始权重 × 时效系数（与 ``life_sim.material_freshness`` 同一口径）：
+    过了「最佳保鲜相位」的念头低价值化、自然排到队尾，而不是占着榜首直到过期
+    那一刻突然消失。返回的是**副本**，附 ``effective_weight`` 供评分使用——
+    评分用衰减后的权重，「低价值化」才真正落到开口分数上。
     """
 
     best: dict[str, Any] | None = None
@@ -191,10 +208,13 @@ def select_material(
         if not sanitize_text(item.get("text", ""), max_chars=80):
             # 没有正文的素材不算素材（占位/空串一律跳过）
             continue
-        weight = _as_float(item.get("weight"), 0.0)
+        raw = _as_float(item.get("weight"), 0.0)
+        weight = raw * material_freshness(item, now=now, floor=floor)
         if weight > best_weight:
             best_weight = weight
             best = dict(item)
+    if best is not None:
+        best["effective_weight"] = best_weight
     return best
 
 
@@ -222,11 +242,13 @@ def decide(
     materials: Sequence[Mapping[str, Any]],
     session: Mapping[str, Any] | None,
     day_key: str,
+    private_chat: bool = False,
 ) -> ProactiveDecision:
     """是否该主动开口，以及不该开口时的原因。
 
     ``session`` 是每会话记录（``{"last_proactive_at","last_user_message_at","day_key","count"}``），
-    由 ``life_sim`` 的 ``sessions`` 字段持久化。
+    由 ``life_sim`` 的 ``sessions`` 字段持久化。``private_chat`` 只影响**未回应退避**
+    （G1 仅私聊启用；群聊与判不出类型的会话一律维持现有硬闸）。
     """
 
     if not config.enabled:
@@ -244,7 +266,7 @@ def decide(
     if config.quiet(now_minutes):
         return ProactiveDecision(False, REASON_QUIET)
 
-    material = select_material(materials, now)
+    material = select_material(materials, now, floor=config.material_decay_floor)
     if material is None:
         return ProactiveDecision(False, REASON_NO_MATERIAL)
 
@@ -262,22 +284,47 @@ def decide(
         )
 
     last_proactive = _as_float(record.get("last_proactive_at"), 0.0)
-    interval_seconds = max(0, int(config.min_interval_minutes)) * 60
+    last_user = _as_float(record.get("last_user_message_at"), 0.0)
+    # 未回应退避（G1，仅私聊）：上次主动之后对方一直没说话 ⇒ 本次开口的间隔按
+    # factor^连击 拉长（连击封顶）。对方回过话则连击视为 0——判定是即时的，
+    # 对方一发言 last_user 就会超过 last_proactive，不需要落库清零。
+    # 群聊 / 判不出会话类型 / 系数 ≤ 1 一律不退避（维持现有硬闸）。
+    streak = _as_int(record.get("unanswered_streak"), 0)
+    if (
+        private_chat
+        and float(config.unanswered_backoff_factor) > 1.0
+        and last_proactive > 0.0
+        and last_proactive > last_user
+    ):
+        # +1：把「上一次主动至今未回应」这一次也计进连击——这样第 2 次开口
+        # 就开始退避（×2），第 3 次 ×4，依此类推；封顶后恒为 ×factor^max_streak。
+        effective_streak = max(
+            0, min(streak + 1, max(0, int(config.unanswered_backoff_max_streak)))
+        )
+    else:
+        effective_streak = 0
+    backoff = max(1.0, float(config.unanswered_backoff_factor)) ** effective_streak
+    interval_seconds = max(0, int(config.min_interval_minutes)) * 60 * backoff
     if last_proactive > 0 and (float(now) - last_proactive) < interval_seconds:
         remain = (interval_seconds - (float(now) - last_proactive)) / 60.0
         return ProactiveDecision(
             False, REASON_INTERVAL,
             material=material,
-            detail=f"距上次主动还差 {remain:.0f} 分钟",
+            backoff=backoff,
+            detail=(
+                f"距上次主动还差 {remain:.0f} 分钟"
+                + (f"（未回应退避 ×{backoff:g}）" if effective_streak else "")
+            ),
         )
 
-    last_user = _as_float(record.get("last_user_message_at"), 0.0)
     silence_seconds = max(0, int(config.recent_user_silence_minutes)) * 60
     if last_user > 0 and (float(now) - last_user) < silence_seconds:
         return ProactiveDecision(False, REASON_SILENCE, material=material, detail="对方刚说过话")
 
     score, detail = score_of(
-        material_weight=_as_float(material.get("weight"), 0.0),
+        material_weight=_as_float(
+            material.get("effective_weight"), _as_float(material.get("weight"), 0.0)
+        ),
         energy=energy,
         emotion=emotion,
         config=config,
@@ -306,6 +353,7 @@ def new_session_record(*, stream_id: str, day_key: str) -> dict[str, Any]:
         "last_proactive_at": 0.0,
         "day_key": str(day_key),
         "count": 0,
+        "unanswered_streak": 0,
     }
 
 
@@ -345,7 +393,16 @@ def record_proactive(
         stream_id=stream_id, day_key=day_key
     )
     record["stream_id"] = str(stream_id)
+    prev_proactive = _as_float(record.get("last_proactive_at"), 0.0)
+    prev_user = _as_float(record.get("last_user_message_at"), 0.0)
     record["last_proactive_at"] = float(now)
+    # 未回应连击：上一次主动之后对方始终没说话 ⇒ 连击 +1；对方回过话就归零。
+    # 群聊也统一记账（decide 那侧按 private_chat 决定是否启用），多记无副作用。
+    record["unanswered_streak"] = (
+        _as_int(record.get("unanswered_streak"), 0) + 1
+        if prev_proactive > 0.0 and prev_proactive > prev_user
+        else 0
+    )
     if str(record.get("day_key", "")) != str(day_key):
         record["day_key"] = str(day_key)
         record["count"] = 1
@@ -363,7 +420,13 @@ def bump_skip_ledger(ledger: dict[str, int], reason: str, *, amount: int = 1) ->
 
 
 def ledger_lines(ledger: Mapping[str, Any], *, limit: int = 10) -> list[str]:
-    """把台账排成「原因：次数」的文本行，按次数降序。"""
+    """把台账排成「原因：次数」的文本行，按次数降序。
+
+    键允许是 ``"<原因>×<档位>"`` 的复合形式——未回应退避（G1）会按档位分桶，
+    这样 ``/生活 为什么`` 能答出「退避到了第几级」而不是一个笼统的
+    「距上次主动太近」。渲染时把原因换成中文标签、档位原样附在后面：
+    ``interval×4`` → ``距上次主动太近 ×4：3 次``。
+    """
 
     items: list[tuple[str, int]] = []
     for key, value in ledger.items():
@@ -372,7 +435,11 @@ def ledger_lines(ledger: Mapping[str, Any], *, limit: int = 10) -> list[str]:
         except (TypeError, ValueError):
             continue
     items.sort(key=lambda pair: pair[1], reverse=True)
-    return [
-        f"{SKIP_REASON_LABELS.get(name, name)}：{count} 次"
-        for name, count in items[: max(1, int(limit))]
-    ]
+    lines: list[str] = []
+    for name, count in items[: max(1, int(limit))]:
+        reason, _, level = name.partition("×")
+        label = SKIP_REASON_LABELS.get(reason, reason)
+        lines.append(
+            f"{label} ×{level}：{count} 次" if level else f"{label}：{count} 次"
+        )
+    return lines

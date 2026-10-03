@@ -855,6 +855,70 @@ def test_iter_material_texts():
     assert list(S.iter_material_texts(state, at)) == ["有效"]
 
 
+# ---------------------------------------------------------------- G2 保鲜相位
+
+
+def test_material_freshness_decay_phases():
+    """G2：保鲜期全额 → 线性衰减到 floor → 过期归零；旧条目视为全额新鲜。"""
+
+    at = ts(2026, 2, 8, 14, 0)
+    item = {"weight": 0.8, "created_at": at, "best_until": at + 1800, "expires_at": at + 3600}
+    assert S.material_freshness(item, now=at + 900, floor=0.25) == pytest.approx(1.0)
+    assert S.material_freshness(item, now=at + 2700, floor=0.25) == pytest.approx(0.625)
+    assert S.material_freshness(item, now=at + 3599, floor=0.25) == pytest.approx(0.25, abs=1e-3)
+    assert S.material_freshness(item, now=at + 3600, floor=0.25) == 0.0
+    # 旧条目（无 best_until）＝ 全额新鲜到过期，行为与加入该功能前一致
+    legacy = {"weight": 0.8, "expires_at": at + 3600}
+    assert S.material_freshness(legacy, now=at + 3599, floor=0.25) == 1.0
+
+
+def test_active_materials_ranks_by_effective_weight():
+    """过了保鲜期的素材低价值化：按**有效权重**排序，而非原始权重。"""
+
+    at = ts(2026, 2, 8, 14, 0)
+    fresh = {"label": "新鲜", "text": "a", "weight": 0.5,
+             "created_at": at, "best_until": at + 3600, "expires_at": at + 7200}
+    stale = {"label": "放旧", "text": "b", "weight": 0.6,
+             "created_at": at, "best_until": at + 60, "expires_at": at + 7200}
+    state = make_state(at=at, activity=A.DAILY, materials=[stale, fresh])
+    mats = S.active_materials(state, at + 3000, floor=0.25)
+    assert [m["label"] for m in mats] == ["新鲜", "放旧"]
+
+
+def test_material_effective_count_and_legacy_items():
+    at = ts(2026, 2, 8, 14, 0)
+    state = make_state(at=at, activity=A.DAILY, materials=[
+        {"weight": 0.5, "created_at": at, "best_until": at + 3600, "expires_at": at + 7200},
+        {"weight": 0.5, "created_at": at, "expires_at": at + 7200},
+    ])
+    assert S.material_effective_count(state, at, floor=0.25) == pytest.approx(2.0)
+    # 衰减中点：0.625 + 旧条目 1.0
+    assert S.material_effective_count(state, at + 5400, floor=0.25) == pytest.approx(1.625)
+
+
+def test_apply_event_stamps_best_until_from_config_ratio():
+    at = ts(2026, 2, 8, 14, 0)
+    state = make_state(at=at, activity=A.DAILY)
+    event = S.LifeEvent(label="煮糊了", material="锅底糊了一层", emotion=-0.3,
+                        energy=0.0, weight=0.5, ttl_hours=6.0)
+    S._apply_event(state, event, now=at, config=cfg(), rng=random.Random(0))
+    assert state.materials[0]["best_until"] == pytest.approx(at + 3 * 3600)
+
+
+def test_corrupt_best_until_entry_is_dropped():
+    at = ts(2026, 2, 8, 14, 0)
+    state = S.LifeState.from_dict({
+        "activity": "daily",
+        "materials": [
+            {"label": "坏", "text": "t", "weight": 0.5, "created_at": at,
+             "expires_at": at + 3600, "best_until": "abc"},
+            {"label": "好", "text": "t", "weight": 0.5, "created_at": at,
+             "expires_at": at + 3600, "best_until": at + 1800},
+        ],
+    })
+    assert [m.get("label") for m in state.materials] == ["好"]
+
+
 # ---------------------------------------------------------------- v1.1.1 回归
 
 
@@ -867,7 +931,9 @@ def test_sleep_cap_holds_across_the_day_boundary():
     """
 
     for label, set_activity_since in (("regular", True), ("stale activity_since=0", False)):
-        config = cfg(day_boundary_hour=12, max_sleep_hours=12.0)
+        # energy_full_wake 在本用例里关掉：这里钉的是「12 小时上限跨生活日边界仍然
+        # 生效」这一条回归；体力满提前醒是另一条行为（见 test_energy_full_wake_*）。
+        config = cfg(day_boundary_hour=12, max_sleep_hours=12.0, energy_full_wake=False)
         start = ts(2026, 1, 1, 3, 0)
         state = S.LifeState()
         state.activity = A.SLEEP
@@ -891,6 +957,32 @@ def test_sleep_cap_holds_across_the_day_boundary():
         # 断言**正好**是 12 小时（不是「小于 12 小时就算过」）：
         # 只写 <= cap 会被「刚躺下就被叫醒」这种反向 bug 骗过（开发中真的踩到过）。
         assert slept == pytest.approx(12.0, abs=0.2), f"{label}: 连续睡了 {slept:.1f} 小时"
+
+
+def test_energy_full_wake_fires_before_the_sleep_cap():
+    """体力回满（且睡满最短时长）就先醒，不等 12 小时上限（energy_full_wake 默认开）。"""
+
+    config = cfg(day_boundary_hour=12, max_sleep_hours=12.0)
+    start = ts(2026, 1, 1, 3, 0)
+    state = S.LifeState()
+    state.activity = A.SLEEP
+    state.sleep_started_at = start
+    state.activity_since = start
+    state.last_tick_at = start
+    state.day_key = S.day_key_of(S.local_datetime(start, TZ), 12)
+
+    woke = None
+    now = start
+    for _ in range(24 * 6 + 2):                 # 10 分钟一步，最多 24 小时
+        now += 600
+        state = S.settle(state, now=now, config=config, events=(), rng=random.Random(0))
+        state = S.enforce_and_apply(state, now=now, config=config, decision=None)
+        if state.activity != A.SLEEP:
+            woke = now
+            break
+    assert woke is not None, "体力回满后应被唤醒"
+    slept = (woke - start) / 3600.0
+    assert config.min_sleep_minutes / 60.0 <= slept < 12.0, f"睡了 {slept:.1f} 小时才醒"
 
 
 def test_impossible_mmdd_is_rejected():

@@ -134,6 +134,20 @@ def test_factors_multiply():
     assert dict(out.factors)["活动(music)"] == pytest.approx(0.9)
 
 
+def test_material_bonus_accepts_effective_count():
+    """素材加成按**有效条数**折算（G2 保鲜衰减后是小数），不再是整数截断。"""
+
+    out = _adjust(material_count=2.5)
+    assert out.material_bonus == pytest.approx(0.15 * 2.5)
+    assert out.material_count == pytest.approx(2.5)
+    assert "2.5 条（有效）" in "\n".join(out.as_lines())
+
+    # 整数条数与旧行为完全一致（向后兼容）
+    whole = _adjust(material_count=3)
+    assert whole.material_bonus == pytest.approx(0.45)
+    assert "3 条（有效）" in "\n".join(whole.as_lines())
+
+
 def test_best_case_and_worst_awake_case():
     best = _adjust(activity="before_sleep", emotion=10.0, energy=10.0)
     worst = _adjust(activity="night_study", emotion=0.0, energy=0.0)

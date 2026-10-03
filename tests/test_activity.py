@@ -421,6 +421,17 @@ def test_pointless_ask_is_provably_equivalent():
                 now_minutes=4 * 60,
             ),
         ),
+        (
+            "体力已满",
+            dict(
+                activity=A.SLEEP,
+                minutes_in_activity=200,
+                minutes_in_sleep=200,
+                sleep_minutes_today=200,
+                energy=10.0,
+                now_minutes=4 * 60,
+            ),
+        ),
     ]
     for label, overrides in skip_cases:
         facts = _facts(**overrides)
@@ -486,6 +497,45 @@ def test_enforce_forces_wake_past_max_sleep():
     assert "强制唤醒" in out.note
 
 
+def test_enforce_daily_cap_wakes_even_when_current_nap_is_young():
+    """v1.5.1：日累计到上限就唤醒，不再要求「当前一觉也满最短时长」。
+
+    真机 2026-10-03 实测（多相小睡 + 12:00 生活日边界）：日累计 11:47 就到
+    720 分钟，但当前一觉才 82 分钟（< min_sleep=120），旧 AND 条件把唤醒拖过
+    12:00 边界、计数被清零，当天的上限账整段抹掉——账本实测一天睡 12.8 小时。
+    """
+
+    out = A.enforce(
+        _facts(
+            activity=A.SLEEP,
+            minutes_in_activity=82,
+            minutes_in_sleep=82,
+            sleep_minutes_today=12 * 60 + 5,
+        ),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.DAILY
+    assert out.source == A.SOURCE_ENFORCED
+    assert "强制唤醒" in out.note
+
+
+def test_enforce_daily_cap_under_keeps_young_nap_sleeping():
+    """反向：日累计未到顶、当前一觉也短 → 继续睡（v1.1.1 的保护不回退）。"""
+
+    out = A.enforce(
+        _facts(
+            activity=A.SLEEP,
+            minutes_in_activity=82,
+            sleep_minutes_today=12 * 60 - 5,
+        ),
+        _request(A.DAILY),
+        _policy(),
+    )
+    assert out.activity == A.SLEEP
+    assert "未满" in out.note
+
+
 def test_enforce_forced_wake_lands_in_sick_rest_when_sick():
     out = A.enforce(
         _facts(activity=A.SLEEP, minutes_in_activity=400, sleep_minutes_today=13 * 60, sick=True),
@@ -502,6 +552,75 @@ def test_enforce_allows_wake_after_min_sleep():
         _policy(),
     )
     assert out.activity == A.DAILY
+
+
+def test_enforce_energy_full_wake_when_slept_enough():
+    """体力回满 + 睡满最短时长 → 强制唤醒（默认开，不依赖模型提议）。"""
+
+    out = A.enforce(
+        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200, energy=10.0),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.DAILY
+    assert out.source == A.SOURCE_ENFORCED
+    assert "体力已满" in out.note
+    # 上限是动态值： ActivityFacts.energy_cap 改成 8.5（熬夜 3 晚后）时 8.5 就算满
+    out = A.enforce(
+        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200,
+               energy=8.5, energy_cap=8.5),
+        None,
+        _policy(),
+    )
+    assert out.activity == A.DAILY
+    assert "体力已满" in out.note
+
+
+def test_enforce_energy_full_wake_lands_in_sick_rest_when_sick():
+    out = A.enforce(
+        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200,
+               energy=10.0, sick=True),
+        None,
+        _policy(),
+    )
+    assert out.activity == A.SICK_REST
+
+
+def test_enforce_energy_full_wake_respects_min_sleep():
+    """刚躺下体力就满也要睡满最短时长——「刚睡下就被叫起来」的保护仍在。"""
+
+    out = A.enforce(
+        _facts(activity=A.SLEEP, minutes_in_activity=60, sleep_minutes_today=60, energy=10.0),
+        None,
+        _policy(),
+    )
+    assert out.activity == A.SLEEP
+    assert out.source == A.SOURCE_RETAINED
+
+
+def test_enforce_energy_full_wake_can_be_disabled():
+    out = A.enforce(
+        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200, energy=10.0),
+        None,
+        _policy(energy_full_wake=False),
+    )
+    assert out.activity == A.SLEEP
+    assert out.source == A.SOURCE_RETAINED
+
+
+def test_energy_full_wake_is_never_a_pointless_ask():
+    """体力满 + 睡够时长 = 必然唤醒（问了也白问）；没睡够时长则必然继续睡。"""
+
+    due = A.request_is_pointless(
+        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200, energy=10.0),
+        _policy(),
+    )
+    assert "必然强制唤醒" in due
+    too_early = A.request_is_pointless(
+        _facts(activity=A.SLEEP, minutes_in_activity=60, sleep_minutes_today=60, energy=10.0),
+        _policy(),
+    )
+    assert "继续睡" in too_early
 
 
 def test_enforce_never_freezes_when_llm_dies_while_asleep():

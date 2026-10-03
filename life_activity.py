@@ -575,6 +575,9 @@ class ActivityFacts:
     now_minutes: int = 0
     emotion: float = 5.0
     energy: float = 5.0
+    #: 体力上限（**动态值**：连熬 3 晚后是 8.5 而不是 10）。「体力满强制唤醒」
+    #: 用它判定回满，不能写死 10。
+    energy_cap: float = 10.0
     sick: bool = False
     sleep_minutes_today: int = 0
     awake_minutes_today: int = 0
@@ -593,6 +596,9 @@ class EnforcePolicy:
     min_awake_hours_per_day: float = 8.0
     min_dwell_minutes: int = 60
     min_sleep_minutes: int = 180
+    #: 睡眠中体力恢复到上限且睡满最短时长就强制唤醒。默认开；关掉则回到
+    #: 「模型提议醒 / 睡满每日上限」两条路。
+    energy_full_wake: bool = True
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
 
@@ -837,7 +843,7 @@ def _sleep_allowed(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
 
 
 def _must_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
-    """睡太久了：睡眠量超过上限且单次睡眠已过最短时长。
+    """睡太久了：单次连续睡眠或本生活日累计，任一到达上限就该醒。
 
     ⚠ ``sleep_minutes_today`` 是**按「生活日」清零**的计数器（``life_sim._settle_day``），
     而生活日边界默认在 12:00。只用它判上限会出现「连续睡 21 小时」的漏洞：
@@ -846,6 +852,12 @@ def _must_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
     所以这里取「日累计」与「本次连续睡眠」的**较大者**：后者由
     ``life_sim.activity_facts`` 从 ``sleep_started_at`` 推出（锚点不可信时返回 0，
     不会因为旧状态里 ``activity_since == 0`` 就误判成「睡了很久」）。
+
+    ⚠ v1.5.1：去掉「且当前一觉已满最短时长」的附加条件（真机 2026-10-03 实测）。
+    多相小睡模式下，日累计在当前一觉还很年轻时就会到顶；旧 AND 条件把唤醒一直
+    往后拖，拖过 12:00 边界后计数被清零，当天的上限账整段蒸发——账本实测一天
+    睡 12.8 小时。「今天已经睡够上限」不因「这一觉刚开始」而顺延；最短睡眠时长
+    的保护属于 ``enforce`` 的普通唤醒路径与 ``_energy_full_wake``，不属于上限唤醒。
     """
 
     cap_minutes = policy.max_sleep_hours * 60.0
@@ -855,11 +867,22 @@ def _must_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
         # 都是 0）时，只能退回日累计：宁可叫醒她，也不能因为缺时间戳就永久静默
         # ——这正是本函数要防的事故形态。
         return int(facts.sleep_minutes_today) >= cap_minutes
-    accumulated = max(0, int(facts.sleep_minutes_today), single_sleep_minutes)
-    return (
-        accumulated >= cap_minutes
-        and single_sleep_minutes >= policy.min_sleep_minutes
-    )
+    return max(0, int(facts.sleep_minutes_today), single_sleep_minutes) >= cap_minutes
+
+
+def _energy_full_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
+    """体力回满就该醒：睡眠的目的是恢复体力，满了继续睡只是空转。
+
+    仍尊重最短睡眠时长（与「本次睡眠未满 N 分钟继续睡」同一把尺）——带着
+    接近满的体力上床也要睡够最低时长，否则变成「刚睡下就被叫起来」。上限读
+    ``facts.energy_cap``（**动态值**：连熬 3 晚后是 8.5），而不是写死 10。
+    """
+
+    if not policy.energy_full_wake:
+        return False
+    if float(facts.energy) < float(facts.energy_cap):
+        return False
+    return facts.minutes_in_activity >= policy.min_sleep_minutes
 
 
 def _awake_floor_ok(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
@@ -889,8 +912,8 @@ def enforce(
 
     判定顺序（每条都对应一个真实故障模式）：
 
-    1. **睡眠中**：先看要不要强制唤醒（睡够上限），再看要不要保住最短睡眠时长，
-       最后才允许按提议醒来。
+    1. **睡眠中**：先看要不要强制唤醒（睡够上限，或体力已回满且睡满最短时长），
+       再看要不要保住最短睡眠时长，最后才允许按提议醒来。
     2. **清醒中**：感冒强制养病；想睡觉要过「健康优先」「清醒下限」「睡眠资格」；
        普通切换要过最短停留时间。
     3. **无有效提议**：默认保持当前活动不动（``llm_retained``），**但「该睡了」是
@@ -915,6 +938,11 @@ def enforce(
             target = _wake_target(facts)
             return ActivityDecision(target, scene, SOURCE_ENFORCED,
                                     f"今日已睡 {facts.sleep_minutes_today / 60:.1f} 小时达上限，强制唤醒")
+        if _energy_full_wake(facts, policy):
+            return ActivityDecision(
+                _wake_target(facts), "", SOURCE_ENFORCED,
+                f"体力已满（{facts.energy:.1f}/{facts.energy_cap:.1f}），强制唤醒",
+            )
         if requested is None or requested == SLEEP:
             return ActivityDecision(SLEEP, scene, source, "仍在睡眠，保持")
         if facts.minutes_in_activity < policy.min_sleep_minutes:
@@ -1009,6 +1037,8 @@ def request_is_pointless(facts: ActivityFacts, policy: EnforcePolicy) -> str:
     if current == SLEEP:
         if _must_wake(facts, policy):
             return "已睡够上限，本轮必然强制唤醒"
+        if _energy_full_wake(facts, policy):
+            return "体力已满，本轮必然强制唤醒"
         if facts.minutes_in_activity < policy.min_sleep_minutes:
             return f"本次睡眠未满 {policy.min_sleep_minutes} 分钟，本轮必然继续睡"
         return ""

@@ -108,6 +108,7 @@ try:
     )
     from .life_host_model import normalize_mode as normalize_host_mode
     from .life_proactive import (
+        REASON_INTERVAL,
         ProactiveConfig as ProactiveRules,
         bump_skip_ledger,
         decide as decide_proactive,
@@ -134,6 +135,7 @@ try:
         mark_ask_skipped,
         mark_llm_failure,
         mark_llm_success,
+        material_effective_count,
         new_state,
         parse_festival_lines,
         parse_mmdd,
@@ -200,6 +202,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_host_model import MODE_LABELS, preview
     from life_host_model import normalize_mode as normalize_host_mode
     from life_proactive import (
+        REASON_INTERVAL,
         ProactiveConfig as ProactiveRules,
         bump_skip_ledger,
         decide as decide_proactive,
@@ -226,6 +229,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         mark_ask_skipped,
         mark_llm_failure,
         mark_llm_success,
+        material_effective_count,
         new_state,
         parse_festival_lines,
         parse_mmdd,
@@ -459,6 +463,15 @@ class SimulationConfig(PluginConfigBase):
         default=12.0,
         description="单日累计睡眠上限；超过就强制唤醒（防止模型让她睡一整天）",
         json_schema_extra={"label": "每日睡眠上限（小时）", "order": 9, "step": 0.5},
+    )
+    energy_full_wake: bool = Field(
+        default=True,
+        description=(
+            "睡眠中体力恢复到上限（动态值：连熬 3 晚后是 8.5）且本次睡眠已满最短时长，"
+            "就强制唤醒（感冒醒到养病）。睡觉的目的是恢复体力，满了继续睡只是空转；"
+            "关掉则回到「模型提议醒 / 睡满每日上限」两条路"
+        ),
+        json_schema_extra={"label": "体力满强制唤醒", "order": 10},
     )
 
 
@@ -827,7 +840,10 @@ class FrequencyConfig(PluginConfigBase):
     )
     material_bonus: float = Field(
         default=0.15,
-        description="每条未过期素材带来的加成（她攒了想说的话，就更想说）",
+        description=(
+            "每条素材带来的加成（她攒了想说的话，就更想说）。按保鲜衰减后的"
+            "**有效条数**计：全新鲜时 1 条 = 1，放旧的素材按比例折算"
+        ),
         json_schema_extra={"label": "每条素材加成", "order": 6, "step": 0.05},
     )
     material_bonus_cap: float = Field(
@@ -969,6 +985,23 @@ class EventsConfig(PluginConfigBase):
         description="「想跟你说的素材」的有效期（小时）。参考设定是 6 小时过期",
         json_schema_extra={"label": "素材有效期（小时）", "order": 3, "step": 1},
     )
+    material_best_ratio: float = Field(
+        default=0.5,
+        description=(
+            "素材「最佳保鲜相位」：有效期的前这个比例是全额权重，之后线性衰减到"
+            "「保鲜衰减下限」、到过期触底。衰减的素材在主动开口候选里自然排到队尾，"
+            "素材加成也按有效条数折算。1 = 全额到过期（旧行为）"
+        ),
+        json_schema_extra={"label": "素材最佳保鲜比例", "order": 4, "step": 0.1},
+    )
+    material_decay_floor: float = Field(
+        default=0.25,
+        description=(
+            "过了保鲜期后的权重下限（0–1）：0 = 衰减到零（等同提前过期），"
+            "1 = 不衰减（旧行为）。衰减而非清零，让她「想说的念头」平滑降温"
+        ),
+        json_schema_extra={"label": "保鲜衰减下限", "order": 5, "step": 0.05},
+    )
 
     _norm_event_lists = _str_list_validator("extra", "disabled")
 
@@ -1075,8 +1108,47 @@ class ProactiveConfigModel(PluginConfigBase):
         json_schema_extra={"label": "静默时段（每行一组）", "order": 6, "rows": 2,
                            "placeholder": "23:30-08:00"},
     )
+    unanswered_backoff_factor: float = Field(
+        default=2.0,
+        description=(
+            "未回应退避（仅私聊）：对方连续不回应时，最小间隔按 ×系数^连击 拉长"
+            "（系数 2 → 3h/6h/12h…）；对方一回话立即归零。群聊与判不出类型的会话"
+            "维持现有硬闸。1 = 关闭退避"
+        ),
+        json_schema_extra={"label": "未回应退避系数", "order": 7, "step": 0.5},
+    )
+    unanswered_backoff_max_streak: int = Field(
+        default=4,
+        description=(
+            "退避连击上限（系数 2、上限 4 → 最长拉到 16 倍 = 48 小时）。"
+            "封顶要**大于**「每天一次」的自然节奏才有意义：设 3（24 小时）时，"
+            "在默认每日上限 1 次下退避永远不是约束条件；48 小时则确定性地变成隔天一次"
+        ),
+        json_schema_extra={"label": "退避连击上限", "order": 8, "step": 1},
+    )
+    filter_mode: str = Field(
+        default="all",
+        description=(
+            "主动开口自己的生效范围：all = 跟随 [apply] 的范围；whitelist / blacklist = "
+            "在 [apply] 范围内再按 target_chats 收窄（最终范围 = 两者交集，[apply] 始终是总闸）。"
+            "写错值按最保守的 whitelist 处理并告警一次"
+        ),
+        json_schema_extra={"label": "主动开口范围（all/whitelist/blacklist）", "order": 9,
+                           "placeholder": "all"},
+    )
+    target_chats: list[str] = Field(
+        default_factory=list,
+        description=(
+            '主动开口的目标列表，语法与 [apply].target_chats 一致，每行 "group:群号" 或 '
+            '"private:QQ号"；仅在 filter_mode 非 all 时使用。whitelist 为空 = 不在任何'
+            "会话主动开口（保守行为，会告警一次）"
+        ),
+        json_schema_extra={"label": "主动开口目标（每行一组）", "order": 10, "rows": 3,
+                           "placeholder": "group:123456"},
+    )
 
     _norm_proactive_quiet = _str_list_validator("quiet_hours")
+    _norm_proactive_targets = _str_list_validator("target_chats")
 
 
 class PromptConfig(PluginConfigBase):
@@ -1768,6 +1840,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             sleep_window_text=sleep_window_text,
             sleep_energy_threshold=max(0.0, min(10.0, float(simulation.sleep_energy_threshold))),
             max_sleep_hours=max_sleep_hours,
+            energy_full_wake=bool(simulation.energy_full_wake),
             min_awake_hours_per_day=max(0.0, min(24.0, float(activity.min_awake_hours_per_day))),
             min_dwell_minutes=max(0, int(activity.min_dwell_minutes)),
             min_sleep_minutes=max(0, int(activity.min_sleep_minutes)),
@@ -1787,6 +1860,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             cold_sleep_debt_risk=max(0.0, min(1.0, float(health.cold_sleep_debt_risk))),
             fire_probability=max(0.0, min(1.0, float(events.fire_probability))),
             material_ttl_hours=max(0.5, float(events.material_ttl_hours)),
+            material_best_ratio=max(0.0, min(1.0, float(events.material_best_ratio))),
+            material_decay_floor=max(0.0, min(1.0, float(events.material_decay_floor))),
             recent_events_keep=max(0, int(activity.llm.recent_events_keep)),
             birthday=str(date.birthday or ""),
             birthday_factor=max(0.2, min(5.0, float(date.birthday_factor))),
@@ -2419,6 +2494,11 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             daily_max=max(0, int(proactive.daily_max)),
             minimum_energy=float(proactive.minimum_energy),
             quiet_hours=self._quiet_windows(proactive.quiet_hours),
+            unanswered_backoff_factor=max(1.0, float(proactive.unanswered_backoff_factor)),
+            unanswered_backoff_max_streak=max(0, int(proactive.unanswered_backoff_max_streak)),
+            material_decay_floor=max(
+                0.0, min(1.0, float(self._sim_config().material_decay_floor))
+            ),
         )
 
     def _activity_mode(self) -> str:
@@ -2520,32 +2600,70 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         return found
 
     def _target_matches(self, session_id: str, info: dict[str, Any]) -> bool:
-        """按 ``filter_mode`` 判断这个会话要不要被干预。"""
+        """按 ``[apply]`` 的范围判断这个会话要不要被干预（频率 + 主动开口的总闸）。"""
 
-        mode = str(self.config.apply.filter_mode or "all").strip().lower()
+        return self._matches_scope(
+            filter_mode=str(self.config.apply.filter_mode or "all"),
+            target_chats=self.config.apply.target_chats,
+            session_id=session_id,
+            info=info,
+            label="生效范围",
+            warn_key="filter_mode",
+        )
+
+    def _proactive_matches(self, session_id: str, info: dict[str, Any]) -> bool:
+        """按 ``[proactive]`` 的范围判断这个会话能不能主动开口（v1.5.2）。
+
+        语义是「在 ``[apply]`` 范围内**再收窄**」：调用方必须已经过 ``_target_matches``，
+        这里只做主动开口自己的那道闸。
+        """
+
+        return self._matches_scope(
+            filter_mode=str(self.config.proactive.filter_mode or "all"),
+            target_chats=self.config.proactive.target_chats,
+            session_id=session_id,
+            info=info,
+            label="主动开口范围",
+            warn_key="proactive_filter_mode",
+        )
+
+    def _matches_scope(
+        self,
+        *,
+        filter_mode: str,
+        target_chats: Any,
+        session_id: str,
+        info: dict[str, Any],
+        label: str,
+        warn_key: str,
+    ) -> bool:
+        """范围匹配的公共实现（``[apply]`` 与 ``[proactive]`` 共用）。"""
+
+        mode = str(filter_mode or "all").strip().lower()
         if mode not in ALLOWED_FILTER_MODES:
             # 非法值回退白名单是**保守**的，但绝不能是**静默**的：v1.1.0 里写个
-            # 「白名单」「only-group」就会让整个插件悄无声息地失效（零写入、零告警、
+            # 「白名单」「only-group」就会让整条链路悄无声息地失效（零写入、零告警、
             # /生活 状态 还显示得像正常）。这里告警一次，并在状态卡里显示命中会话数。
             self._warn_once(
-                "filter_mode",
-                "生效范围 filter_mode=%r 不是合法值（可选 %s），已按最保守的 whitelist 处理；"
-                "若 %s 为空则不会干预任何会话",
-                self.config.apply.filter_mode,
+                warn_key,
+                "%s filter_mode=%r 不是合法值（可选 %s），已按最保守的 whitelist 处理；"
+                "若对应 target_chats 为空则一条会话都不会命中",
+                label,
+                filter_mode,
                 "/".join(ALLOWED_FILTER_MODES),
-                "target_chats",
             )
             mode = "whitelist"
         if mode == "all":
             return True
 
-        wanted = {str(item).strip() for item in _as_str_list(self.config.apply.target_chats)}
+        wanted = {str(item).strip() for item in _as_str_list(target_chats)}
         wanted.discard("")
         if mode == "whitelist" and not wanted:
             self._warn_once(
-                "filter_mode_empty_whitelist",
-                "filter_mode=whitelist 但 target_chats 为空，本插件不会干预任何会话"
+                f"{warn_key}_empty_whitelist",
+                "%s filter_mode=whitelist 但 target_chats 为空，一条会话都不会命中"
                 "（这是保守行为，不是故障）",
+                label,
             )
         group_id = _as_text(info.get("group_id"), "")
         user_id = _as_text(info.get("user_id"), "")
@@ -2804,7 +2922,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             sick=is_cold(self._state, now),
             sleep_debt_nights=self._state.sleep_debt_nights,
             date_factor=date_factor(self._state, now, sim_config),
-            material_count=len(active_materials(self._state, now)),
+            material_count=material_effective_count(
+                self._state, now, floor=sim_config.material_decay_floor
+            ),
             now_minutes=local_now.hour * 60 + local_now.minute,
             config=self._factor_config(),
             mode=self._host_mode,
@@ -3149,6 +3269,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         for session_id, info in sessions:
             if not self._target_matches(session_id, info):
                 continue
+            # v1.5.2：主动开口自己的范围闸（[apply] 是总闸，这里只能在总闸内再收窄）
+            if not self._proactive_matches(session_id, info):
+                continue
             decision = decide_proactive(
                 config=rules,
                 now=now,
@@ -3159,12 +3282,22 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 materials=state.materials,
                 session=state.sessions.get(session_id),
                 day_key=day_key,
+                # 未回应退避（G1）仅私聊启用；判不出会话类型时按群聊处理（不退避）
+                private_chat=self._session_is_group(session_id) is False,
             )
             if decision.should_send:
                 if best is None or decision.score > best[0]:
                     best = (decision.score, session_id, decision)
             else:
-                reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
+                # 未回应退避按档位分桶记账：/生活 为什么 才答得出「退避到第几级」，
+                # 而不是把 ×2 和 ×16 混成一个笼统的「距上次主动太近」。
+                key = decision.reason
+                if (
+                    decision.reason == REASON_INTERVAL
+                    and float(getattr(decision, "backoff", 1.0) or 1.0) > 1.0
+                ):
+                    key = f"{REASON_INTERVAL}×{int(round(float(decision.backoff)))}"
+                reasons[key] = reasons.get(key, 0) + 1
 
         for reason, count in reasons.items():
             bump_skip_ledger(state.skip_ledger, reason, amount=count)
@@ -3380,10 +3513,22 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             f"情绪 {state.emotion:.1f}/10；体力 {state.energy:.1f}/10；"
             f"{health_label(state, now, sim_config)}",
         ]
-        materials = active_materials(state, now)
+        materials = active_materials(state, now, floor=sim_config.material_decay_floor)
         if materials:
             lines.append(f"最近想说的：{sanitize_text(materials[0].get('text', ''), max_chars=60)}")
         return "\n".join(lines)
+
+    def _material_line(self, now: float, sim_config: SimConfig) -> str:
+        """状态卡的素材行：条数 + 有效期；有素材进入保鲜衰减期时附有效条数。"""
+
+        mats = active_materials(self._state, now, floor=sim_config.material_decay_floor)
+        line = f"素材：{len(mats)} 条（{self.config.events.material_ttl_hours:g} 小时内有效）"
+        effective = material_effective_count(
+            self._state, now, floor=sim_config.material_decay_floor
+        )
+        if effective < len(mats) - 0.05:
+            line += f"，保鲜衰减后约 {effective:.1f} 条"
+        return line
 
     def _render_status(self, now: float, stream_id: str = "") -> str:
         state = self._state
@@ -3425,7 +3570,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         lines.extend(self._economy_card_lines(now))
         lines.extend(self._social_card_lines(now))
         lines.extend([
-            f"素材：{len(active_materials(state, now))} 条（{self.config.events.material_ttl_hours:g} 小时内有效）",
+            self._material_line(now, sim_config),
             f"宿主模式：{mode_label}　{talk_source}：{talk_value:.3f}",
             f"生效范围：{self.config.apply.filter_mode}（本轮命中 {self._last_target_count} 个会话）"
             + (
@@ -3471,8 +3616,15 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 mode=self._host_mode, talk_value=talk_value, adjust=composed
             ).get("verdict", "")
             lines.append(f"后果：{verdict}")
+        proactive_scope = "全部会话"
+        if str(self.config.proactive.filter_mode or "all").strip().lower() != "all":
+            proactive_scope = (
+                f"{'白名单' if str(self.config.proactive.filter_mode).strip().lower() == 'whitelist' else '黑名单'}"
+                f" {len(self.config.proactive.target_chats)} 个"
+            )
         lines.append(
             "主动开口：" + ("已启用" if self.config.proactive.enabled else "未启用")
+            + (f"（范围：{proactive_scope}）" if self.config.proactive.enabled else "")
             + ("　|　演算模式（未写宿主）" if self.config.simulation.dry_run else "")
         )
         return "\n".join(lines)
@@ -3907,7 +4059,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         now = time.time()
         state = self._state
         sim_config = self._sim_config()
-        materials = active_materials(state, now)
+        materials = active_materials(state, now, floor=sim_config.material_decay_floor)
         text = "\n".join(
             [
                 f"当前活动：{self._activity_label(state.activity)}"

@@ -761,6 +761,20 @@ def test_recent_events_keep_maps_into_sim_config():
     assert plugin._sim_config().recent_events_keep == 0
 
 
+def test_energy_full_wake_maps_into_sim_config():
+    """``[simulation] energy_full_wake`` → ``SimConfig`` → 强制层策略，默认开。"""
+
+    _module, plugin, _host = _make_plugin()
+    assert plugin._sim_config().energy_full_wake is True
+    sim = plugin._sim_config()
+    assert sim.energy_full_wake is True
+
+    plugin.config.simulation.energy_full_wake = False
+    assert plugin._sim_config().energy_full_wake is False
+    policy = S.build_enforce_policy(plugin._sim_config())
+    assert policy.energy_full_wake is False
+
+
 def test_plugin_warns_once_on_bad_workdays():
     """同一个坏值只告警一次（不同类型的问题各告警一次），且都留痕。"""
 

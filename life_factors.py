@@ -233,7 +233,13 @@ class AdjustBreakdown:
     raw: float
     reason: str
     factors: tuple[tuple[str, float], ...] = ()
-    material_count: int = 0
+    material_count: float = 0.0
+    """素材的**有效条数**：各条时效系数之和（保鲜期内 1.0，衰减期线性下降）。
+
+    有了「最佳保鲜相位」后不再是整数——放旧的素材按衰减比例折算，素材加成
+    随之平滑下降，而不是在过期那一刻从满额直接跳到 0。
+    """
+
     material_bonus: float = 0.0
     curve_set: str = "frequency"
 
@@ -242,7 +248,7 @@ class AdjustBreakdown:
         for name, value in self.factors:
             lines.append(f"  × {name} = {value:.3f}")
         if self.material_bonus:
-            lines.append(f"  + 素材 {self.material_count} 条 = +{self.material_bonus:.3f}")
+            lines.append(f"  + 素材 {self.material_count:g} 条（有效）= +{self.material_bonus:.3f}")
         lines.append(f"最终倍率：{self.adjust:.3f}")
         return lines
 
@@ -262,7 +268,7 @@ def compute_adjust(
     sick: bool,
     sleep_debt_nights: int,
     date_factor: float,
-    material_count: int,
+    material_count: float,
     now_minutes: int,
     config: FactorConfig,
     mode: str = "frequency",
@@ -330,7 +336,7 @@ def compute_adjust(
 
     bonus = min(
         float(config.material_bonus_cap),
-        max(0.0, float(config.material_bonus)) * max(0, int(material_count)),
+        max(0.0, float(config.material_bonus)) * max(0.0, float(material_count)),
     )
 
     # 兜底：任何一条因子非有限（只可能来自被外部写坏的配置对象）都不许污染倍率
@@ -346,7 +352,7 @@ def compute_adjust(
         raw=raw,
         reason=REASON_OK,
         factors=tuple((name, value) for name, value in factors if abs(value - 1.0) > 1e-9),
-        material_count=max(0, int(material_count)),
+        material_count=max(0.0, float(material_count)),
         material_bonus=bonus,
         curve_set=curve_name,
     )
