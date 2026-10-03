@@ -586,7 +586,10 @@ def test_intake_social_appends_events_and_spends_the_daily_budget():
     async def run():
         module, plugin, host = _make_plugin(social={"enabled": True})
         host.api_returns[TARGET] = digest_payload()
-        now = time.time()
+        # 夹具的 generated_at 固定在 2026-10-01 23:40：now 必须与它对齐在 24h
+        # 新鲜度窗口内，否则真实时钟漂出窗口后情绪额度恒为 0（2026-10-03 踩到的
+        # 时间炸弹）。用与插件相同的换算函数构造固定 now，用例从此与时钟无关。
+        now = SOS.local_stamp_to_epoch("2026-10-02 12:00:00", tz_offset_minutes=TZ)
         await plugin._refresh_social(now)
         plugin._state.day_key = "2026-10-01"
         plugin._state.activity = A.DAILY
@@ -747,7 +750,8 @@ def test_social_state_is_persisted_and_survives_a_round_trip():
     async def run():
         module, plugin, host = _make_plugin(social={"enabled": True})
         host.api_returns[TARGET] = digest_payload()
-        now = time.time()
+        # 与上一用例同理：now 与夹具的 generated_at 对齐，时钟漂移不再影响结果。
+        now = SOS.local_stamp_to_epoch("2026-10-02 12:00:00", tz_offset_minutes=TZ)
         await plugin._refresh_social(now)
         plugin._state.day_key = "2026-10-01"
         plugin._intake_social(now, plugin._sim_config())

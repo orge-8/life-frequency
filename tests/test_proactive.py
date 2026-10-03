@@ -93,6 +93,20 @@ def test_select_material_returns_none_when_all_expired():
     assert P.select_material([], now) is None
 
 
+def test_select_material_decays_past_best_until():
+    """G2：过了保鲜期的素材低价值化——按有效权重挑选，附 effective_weight 供评分。"""
+
+    now = 1000.0
+    stale = _material(weight=0.9, now=now)
+    stale["best_until"] = now - 800          # 已过保鲜期较久
+    stale["expires_at"] = now + 200          # 衰减到接近下限：0.9×0.4 = 0.36
+    fresh = _material(weight=0.6, now=now, label="新鲜")
+    fresh["best_until"] = now + 500
+    chosen = P.select_material([stale, fresh], now, floor=0.25)
+    assert chosen is not None and chosen["label"] == "新鲜"
+    assert chosen["effective_weight"] == pytest.approx(0.6)
+
+
 def test_build_intent_sanitizes_and_mentions_label():
     intent = P.build_intent({"label": "<小事>", "text": "{刚发生}"})
     assert "<" not in intent and "{" not in intent
@@ -309,3 +323,81 @@ def test_records_are_rebuilt_from_garbage():
     assert sessions["s1"]["last_user_message_at"] == pytest.approx(1000.0)
     P.record_proactive(sessions, stream_id="s1", now=1000.0, day_key="2026-02-08")
     assert sessions["s1"]["count"] == 1
+
+
+# ---------------------------------------------------------------- G1 未回应退避
+
+
+def test_unanswered_backoff_lengthens_interval_private_only():
+    """G1：对方连续不回应 → 间隔 ×2^连击 拉长（封顶）；仅私聊；回话立即归零。"""
+
+    record = {
+        "last_proactive_at": 900.0,        # 距 now=1000 只有 100 秒
+        "last_user_message_at": 0.0,       # 主动之后对方一直没说话
+        "unanswered_streak": 0,
+        "day_key": "2026-02-08",
+        "count": 0,
+    }
+    out = _decide(session=record, private_chat=True)
+    assert out.reason == P.REASON_INTERVAL
+    assert "未回应退避 ×2" in out.detail    # 第 1 次未回应：0+1 → 间隔 ×2
+
+    once = dict(record, unanswered_streak=1)
+    out = _decide(session=once, private_chat=True)
+    assert "×4" in out.detail               # 连击 1+1 → ×4
+
+    capped = dict(record, unanswered_streak=9)
+    out = _decide(session=capped, private_chat=True)
+    assert "×16" in out.detail              # 连击封顶 2^4 = 48 小时
+
+    out = _decide(session=record)           # 群聊 / 未传 private_chat：不退避
+    assert out.reason == P.REASON_INTERVAL
+    assert "退避" not in out.detail
+
+    replied = dict(record, last_user_message_at=950.0)   # 主动之后对方说过话
+    out = _decide(session=replied, private_chat=True)
+    assert out.reason == P.REASON_INTERVAL
+    assert "退避" not in out.detail
+
+    off = _decide(session=record, private_chat=True,
+                  config=_config(unanswered_backoff_factor=1.0))
+    assert "退避" not in off.detail          # 系数 1 = 关闭
+
+
+def test_record_proactive_tracks_unanswered_streak():
+    sessions: dict = {}
+    P.record_user_message(sessions, stream_id="s1", now=1000.0, day_key="2026-02-08")
+    P.record_proactive(sessions, stream_id="s1", now=2000.0, day_key="2026-02-08")
+    assert sessions["s1"]["unanswered_streak"] == 0     # 第 1 次主动：此前没有未回应
+    P.record_proactive(sessions, stream_id="s1", now=3000.0, day_key="2026-02-08")
+    assert sessions["s1"]["unanswered_streak"] == 1     # 第 1 次主动无人回应 → 连击 1
+    P.record_user_message(sessions, stream_id="s1", now=4000.0, day_key="2026-02-08")
+    P.record_proactive(sessions, stream_id="s1", now=5000.0, day_key="2026-02-08")
+    assert sessions["s1"]["unanswered_streak"] == 0     # 对方回过话 → 归零
+
+
+def test_backoff_level_is_observable_in_the_ledger():
+    """退避档位必须能被用户看见：``decision.backoff`` + 台账复合键渲染。
+
+    没有这一条，退避就是**静默生效**的——``/生活 为什么`` 只会显示一个笼统的
+    「距上次主动太近」，用户无从判断她是在正常冷却还是已经被降温到隔天一次。
+    """
+
+    record = {
+        "last_proactive_at": 900.0,
+        "last_user_message_at": 0.0,
+        "unanswered_streak": 1,
+        "day_key": "2026-02-08",
+        "count": 0,
+    }
+    out = _decide(session=record, private_chat=True)
+    assert out.reason == P.REASON_INTERVAL
+    assert out.backoff == pytest.approx(4.0)        # 连击 1+1 → ×4
+
+    group = _decide(session=record)                 # 群聊不退避
+    assert group.backoff == pytest.approx(1.0)
+
+    label = P.SKIP_REASON_LABELS[P.REASON_INTERVAL]
+    lines = P.ledger_lines({f"{P.REASON_INTERVAL}×4": 3, P.REASON_INTERVAL: 5})
+    assert f"{label} ×4：3 次" in lines
+    assert f"{label}：5 次" in lines

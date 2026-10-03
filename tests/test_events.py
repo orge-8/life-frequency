@@ -9,7 +9,7 @@ import life_events as E
 
 
 def test_builtin_library_shape():
-    assert len(E.BUILTIN_EVENTS) == 52
+    assert len(E.BUILTIN_EVENTS) == 55
     labels = [event.label for event in E.BUILTIN_EVENTS]
     assert len(set(labels)) == len(labels), "事件标签必须唯一"
     valid_activities = {
@@ -21,6 +21,23 @@ def test_builtin_library_shape():
         assert 0.0 <= event.weight <= 1.0, event.label
         assert -3.0 <= event.emotion <= 3.0, event.label
         assert event.material, f"{event.label} 应当有素材文本"
+
+
+def test_sick_rest_pool_not_all_negative():
+    """v1.5.1：养病事件池不许再是「全负价」。
+
+    真机 2026-10-03 前的旧池只有 2 条负价事件（嗓子疼 −0.8 / 出了身汗 −0.4），
+    事件抽取是均匀分布，40%/tick 的触发率给出 −0.24/分tick 的情绪冲击，
+    大于 0.2/tick 的回归速率——感冒期间情绪被钉在 0~2 分（仿真 mean 1.89），
+    病愈后 24h 余波继续 −0.6。守卫：池均价必须 ≥ −0.2，且至少有一条正价事件。
+    """
+
+    sick = E.eligible_events(E.BUILTIN_EVENTS, "sick_rest")
+    assert sick, "养病事件池不应当为空"
+    assert len(sick) >= 3, f"养病事件池至少 3 条（含正价），实际 {len(sick)}"
+    mean_emotion = sum(event.emotion for event in sick) / len(sick)
+    assert mean_emotion >= -0.2, f"养病事件池均价 {mean_emotion:+.2f} 过负（会把感冒情绪钉在地板）"
+    assert any(event.emotion > 0 for event in sick), "养病事件池至少要有一条正价事件"
 
 
 # ---------------------------------------------------------------- 清洗

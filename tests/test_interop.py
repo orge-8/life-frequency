@@ -24,6 +24,7 @@ import math
 import pathlib
 import sys
 import time
+from typing import Any
 
 import pytest
 
@@ -1419,5 +1420,127 @@ def test_persona_injection_is_capped_by_config():
         zero_prompts = [kw.get("prompt", "") for kw in zero_host.calls_of("llm.generate")]
         assert zero_prompts, "应该调过一次模型"
         assert "十九岁" not in zero_prompts[-1], "persona_max_chars=0 时不该带人设"
+
+    asyncio.run(run())
+
+
+def _proactive_material(now: float) -> dict[str, Any]:
+    return {
+        "label": "小事",
+        "text": "刚发生的一件小事",
+        "weight": 0.9,
+        "created_at": now,
+        "expires_at": now + 3600.0,
+    }
+
+
+def _proactive_triggered(host) -> list[str]:
+    """取主动开口触发过的会话（按顺序去重）。
+
+    ⚠ 测试脚手架的已知习惯：``ScaleHost.rpc_call`` 先记一次，未接住的能力落到
+    ``FakeHost.rpc_call`` 会**再记一次**（api.call 等落穿能力皆双记）。
+    ``maisaka.proactive.trigger`` 正是落穿能力，所以这里必须去重后再断言。
+    """
+
+    return list(dict.fromkeys(
+        kw.get("stream_id") for kw in host.calls_of("maisaka.proactive.trigger")
+    ))
+
+
+def test_proactive_scope_whitelist_and_intersection_with_apply():
+    """v1.5.2：主动开口自己的白名单；有效范围 = [apply] ∩ [proactive]。
+
+    ``[apply]`` 是总闸（频率 + 主动开口），``[proactive]`` 只能在总闸内**再收窄**。
+    """
+
+    async def run():
+        _module, plugin, host = _make_plugin(
+            proactive={
+                "enabled": True,
+                "quiet_hours": [],
+                "filter_mode": "whitelist",
+                "target_chats": ["group:123456"],       # host.sessions 里 group-1 的群号
+            },
+        )
+        now = time.time()
+        plugin._state.materials = [_proactive_material(now)]
+        await plugin._maybe_proactive(now)
+        assert _proactive_triggered(host) == ["group-1"], "白名单内的群应当能主动开口"
+
+        # 白名单换成一个不存在的群 ⇒ 不命中 ⇒ 不触发（排除 daily_max 等其它闸的干扰：
+        # 每次断言前清空会话记录，让它回到「今天一次都没开口」的初始态）
+        host.calls.clear()
+        plugin._state.sessions.clear()
+        plugin.config.proactive.target_chats = ["group:999"]
+        await plugin._maybe_proactive(now)
+        assert not host.calls_of("maisaka.proactive.trigger"), "白名单外的会话不该主动开口"
+
+        # proactive 放开为 all，但 [apply] 总闸收窄 ⇒ 交集为空 ⇒ 仍不触发
+        plugin.config.proactive.filter_mode = "all"
+        plugin.config.proactive.target_chats = []
+        plugin.config.apply.filter_mode = "whitelist"
+        plugin.config.apply.target_chats = ["group:999"]
+        await plugin._maybe_proactive(now)
+        assert not host.calls_of("maisaka.proactive.trigger"), "[apply] 总闸必须继续生效"
+
+    asyncio.run(run())
+
+
+def test_proactive_scope_blacklist_and_illegal_mode_fallback():
+    """v1.5.2：黑名单与非法值回退——写错 filter_mode 必须告警一次并保守处理。"""
+
+    async def run():
+        module, plugin, host = _make_plugin(
+            proactive={"enabled": True, "quiet_hours": [], "filter_mode": "白名单"},
+        )
+        now = time.time()
+        plugin._state.materials = [_proactive_material(now)]
+
+        records: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: records.append(record.getMessage())
+        log = logging.getLogger(f"plugin.{module.__plugin_id__}")
+        log.setLevel(logging.DEBUG)
+        log.addHandler(handler)
+        try:
+            # 非法值「白名单」→ 告警一次 + 按 whitelist 回退；target_chats 为空 ⇒ 无一命中
+            await plugin._maybe_proactive(now)
+        finally:
+            log.removeHandler(handler)
+        assert not host.calls_of("maisaka.proactive.trigger"), "回退后的空 whitelist 不该触发"
+        assert any("主动开口范围" in item and "filter_mode" in item for item in records), records
+
+        # 黑名单命中 group-1 ⇒ 它不能开口
+        plugin._state.sessions.clear()
+        plugin.config.proactive.filter_mode = "blacklist"
+        plugin.config.proactive.target_chats = ["group:123456"]
+        await plugin._maybe_proactive(now)
+        assert not host.calls_of("maisaka.proactive.trigger")
+
+        # 黑名单换成别的群 ⇒ group-1 解禁，可以开口
+        plugin.config.proactive.target_chats = ["group:999"]
+        await plugin._maybe_proactive(now)
+        assert _proactive_triggered(host) == ["group-1"], "黑名单外的会话应当能主动开口"
+
+    asyncio.run(run())
+
+
+def test_proactive_scope_defaults_to_all_and_shows_in_status():
+    """v1.5.2：默认 filter_mode=all 行为与旧版完全一致；状态卡显示当前范围。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin(proactive={"enabled": True, "quiet_hours": []})
+        now = time.time()
+        plugin._state.materials = [_proactive_material(now)]
+        await plugin._maybe_proactive(now)
+        assert _proactive_triggered(host) == ["group-1"], "默认 all 下不该改变既有行为"
+
+        card_all = plugin._render_status(now, "group-1")
+        assert "主动开口：已启用（范围：全部会话）" in card_all, card_all
+
+        plugin.config.proactive.filter_mode = "whitelist"
+        plugin.config.proactive.target_chats = ["group:123456", "private:42"]
+        card_whitelist = plugin._render_status(now, "group-1")
+        assert "主动开口：已启用（范围：白名单 2 个）" in card_whitelist, card_whitelist
 
     asyncio.run(run())
