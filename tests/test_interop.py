@@ -1544,3 +1544,394 @@ def test_proactive_scope_defaults_to_all_and_shows_in_status():
         assert "主动开口：已启用（范围：白名单 2 个）" in card_whitelist, card_whitelist
 
     asyncio.run(run())
+
+
+def test_host_dynamic_mode_is_detected_and_uses_dynamic_curve_set():
+    """v1.6.0（MaiBot 1.3.2）：``reply_trigger_mode="dynamic"`` 必须被认出来。
+
+    旧插件只认 frequency/reply_necessity，读到 dynamic 会**静默退回计数门**——
+    曲线选错（数条数 vs 目标回复比例）、状态卡印错结论，而且没有任何告警。
+    """
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        host.config_values["chat.reply_timing.reply_trigger_mode"] = "dynamic"
+        await plugin._refresh_host_context()
+        assert plugin._host_mode == "dynamic"
+        assert plugin._host_mode_source == "host"
+
+        # 曲线组跟着模式走：只改 dynamic 那一套，拆解里印的组名必须是 dynamic
+        plugin.config.emotion_energy.curves.dynamic.mood = ["0=0.20", "10=1.0"]
+        breakdown = plugin._compute_breakdown(time.time())
+        assert breakdown.curve_set == "dynamic"
+        assert breakdown.adjust < 1.0, "被调窄的 dynamic 曲线应当确实生效"
+
+        # 状态卡按动态门渲染：不出现计数门/评分门那套条数结论
+        card = await plugin._render_frequency(time.time(), "group-1")
+        assert "动态门" in card, card
+        assert "不适用" in card, "动态门下不该再报「纯闲聊需要几条」"
+        assert "评分门" not in card and "必要性系数" not in card, card
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 六、睡眠中被 @ 唤醒（v1.7.0）
+
+
+def _sleepy(plugin, now: float) -> None:
+    """把她摆进「正睡着」的状态（不推进真实时钟，直接改状态）。"""
+
+    plugin._state.activity = "sleep"
+    plugin._state.activity_since = now - 3600
+    plugin._state.sleep_started_at = now - 3600
+    plugin._state.sleep_minutes_today = 60
+    plugin._state.energy = 5.0
+    plugin._state.at_wake_until = 0.0
+
+
+def test_at_while_asleep_wakes_and_writes_awake_adjust():
+    """核心行为：睡着时一条 `@` 必须让她在宿主眼里**不再静默**（倍率 > 0）。
+
+    必须先写：宿主的判定顺序是「先判静默（`turn_trigger/scheduler.py:57`）、
+    再判 `@` 强制触发（`:65`）」，而钩子（`bot.py:812`）早于 `runtime.register_message()`
+    的武装与调度（`:923`/`:935`）返回 —— 所以只有钩子里这一笔能救这条 `@`。
+    """
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        now = time.time()
+        _sleepy(plugin, now)
+
+        # 前提：睡眠时倍率确实是 0（宿主进入了静默消费）
+        await plugin._apply_sweep(now)
+        assert host.adjust.get("group-1") == pytest.approx(0.0), "睡眠本就该是 0"
+        host.calls.clear()
+
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+
+        written = host.calls_of("frequency.set_adjust")
+        assert len(written) == 1, f"应当刚好写一次：{written}"
+        assert written[0]["chat_id"] == "group-1"
+        value = float(written[0]["value"])
+        assert value > 0.0, "写出去的值必须是正的，否则宿主照样静默消费"
+        assert value == pytest.approx(plugin._compute_breakdown(time.time()).adjust)
+        # 窗口写入 state 且记账记成「自己写的」（否则下轮会把自己的值当外部基数，乘两次）
+        assert plugin._state.at_wake_until > time.time()
+        assert plugin._state.at_wake_until <= now + 10 * 60 + 2
+        assert plugin._state.applied["group-1"] == pytest.approx(value)
+
+    asyncio.run(run())
+
+
+def test_wake_only_reacts_to_at_and_only_while_asleep():
+    """只认 `@`，且只在她睡着时；提及（喊名字）与醒着都不开窗口。
+
+    与宿主默认值对齐：``inevitable_at_reply`` 默认 true、``mentioned_bot_reply`` 默认 false，
+    所以「提及必回复」本来就不强制，本插件也不必替它做。
+    """
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        now = time.time()
+
+        # 1) 醒着：不开窗口、不写
+        plugin._state.activity = "daily"
+        plugin._state.at_wake_until = 0.0
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+        assert plugin._state.at_wake_until == 0.0
+        assert not host.calls_of("frequency.set_adjust")
+
+        # 2) 睡着，但只是被提及（is_mentioned）⇒ 不唤醒
+        _sleepy(plugin, now)
+        await plugin.note_session(
+            message={"session_id": "group-1", "is_mentioned": True}
+        )
+        assert plugin._state.at_wake_until == 0.0
+        assert not host.calls_of("frequency.set_adjust")
+
+        # 3) 睡着，普通消息 ⇒ 不唤醒
+        await plugin.note_session(
+            message={"session_id": "group-1", "processed_plain_text": "今晚好累"}
+        )
+        assert plugin._state.at_wake_until == 0.0
+        assert not host.calls_of("frequency.set_adjust")
+
+        # 4) 睡着 + @ ⇒ 唤醒（对照组，证明前三条不是「整条链路没工作」）
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+        assert plugin._state.at_wake_until > now
+        assert len(host.calls_of("frequency.set_adjust")) == 1
+
+    asyncio.run(run())
+
+
+def test_wake_window_expires_back_to_true_silence():
+    """窗口一过自动回睡：倍率重新变 0，不需要任何额外写入或定时器。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        now = time.time()
+        _sleepy(plugin, now)
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+        assert plugin._compute_breakdown(now).adjust > 0.0
+
+        # 手动把窗口推到期（等价于 10 分钟后）
+        plugin._state.at_wake_until = now - 1.0
+        assert plugin._wake_note(now) == ""
+        assert plugin._compute_breakdown(now).adjust == pytest.approx(0.0), "窗口过了就该是 0"
+        await plugin._apply_sweep(now)
+        assert host.adjust["group-1"] == pytest.approx(0.0)
+
+    asyncio.run(run())
+
+
+def test_wake_window_extends_on_repeat_at_without_second_rpc():
+    """窗口内再来 @ 只顺延截止时间，不重复写宿主（每条消息一次 RPC 是成本）。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        now = time.time()
+        _sleepy(plugin, now)
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+        host.calls.clear()
+
+        # 模拟「9 分钟后又来一条 @」：此刻窗口只剩 1 分钟（两条 @ 落在同一毫秒的话，
+        # ``max(旧值, now+窗口)`` 本来就不会变——那不是缺陷，是「只顺延、不叠加」）
+        plugin._state.at_wake_until = time.time() + 60
+        stale = plugin._state.at_wake_until
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+
+        assert not host.calls_of("frequency.set_adjust"), "窗口内重复 @ 不该再写一次"
+        assert plugin._state.at_wake_until > stale, "应当顺延窗口"
+        assert plugin._state.at_wake_until == pytest.approx(time.time() + 10 * 60, abs=3)
+        assert plugin._state.applied["group-1"] == pytest.approx(host.adjust["group-1"])
+
+    asyncio.run(run())
+
+
+def test_wake_can_be_disabled_and_zero_minutes_means_off():
+    """``wake_on_at=false`` 回到「睡就是睡」；``wake_minutes=0`` 同义（0 即关）。"""
+
+    async def run():
+        for overrides in (
+            {"simulation": {"wake_on_at": False}},
+            {"simulation": {"wake_minutes": 0}},
+        ):
+            _module, plugin, host = _make_plugin(**overrides)
+            now = time.time()
+            _sleepy(plugin, now)
+            await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+            assert plugin._state.at_wake_until == 0.0, overrides
+            assert not host.calls_of("frequency.set_adjust"), overrides
+
+    asyncio.run(run())
+
+
+def test_quiet_hours_and_scope_still_win_over_at():
+    """``quiet_hours``（用户自己设的静默时段）与 ``[apply]`` 范围优先于一句 `@`。"""
+
+    async def run():
+        # quiet_hours 覆盖「现在」⇒ 不唤醒（否则会写一个 0 出去、卡片却说被唤醒）
+        now = time.time()
+        local = time.localtime(now)
+        plugin_module, plugin, host = _make_plugin(
+            frequency={"quiet_hours": [f"{local.tm_hour:02d}:00-{(local.tm_hour + 1) % 24:02d}:00"]}
+        )
+        _sleepy(plugin, now)
+        assert plugin._in_quiet_hours(now) is True, "用例前提：现在确实落在静默时段里"
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+        assert plugin._state.at_wake_until == 0.0, "quiet_hours 里不该被 @ 叫醒"
+        assert not host.calls_of("frequency.set_adjust")
+
+        # 生效范围是白名单且不含这个群 ⇒ 不唤醒
+        _m2, plugin2, host2 = _make_plugin(
+            apply={"filter_mode": "whitelist", "target_chats": ["group:999"]}
+        )
+        _sleepy(plugin2, now)
+        await plugin2.note_session(message={"session_id": "group-1", "is_at": True})
+        assert plugin2._state.at_wake_until == 0.0
+        assert not host2.calls_of("frequency.set_adjust")
+
+    asyncio.run(run())
+
+
+def test_wake_keeps_compose_bookkeeping_single_written():
+    """唤醒那一笔也要进「自证记账」，否则巡检会把自己的值当外部基数**乘两次**。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin(apply={"compose_external": True})
+        now = time.time()
+        host.foreign_write("group-1", 0.5)          # 扮演 budget-pacer
+        _sleepy(plugin, now)
+        assert plugin._compose_external() is True
+
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+        woken = host.adjust["group-1"]
+        assert woken == pytest.approx(0.5 * plugin._compute_breakdown(now).adjust), "没叠上外部基数"
+
+        # 窗口内的巡检：值没变 ⇒ 一笔都不该再写，也绝不能变成 0.5 × 倍率 × 倍率
+        host.calls.clear()
+        await plugin._apply_sweep(now)
+        await plugin._apply_sweep(now)
+        assert not host.calls_of("frequency.set_adjust"), "重复巡检不该再写"
+        assert host.adjust["group-1"] == pytest.approx(woken), "倍率被乘了两次"
+        assert plugin._state.foreign["group-1"] == pytest.approx(0.5)
+
+    asyncio.run(run())
+
+
+def test_dry_run_wake_logs_window_but_writes_nothing():
+    """演算模式下照常推进状态、照常算倍率，但**一笔都不写宿主**。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin(simulation={"dry_run": True})
+        now = time.time()
+        _sleepy(plugin, now)
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+        assert plugin._state.at_wake_until > now, "窗口仍要记下来（状态卡要显示）"
+        assert not host.calls_of("frequency.set_adjust"), "演算模式不许写宿主"
+        assert host.adjust.get("group-1") is None
+
+    asyncio.run(run())
+
+
+def test_wake_is_visible_in_status_card_and_prompt_digest():
+    """可观测性：卡片与注入提示词都要说清「她本来在睡、刚被 @ 吵醒」。"""
+
+    async def run():
+        _module, plugin, _host = _make_plugin()
+        now = time.time()
+        _sleepy(plugin, now)
+        await plugin.note_session(message={"session_id": "group-1", "is_at": True})
+
+        status = plugin._render_status(now, "group-1")
+        assert "被 @ 唤醒" in status, status
+        card = await plugin._render_frequency(now, "group-1")
+        assert "被 @ 唤醒" in card, card
+        digest = plugin._life_digest()
+        assert "被 @ 吵醒" in digest, digest
+
+        # 窗口过了就都不该再提（否则提示词会让她一直以为刚被吵醒）
+        plugin._state.at_wake_until = now - 1.0
+        assert "被 @ 唤醒" not in plugin._render_status(now, "group-1")
+        assert await plugin._render_frequency(now, "group-1")
+        assert "被 @ 吵醒" not in plugin._life_digest()
+
+    asyncio.run(run())
+
+
+def test_hook_reads_group_and_user_ids_from_real_nested_payload():
+    """真机载荷是嵌套的（``message_info.group_info`` / ``message_info.user_info``）。
+
+    只读顶层键会让 ``_seen_sessions`` 里的群号/QQ 号在真机上恒为空串，
+    于是 ``[apply]`` / ``[proactive]`` 的 ``group:xxx`` / ``private:xxx`` 白名单匹配失效
+    （本地夹具用平铺键，所以一直绿）。用例直接喂**真机形状**的载荷。
+    """
+
+    async def run():
+        _module, plugin, _host = _make_plugin()
+        payload = {
+            "session_id": "group-1",
+            "is_at": True,
+            "message_info": {
+                "group_info": {"group_id": "123456", "group_name": "测试群"},
+                "user_info": {"user_id": "10001", "user_nickname": "某人"},
+            },
+        }
+        await plugin.note_session(message=payload)
+        info = plugin._seen_sessions["group-1"]
+        assert info["group_id"] == "123456", info
+        assert info["user_id"] == "10001", info
+        assert info["is_group_session"] is True
+
+        # 平铺形状仍要认（本地夹具 / 未来版本加了平铺键时行为不变）
+        _m2, plugin2, _h2 = _make_plugin()
+        await plugin2.note_session(
+            message={"session_id": "group-2", "group_id": "654321", "user_id": "20002"}
+        )
+        info2 = plugin2._seen_sessions["group-2"]
+        assert (info2["group_id"], info2["user_id"]) == ("654321", "20002")
+
+    asyncio.run(run())
+
+
+def test_wake_fields_are_visible_and_editable_in_webui_schema():
+    """两个新字段必须出现在 WebUI 配置页（看不见的开关等于没有这个功能）。
+
+    ⚠ 走**插件实例**的 ``get_webui_config_schema``：真机 Runner 调的就是它
+    （``runner_main.py:1468-1475``），而插件覆写过它来把嵌套节提升成顶层 section。
+    """
+
+    module, plugin, _host = _make_plugin()
+    sections = plugin.get_webui_config_schema(
+        plugin_id=module.__plugin_id__,
+        plugin_name="生活频率",
+        plugin_version="1.7.0",
+        plugin_description="",
+        plugin_author="orge-8",
+    )["sections"]
+    fields = sections["simulation"]["fields"]
+    assert fields["wake_on_at"]["type"] == "boolean", fields["wake_on_at"]
+    assert fields["wake_minutes"]["type"] == "integer", fields["wake_minutes"]
+    for name in ("wake_on_at", "wake_minutes"):
+        assert fields[name]["label"] != name, f"{name} 缺中文 label，WebUI 会显示成英文键名"
+    # 默认值本身就是产品决策：升级后「睡着被 @ 会回一句」默认生效，不写配置也能用
+    assert plugin.config.simulation.wake_on_at is True
+    assert int(plugin.config.simulation.wake_minutes) == 10
+
+
+def test_wake_window_roundtrips_and_bad_values_are_dropped():
+    """状态字段的持久化契约：旧状态文件（没有这个键）零迁移，坏时间戳按「没有窗口」处理。"""
+
+    _module, plugin, _host = _make_plugin()
+    State = type(plugin._state)
+    assert State.from_dict({}).at_wake_until == 0.0, "旧 life_state.json 必须照旧加载"
+    for bad in (float("inf"), float("-inf"), float("nan"), -5.0):
+        assert State.from_dict({"at_wake_until": bad}).at_wake_until == 0.0, bad
+    good = time.time() + 600
+    assert State.from_dict({"at_wake_until": good}).at_wake_until == pytest.approx(good)
+    assert State.from_dict({"at_wake_until": "abc"}).at_wake_until == 0.0, "非数值按缺省处理"
+
+
+# ---------------------------------------------------------------- 七、活动提示词告诉模型什么
+
+
+def test_activity_prompt_discloses_choice_effects_from_live_config():
+    """真机那条提示词（``ctx.llm.generate`` 的 payload）里必须带上「选择影响」事实。
+
+    断言的是**实际发出去的 prompt**，不是我自己拼的模板：``host.calls_of("llm.generate")``
+    拿到的就是 ``_ask_activity`` 交给模型的原文。数值必须跟着配置走（写死就会漂）。
+    """
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        host.returns["llm.generate"] = {
+            "success": True,
+            "response": '{"activity": "daily", "scene": "在做点日常的事"}',
+        }
+        # 改一个会进提示词的配置：上限从 12 小时改成 9 小时
+        plugin.config.simulation.max_sleep_hours = 9.0
+        await plugin._ask_activity(now=1_800_000_000.0)
+
+        prompts = [kw.get("prompt", "") for kw in host.calls_of("llm.generate")]
+        assert prompts, "应该调过一次模型"
+        prompt = prompts[-1]
+        for needle in (
+            "【这些选择会影响什么】",
+            "不要为了数值挑活动",
+            "体力每小时（恢复）",
+            "体力每小时（消耗）",
+            "情绪：默认会往基线",
+            "今日已睡/清醒",
+            "熬夜与上限",
+            "感冒：每天",
+            "说话多少",
+        ):
+            assert needle in prompt, needle
+        assert "9 小时" in prompt, "提示词里的睡眠上限必须来自配置（写死就会漂）"
+        assert "12 小时" not in prompt, "旧配置值不该残留"
+        # 睡眠唤醒的事实要如实跟随开关：默认开 ⇒ 说「被 @ 会临时醒来一次」
+        assert "被 @ 会临时醒来一次" in prompt
+        # 经济没接上（hint 为空）时不许凭空提钱，否则会诱导「为了省钱挑活动」
+        assert "钱：活动不改变" not in prompt
+
+    asyncio.run(run())

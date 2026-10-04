@@ -1262,3 +1262,97 @@ def test_wake_without_anchor_falls_back_to_day_total():
     )
     assert state.sleep_debt_nights == 1
     assert state.sleep_ledger == [], "兜底路径不计账本"
+
+
+# ---------------------------------------------------------------- 提示词里的「选择影响」事实
+
+
+def _effects(**overrides):
+    kwargs = dict(
+        activity_factors={A.SLEEP: 0.0, A.DAILY: 1.0, "game": 0.5, "before_sleep": 1.15},
+        at_wake=True,
+        mention_economy=True,
+    )
+    kwargs.update(overrides)
+    return "\n".join(S.activity_effect_lines(S.SimConfig(), **kwargs))
+
+
+def test_effect_lines_track_config():
+    """影响说明必须与真配置**同源**：配置一改，行文跟着变（写死数值就会漂）。
+
+    这是「提示词不许比实现更旧」的守卫：模型按错的因果选择，而 enforce 只按真值收口，
+    两边永远对不上。
+    """
+
+    text = _effects()
+    # 体力表（settle 用的同一张）、睡眠上限、熬夜阈值、体力上限、情绪参数
+    assert "睡觉 +1.20" in text
+    assert "打游戏 -0.70" in text
+    assert "深夜做题 -1.20" in text
+    assert "12 小时" in text
+    assert "低于 5 小时" in text
+    assert "8.5" in text
+    assert "0.20/10 分钟" in text
+    assert "40%" in text
+
+    # 反向：整份配置换一套，行文必须整体跟着变
+    changed = S.SimConfig(
+        max_sleep_hours=9.0,
+        min_awake_hours_per_day=6.0,
+        sleep_debt_threshold_minutes=240,
+        sleep_deprived_energy_cap=7.5,
+        cold_base_risk=0.5,
+        cold_check_hour=5,
+        fire_probability=0.9,
+        recover_per_tick=0.5,
+        energy_delta_per_hour={A.SLEEP: 2.0, "work": -3.0},
+    )
+    other = "\n".join(
+        S.activity_effect_lines(changed, activity_factors={A.SLEEP: 0.0, A.DAILY: 1.0})
+    )
+    assert "睡觉 +2.00" in other and "工作 -3.00" in other
+    assert "9 小时" in other and "12 小时" not in other
+    assert "6 小时" in other
+    assert "低于 4 小时" in other
+    assert "7.5" in other
+    assert "5:00" in other and "50%" in other
+    assert "0.50/10 分钟" in other and "90%" in other
+    assert "睡觉 +1.20" not in other, "旧配置的数值不该残留"
+
+
+def test_effect_lines_state_the_at_wake_and_money_facts():
+    """两件必须如实说明、否则会凭空造出错误因果的事。"""
+
+    # ① @ 唤醒开着 / 关着，说法必须不同
+    assert "被 @ 会临时醒来一次" in _effects(at_wake=True)
+    assert "连 @ 也不回" in _effects(at_wake=False)
+
+    # ② 经济只在有提示词时才提，而且要说清「活动与钱无关」
+    assert "钱：活动不改变" in _effects(mention_economy=True)
+    assert "钱：" not in _effects(mention_economy=False)
+
+    # ③ 班表只在自己启用了作息班表时才提
+    assert "作息班表" not in _effects()
+    scheduled = S.SimConfig(schedule=A.ScheduleConfig(enabled=True, workdays=(1, 2, 3, 4, 5)))
+    assert "作息班表" in "\n".join(
+        S.activity_effect_lines(scheduled, activity_factors={A.SLEEP: 0.0})
+    )
+
+    # ④ 体力满立刻唤醒关掉时，不该再声称「回到上限就立刻醒」
+    no_auto = S.SimConfig(energy_full_wake=False)
+    assert "立刻醒" not in "\n".join(
+        S.activity_effect_lines(no_auto, activity_factors={A.SLEEP: 0.0})
+    )
+
+
+def test_effect_lines_quote_the_activity_factor_range_not_a_hardcoded_one():
+    """发言频率只说结论与幅度，且幅度来自真实因子表。"""
+
+    narrow = _effects(activity_factors={A.SLEEP: 0.0, A.DAILY: 1.0, "game": 0.9})
+    wide = _effects(activity_factors={A.SLEEP: 0.0, A.DAILY: 1.0, "game": 0.1})
+    assert "1.1 倍" in narrow
+    assert "10.0 倍" in wide
+    assert "别为了让她多说话或少说话而挑活动" in wide
+
+    # 没有因子表就不提频率（避免在不知道数值时乱说）
+    assert "说话多少" not in _effects(activity_factors=None)

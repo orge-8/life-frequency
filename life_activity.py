@@ -632,6 +632,14 @@ class PromptInput:
     schedule_lines: tuple[str, ...] = field(default_factory=tuple)
     """班表事实（工作日/在岗/岗位职责…）。空 = 不提作息。"""
 
+    effect_lines: tuple[str, ...] = field(default_factory=tuple)
+    """「选这个活动会影响什么」的事实行（由 ``life_sim.activity_effect_lines`` 从
+    **真配置**渲染）。空 = 不提影响。
+
+    为什么不把数值写死在提示词模板里：那些数字就是 ``settle``/``enforce`` 用的同一份
+    配置，写死必然漂移；模型按错的因果选择、而强制层只按真值收口，两边永远对不上。
+    """
+
     economy_hint: str = ""
     """手头紧时的一段约束（来自经济维度）。空串 = 不提钱的事。"""
 
@@ -730,6 +738,16 @@ def build_prompt(prompt_input: PromptInput) -> str:
         f"约束：睡眠时段 {prompt_input.sleep_window_text}（此时间之外只有体力很低或生病才会睡）；"
         f"换活动有最短停留时间；每天至少要清醒一段时间。"
     )
+    if prompt_input.effect_lines:
+        lines.append("")
+        lines.append(
+            "【这些选择会影响什么】（下面都是事实说明，不是评分表；"
+            "请按生活合理性选活动，不要为了数值挑活动）"
+        )
+        for raw in prompt_input.effect_lines:
+            cleaned = sanitize_text(raw, max_chars=260)
+            if cleaned:
+                lines.append(f"· {cleaned}")
     lines.append("")
 
     lines.append("【输出要求】")
@@ -871,18 +889,21 @@ def _must_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
 
 
 def _energy_full_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
-    """体力回满就该醒：睡眠的目的是恢复体力，满了继续睡只是空转。
+    """体力回满就**立刻**醒：睡眠的目的是恢复体力，满了继续睡只是空转。
 
-    仍尊重最短睡眠时长（与「本次睡眠未满 N 分钟继续睡」同一把尺）——带着
-    接近满的体力上床也要睡够最低时长，否则变成「刚睡下就被叫起来」。上限读
-    ``facts.energy_cap``（**动态值**：连熬 3 晚后是 8.5），而不是写死 10。
+    v1.6.0（真机调参）：**不再要求睡满最短时长**。旧条件让体力已经回满的她继续躺到
+    ``min_sleep_minutes``——真机实拍「体力 10.0/10、已持续 73 分钟仍在睡」，而这段时间
+    不恢复任何东西。上限读 ``facts.energy_cap``（**动态值**：连熬 3 晚后是 8.5），
+    而不是写死 10。
+
+    已知代价（不想要就关 ``[simulation] energy_full_wake``）：模型在她满体力时若仍
+    反复提议睡觉、且此刻处于睡眠窗口内，会出现「睡下 → 下一个推进间隔被唤醒 →
+    再提议睡」的短周期往复；真实睡眠由体力低于阈值或窗口驱动的部分不受影响。
     """
 
     if not policy.energy_full_wake:
         return False
-    if float(facts.energy) < float(facts.energy_cap):
-        return False
-    return facts.minutes_in_activity >= policy.min_sleep_minutes
+    return float(facts.energy) >= float(facts.energy_cap)
 
 
 def _awake_floor_ok(facts: ActivityFacts, policy: EnforcePolicy) -> bool:

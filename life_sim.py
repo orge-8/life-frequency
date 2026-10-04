@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 try:  # 包式加载（Runner 真机）
     from .life_activity import (
+        ACTIVITY_LABELS,
         ALLOWED_ACTIVITIES,
         DAILY,
         SLEEP,
@@ -43,6 +44,7 @@ try:  # 包式加载（Runner 真机）
     from .life_events import LifeEvent, pick_event, sanitize_text
 except ImportError:  # 平铺兜底（脚本直跑 / 测试）
     from life_activity import (
+        ACTIVITY_LABELS,
         ALLOWED_ACTIVITIES,
         DAILY,
         SLEEP,
@@ -244,8 +246,9 @@ class SimConfig:
     min_awake_hours_per_day: float = 8.0
     min_dwell_minutes: int = 60
     min_sleep_minutes: int = 180
-    #: 睡眠中体力恢复到上限且睡满最短时长就强制唤醒（「睡觉的目的是恢复体力，
-    #: 满了继续睡只是空转」）。默认开；关掉则回到「模型提议醒 / 睡满每日上限」两条路。
+    #: 睡眠中体力恢复到上限就强制唤醒（v1.6.0：**不再要求睡满最短时长**——
+    #: 体力满了继续躺只是空转，真机实测她带着 10.0/10 又睡了 73 分钟）。
+    #: 默认开；关掉则回到「模型提议醒 / 睡满每日上限」两条路。
     energy_full_wake: bool = True
 
     inertia_minutes: int = 40
@@ -293,6 +296,136 @@ class SimConfig:
 
     #: 作息班表（``[activity.schedule]``）。默认关闭 = 与加这一层之前完全一致。
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+
+
+def _activity_label(activity: str) -> str:
+    return ACTIVITY_LABELS.get(str(activity), str(activity))
+
+
+def activity_effect_lines(
+    config: SimConfig,
+    *,
+    activity_factors: Mapping[str, float] | None = None,
+    at_wake: bool = False,
+    mention_economy: bool = False,
+) -> tuple[str, ...]:
+    """「选这个活动会影响什么」的事实行，供活动决策提示词使用。
+
+    ⚠ **全部数字都从 ``config`` / ``activity_factors`` 现算**，一个都不写死。理由：
+    提示词里印一个和实现不同的数值，比不印更糟 —— 模型会按错的因果做选择，而
+    ``enforce`` 只按真值收口，两边永远对不上；用户改了配置（比如
+    ``[events] fire_probability`` 或 ``[health] sleep_debt_threshold_minutes``）
+    提示词也必须跟着变。回归用例见 ``tests/test_sim.py::test_effect_lines_track_config``。
+
+    ``at_wake`` / ``mention_economy`` 是**要如实说明**的两件事：
+    ``at_wake`` 关掉时「睡觉连 `@` 都不回」才成立；经济维度与活动无关，
+    不说清楚模型可能会「为了省钱挑便宜的活动」——那是我在 prompt 里凭空创造出的因果。
+    """
+
+    lines: list[str] = []
+
+    # ---- 体力：每小时增减（真值就是 settle 里用的那张表）----
+    deltas: dict[str, float] = {}
+    for key, value in dict(config.energy_delta_per_hour).items():
+        number = _as_float(value)
+        if number is not None and math.isfinite(number):
+            deltas[str(key)] = float(number)
+    gains = sorted(((k, v) for k, v in deltas.items() if v > 0), key=lambda kv: -kv[1])
+    costs = sorted(((k, v) for k, v in deltas.items() if v < 0), key=lambda kv: kv[1])
+    if gains:
+        lines.append(
+            "体力每小时（恢复）："
+            + "、".join(f"{_activity_label(k)} +{v:.2f}" for k, v in gains)
+        )
+    if costs:
+        lines.append(
+            "体力每小时（消耗）："
+            + "、".join(f"{_activity_label(k)} {v:.2f}" for k, v in costs)
+        )
+
+    # ---- 情绪 ----
+    tick_minutes = max(1.0, float(config.tick_seconds) / 60.0)
+    lines.append(
+        f"情绪：默认会往基线（{config.baseline_emotion:.1f} ± 最近 24 小时事件余波 "
+        f"{config.afterglow_cap:.1f}）回归，约 {config.recover_per_tick:.2f}/"
+        f"{tick_minutes:.0f} 分钟，睡觉时快 {config.sleep_recover_multiplier:.1f} 倍；"
+        "真正拉高或拉低情绪的是发生的事（清醒时每个推进间隔有 "
+        f"{_clamp(config.fire_probability, 0.0, 1.0):.0%} 概率发生一件，"
+        "不同活动会抽到不同的事）。"
+    )
+
+    # ---- 今日已睡 / 清醒 + 睡眠怎么结束 ----
+    lines.append(
+        f"今日已睡/清醒：只有 sleep 计入「已睡」，其余活动都计入「清醒」；"
+        f"已睡累计（或这一觉连续）到 {config.max_sleep_hours:g} 小时会被强制叫醒；"
+        f"清醒不足 {config.min_awake_hours_per_day:g} 小时则不许入睡"
+        f"（生病或体力低于 {config.sleep_energy_threshold:g} 时不受此限）。"
+    )
+    if config.energy_full_wake:
+        lines.append(
+            "睡觉怎么结束：体力回到上限就立刻醒（上限随熬夜天数变，见下条），"
+            f"不会睡到自然醒；或睡满 {config.max_sleep_hours:g} 小时被强制唤醒。"
+        )
+
+    # ---- 熬夜与体力上限 ----
+    lines.append(
+        f"熬夜与上限：每次睡醒按最近 24 小时实际睡够多少判，低于 "
+        f"{config.sleep_debt_threshold_minutes / 60.0:g} 小时算一夜没睡够；"
+        f"连 {config.sleep_debt_cap_nights} 夜会把体力上限从 {config.energy_max:g} "
+        f"压到 {config.sleep_deprived_energy_cap:g}（上限变低也更容易感冒）。"
+    )
+
+    # ---- 感冒 ----
+    lines.append(
+        f"感冒：每天 {config.cold_check_hour}:00 之后判一次，基础 "
+        f"{_clamp(config.cold_base_risk, 0.0, 1.0):.0%}，每有一晚没睡够 +"
+        f"{_clamp(config.cold_sleep_debt_risk, 0.0, 1.0):.0%}，"
+        f"体力低于 {config.sleep_energy_threshold:g} 时再 +"
+        f"{_clamp(config.cold_sleep_debt_risk, 0.0, 1.0):.0%}；中招 "
+        f"{config.cold_min_days}~{max(config.cold_min_days, config.cold_max_days)} 天，"
+        "期间除睡觉外只能养病，说话也会明显变少。"
+    )
+
+    # ---- 班表（仅启用时）----
+    if config.schedule.enabled:
+        lines.append(
+            "作息班表：上班/通勤/午休这些相位里的活动受限，违反会被强制改掉"
+            "（上面的班表行已经写明现在适合哪些）。"
+        )
+
+    # ---- 钱（经济提示存在时才说，避免无谓噪音）----
+    if mention_economy:
+        lines.append(
+            "钱：活动不改变手头宽裕程度——经济维度只读预算插件的数据，"
+            "手头紧只会让她的场景与语气省着花。不要为了省钱挑活动。"
+        )
+
+    # ---- 发言频率（只说结论，不给数值清单）----
+    if activity_factors:
+        values: list[float] = []
+        for key, value in activity_factors.items():
+            number = _as_float(value)
+            if str(key) == SLEEP or number is None or not math.isfinite(number):
+                continue
+            if number > 0:
+                values.append(float(number))
+        ratio_text = ""
+        if values and min(values) > 0:
+            ratio = max(values) / min(values)
+            ratio_text = f"其余活动之间最多相差约 {ratio:.1f} 倍。"
+        if float(_as_float(activity_factors.get(SLEEP), 0.0) or 0.0) <= 0:
+            silent_part = (
+                "睡觉等于完全静默——消息照收、进历史，但不进她的思考"
+                + ("（被 @ 会临时醒来一次）" if at_wake else "（连 @ 也不回）")
+            )
+        else:
+            silent_part = "睡觉时说话极少"
+        lines.append(
+            f"说话多少：{silent_part}；{ratio_text}"
+            "别为了让她多说话或少说话而挑活动。"
+        )
+
+    return tuple(lines)
 
 
 class SimConfigError(ValueError):
@@ -454,6 +587,14 @@ class LifeState:
     activity_note: str = ""
     activity_since: float = 0.0
     scene: str = ""
+    #: 睡眠期间被 ``@`` 唤醒到的时刻（epoch 秒；``0`` = 没有唤醒窗口）。
+    #: 它是一条**临时清醒窗口**：``now < at_wake_until`` 时倍率按清醒算，而不是睡眠的 0。
+    #: 原因是宿主的判定顺序——先判「频率是否静默」再判「`@` 强制触发」
+    #: （``src/maisaka/turn_trigger/scheduler.py:57`` / ``:65``），倍率为精确 0 时这条 `@`
+    #: 会被静默轮吃掉（``reasoning_engine.py:1197`` 还会清掉强制轮标记），所以她必须先在
+    #: 宿主眼里「不是静默」才有机会回话。窗口一过，只要 ``activity`` 仍是 ``sleep``
+    #: 就自动回到静默（``plugin._effective_activity``），不需要额外清理。
+    at_wake_until: float = 0.0
 
     emotion: float = BASELINE_EMOTION
     energy: float = 6.0
@@ -560,6 +701,10 @@ class LifeState:
         state.emotion = _clamp(state.emotion, 0.0, EMOTION_MAX)
         state.energy = _clamp(state.energy, 0.0, ENERGY_MAX)
         state.energy_cap = _clamp(state.energy_cap, 1.0, ENERGY_MAX)
+        if not math.isfinite(state.at_wake_until) or state.at_wake_until < 0.0:
+            # 坏时间戳按「没有唤醒窗口」处理：``inf`` 会让她从此不睡，``nan`` 的比较恒为假
+            # （看着无害，但状态卡会印出 nan，排查时无从判断）
+            state.at_wake_until = 0.0
         state.applied = _sanitize_adjust_map(state.applied)
         state.foreign = _sanitize_adjust_map(state.foreign)
         state.observed = _sanitize_adjust_map(state.observed)

@@ -95,6 +95,18 @@ def test_unknown_mode_falls_back_to_frequency_curve():
     assert _adjust(mode="garbage").curve_set == "frequency"
 
 
+def test_dynamic_curve_set_is_independent():
+    """v1.6.0：``dynamic``（宿主 1.3.2）有自己的一套曲线，不与 frequency 串用。"""
+
+    assert _config().curve_set_for("dynamic") is not None
+    widened = F.CurveSet(mood=((0.0, 0.35), (10.0, 1.3)))
+    config = _config(curves_dynamic=widened)
+    dynamic = _adjust(config=config, mode="dynamic", emotion=0.0)
+    frequency = _adjust(config=config, mode="frequency", emotion=0.0)
+    assert dynamic.curve_set == "dynamic"
+    assert dynamic.adjust < frequency.adjust, "只改 dynamic 组时 frequency 组应保持原提案"
+
+
 # ---------------------------------------------------------------- 硬闸
 
 

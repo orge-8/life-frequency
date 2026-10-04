@@ -36,25 +36,34 @@ from math import ceil, log1p
 
 MODE_FREQUENCY = "frequency"
 MODE_REPLY_NECESSITY = "reply_necessity"
-"""两条通路的标识，与宿主 ``reply_trigger_mode`` 的取值一一对应。"""
+MODE_DYNAMIC = "dynamic"
+"""三条通路的标识。
+
+- ``frequency`` / ``dynamic`` 是 MaiBot 1.3.2 的两个合法取值
+  （``src/config/official_configs.py``：``Literal["frequency", "dynamic"]``）。
+- ``reply_necessity`` 是 1.3.1 及更早的取值，1.3.2 用 ``dynamic`` 取代了它
+  （``turn_trigger/`` 里只剩计数门与动态门，没有了必要性门）。保留识别它是为了
+  兼容仍跑旧宿主的部署；新宿主不会再返回这个值。
+"""
 
 DEFAULT_MODE = MODE_FREQUENCY
-"""宿主默认值（``official_configs.py:599``）。读不到配置时按它处理。"""
+"""宿主默认值（``official_configs.py``）。读不到配置时按它处理。"""
 
-ALL_MODES = (MODE_FREQUENCY, MODE_REPLY_NECESSITY)
+ALL_MODES = (MODE_FREQUENCY, MODE_REPLY_NECESSITY, MODE_DYNAMIC)
 
 MODE_LABELS = {
     MODE_FREQUENCY: "计数门（frequency）",
-    MODE_REPLY_NECESSITY: "评分门（reply_necessity）",
+    MODE_REPLY_NECESSITY: "评分门（reply_necessity·宿主 ≤1.3.1）",
+    MODE_DYNAMIC: "动态触发（dynamic）",
 }
 
 
 def normalize_mode(value: object) -> str:
-    """把任意配置值归一化成两个合法模式之一。
+    """把任意配置值归一化成三个合法模式之一。
 
-    宿主只接受 ``frequency`` / ``reply_necessity``；其余（含 ``None``、空串、
-    大小写差异、旧配置残留）一律按宿主默认 ``frequency`` 处理，绝不抛错——
-    这个函数会在每个 tick 被调用，不能因为一个脏配置把后台循环打死。
+    宿主 1.3.2 只接受 ``frequency`` / ``dynamic``；其余（含 ``None``、空串、
+    大小写差异、旧配置里的 ``reply_necessity``、脏值）一律按宿主默认 ``frequency``
+    处理，绝不抛错——这个函数会在每个 tick 被调用，不能因为一个脏配置把后台循环打死。
     """
 
     text = str(value or "").strip().lower()
@@ -115,7 +124,71 @@ DEFAULT_CHATTER_MESSAGE_LENGTH = 8
 宿主的**内容分**来自整批拼接长度（``reply_necessity.py:158/267-273``），所以
 「同一批里有多少条」和「这批有多长」是耦合的；不写明这个假设，
 `/生活 频率` 印出的数字就无从解释。用户消息更长时会更早触发（更少条数）。
+
+⚠ 这个假设只对计数门 / 评分门（宿主 ≤1.3.1）有意义：1.3.2 的动态门不数条数。
 """
+
+
+# ---------------------------------------------------------------- 动态门（MaiBot 1.3.2）
+
+DYNAMIC_WINDOW_SECONDS = 3600.0
+"""动态门的统计窗口：1 小时（``turn_trigger/dynamic_gate.py``）。"""
+
+DYNAMIC_FORCED_EXPECTED_REPLIES = 0.91
+"""一次 @ 强制触发按 0.91 次「预期回复」计入窗口（``dynamic_gate.py`` 的
+``FORCED_TURN_EXPECTED_REPLIES``，拟合数据中的实测均值）。"""
+
+DYNAMIC_VIRTUAL_ROUND_SECONDS = 40.0
+"""预期回复数按「虚拟轮次」累计：同一时长内到达的消息归为一轮、只计一次
+（``VIRTUAL_ROUND_SECONDS``）。不设门控时 Planner 本来就不是每条消息判一次，
+思考耗时/空闲退避/wait 会把消息攒成一批（拟合数据里平均每批 2.9 条）。"""
+
+DYNAMIC_MIN_WINDOW_SCORE_COUNT = 20
+"""窗口内样本少于它时用静态阈值表；够了才按「概率从高到低累积到预算」定门槛。"""
+
+DYNAMIC_STATIC_KEEP_RATIO_THRESHOLDS: tuple[tuple[float, float], ...] = (
+    (0.0, 1.0),
+    (0.1, 0.605),
+    (0.2, 0.482),
+    (0.3, 0.430),
+    (0.4, 0.376),
+    (0.5, 0.336),
+    (0.6, 0.313),
+    (0.7, 0.290),
+    (0.8, 0.250),
+    (0.9, 0.206),
+    (1.0, 0.0),
+)
+"""宿主 ``_STATIC_KEEP_RATIO_THRESHOLDS``：小样本时 keep_ratio → 概率门槛（分段线性）。"""
+
+
+def dynamic_static_threshold(keep_ratio: float) -> float:
+    """小样本下的静态概率门槛（复刻 ``dynamic_gate._static_threshold``）。"""
+
+    ratio = min(1.0, max(0.0, float(keep_ratio)))
+    for index in range(1, len(DYNAMIC_STATIC_KEEP_RATIO_THRESHOLDS)):
+        low_ratio, low_threshold = DYNAMIC_STATIC_KEEP_RATIO_THRESHOLDS[index - 1]
+        high_ratio, high_threshold = DYNAMIC_STATIC_KEEP_RATIO_THRESHOLDS[index]
+        if ratio <= high_ratio:
+            span = high_ratio - low_ratio
+            if span <= 0:
+                return float(high_threshold)
+            return low_threshold + (high_threshold - low_threshold) * (
+                (ratio - low_ratio) / span
+            )
+    return 0.0
+
+
+def dynamic_keep_ratio(effective_frequency: float) -> float:
+    """动态门里的「目标回复比例」= ``min(1, max(0, 生效频率))``。
+
+    ⚠ 与计数门最大的区别：倍率在这里不是「攒几条」的刻度，而是**窗口内保留多少
+    比例的预期回复机会**。生效频率 ≥ 1 时 keep_ratio=1、静态门槛 0（几乎全放行），
+    所以倍率 >1 在动态门下没有额外上行空间——想让她整体更活跃要调宿主的
+    ``talk_value``，本插件的倍率只负责往下压（睡眠=0、感冒、低情绪体力…）。
+    """
+
+    return min(1.0, max(0.0, float(effective_frequency)))
 
 
 # ---------------------------------------------------------------- 门控
@@ -140,7 +213,14 @@ def is_silent(effective_frequency: float) -> bool:
 
 
 def trigger_threshold(mode: str, effective_frequency: float) -> int:
-    """复刻 ``runtime.py:1129-1136``：触发一轮所需的消息数。
+    """折算「攒够几条消息」的门槛。
+
+    - ``frequency`` / ``dynamic``（宿主 1.3.2）：``max(1, ceil(1/freq))``。宿主
+      ``runtime.py::_get_message_trigger_threshold`` **不区分模式**都是这个公式。
+      ⚠ 在 ``dynamic`` 模式下它只是**日志与等待节奏**用的条数（宿主把它印在
+      「[频率: x][pending/T 消息]」里），真正放行由概率门决定——见
+      ``dynamic_static_threshold`` 与 ``preview``。
+    - ``reply_necessity``（宿主 ≤1.3.1）：``max(1, ceil(1/freq²))``。
 
     返回 ``0`` 表示静默（宿主在该分支直接返回 0）。
     """
@@ -338,9 +418,12 @@ def plain_chatter_messages_needed(
     也够不到触发线，必须靠 @/提及/私聊或带问题的消息才能叫动她。
 
     计数门下返回触发阈值 ``T``（忽略空窗补偿——补偿只会让它更少）。
+    动态门（1.3.2）下返回 ``None``：它按「每批消息的回复可能性」与频率比对，不数条数。
     """
 
     if is_silent(effective_frequency):
+        return None
+    if normalize_mode(mode) == MODE_DYNAMIC:
         return None
     if normalize_mode(mode) != MODE_REPLY_NECESSITY:
         threshold = trigger_threshold(MODE_FREQUENCY, effective_frequency)
@@ -407,6 +490,29 @@ def preview(
     if result["silent"]:
         result["plain_chatter_messages_needed"] = None
         result["verdict"] = "静默：消息被静默消费，不进 Planner，零模型开销（@ 也穿透不了）"
+        return result
+
+    if normalized_mode == MODE_DYNAMIC:
+        keep_ratio = dynamic_keep_ratio(effective)
+        static_gate = dynamic_static_threshold(keep_ratio)
+        result["plain_chatter_messages_needed"] = None
+        result["probability_gate"] = True
+        result["dynamic_keep_ratio"] = keep_ratio
+        result["dynamic_static_threshold"] = static_gate
+        result["dynamic_window_seconds"] = DYNAMIC_WINDOW_SECONDS
+        if keep_ratio >= 1.0:
+            result["verdict"] = (
+                "动态触发：目标回复比例 100%（生效频率 ≥ 1）——静态门槛 0，"
+                "每批新消息基本都会进 Planner；倍率再高也没有上行空间"
+            )
+        else:
+            result["verdict"] = (
+                f"动态触发：生效频率 {effective:.3f} 就是 1 小时窗口内的目标回复比例"
+                f"（keep_ratio {keep_ratio:.3f}）。门槛由窗口里各批消息的「回复可能性」"
+                f"从高到低累积到预算定出；窗口样本不足 {DYNAMIC_MIN_WINDOW_SCORE_COUNT} 批时"
+                f"用静态表，当前约 {static_gate:.3f}。群聊按此概率放行，"
+                "私聊不适用动态门（有新消息直接进 Planner）"
+            )
         return result
 
     needed = plain_chatter_messages_needed(

@@ -62,9 +62,74 @@ def test_normalize_mode_falls_back_to_host_default():
     assert lm.normalize_mode("frequency") == "frequency"
     assert lm.normalize_mode("reply_necessity") == "reply_necessity"
     assert lm.normalize_mode(" Reply_Necessity ") == "reply_necessity"
+    # MaiBot 1.3.2 起的新模式
+    assert lm.normalize_mode("dynamic") == "dynamic"
+    assert lm.normalize_mode(" Dynamic ") == "dynamic"
     assert lm.normalize_mode("") == lm.DEFAULT_MODE == "frequency"
     assert lm.normalize_mode(None) == "frequency"
     assert lm.normalize_mode("bogus") == "frequency"
+
+
+def test_dynamic_is_a_recognized_mode_with_its_own_label():
+    assert lm.MODE_DYNAMIC in lm.ALL_MODES
+    assert "dynamic" in lm.MODE_LABELS[lm.MODE_DYNAMIC]
+    # 三套模式都要有中文标签（状态卡直接印它）
+    for mode in lm.ALL_MODES:
+        assert lm.MODE_LABELS.get(mode)
+
+
+def test_dynamic_mode_uses_the_count_formula_for_display():
+    """宿主 1.3.2 的 ``runtime.py::_get_message_trigger_threshold`` **不分模式**，
+    动态门下这个条数只进日志与等待节奏，不是放行条件。"""
+
+    for frequency, expected in ((1.0, 1), (0.81, 2), (0.45, 3), (0.28, 4)):
+        assert lm.trigger_threshold(lm.MODE_DYNAMIC, frequency) == expected
+
+
+def test_dynamic_keep_ratio_clamps_to_unit():
+    assert lm.dynamic_keep_ratio(0.2) == pytest.approx(0.2)
+    assert lm.dynamic_keep_ratio(2.0) == 1.0, "倍率 >1 在动态门下没有上行空间"
+    assert lm.dynamic_keep_ratio(-1.0) == 0.0
+
+
+def test_dynamic_static_threshold_matches_host_table():
+    """复刻 ``dynamic_gate._STATIC_KEEP_RATIO_THRESHOLDS``：端点 + 段内线性插值。"""
+
+    assert lm.dynamic_static_threshold(0.0) == pytest.approx(1.0)
+    assert lm.dynamic_static_threshold(0.1) == pytest.approx(0.605)
+    assert lm.dynamic_static_threshold(0.2) == pytest.approx(0.482)
+    assert lm.dynamic_static_threshold(0.5) == pytest.approx(0.336)
+    assert lm.dynamic_static_threshold(1.0) == pytest.approx(0.0)
+    assert lm.dynamic_static_threshold(0.15) == pytest.approx((0.605 + 0.482) / 2)
+    assert lm.dynamic_static_threshold(-1.0) == pytest.approx(1.0)
+    assert lm.dynamic_static_threshold(5.0) == pytest.approx(0.0)
+
+
+def test_plain_chatter_is_not_applicable_in_dynamic_mode():
+    assert lm.plain_chatter_messages_needed(lm.MODE_DYNAMIC, 0.5) is None
+    assert lm.plain_chatter_messages_needed(lm.MODE_DYNAMIC, 0.0) is None
+
+
+def test_preview_dynamic_mode_reports_keep_ratio_and_static_gate():
+    out = lm.preview(mode="dynamic", talk_value=0.2, adjust=1.0)
+    assert out["probability_gate"] is True
+    assert out["plain_chatter_messages_needed"] is None
+    assert out["dynamic_keep_ratio"] == pytest.approx(0.2)
+    assert out["dynamic_static_threshold"] == pytest.approx(0.482)
+    assert "目标回复比例" in out["verdict"]
+    assert "私聊不适用动态门" in out["verdict"]
+    assert out["threshold"] == lm.trigger_threshold("dynamic", 0.2), "条数门槛仍要能报出来"
+
+    # 生效频率 ≥1：静态门槛 0，且明确说明倍率没有上行空间
+    full = lm.preview(mode="dynamic", talk_value=1.0, adjust=1.5)
+    assert full["dynamic_keep_ratio"] == 1.0
+    assert full["dynamic_static_threshold"] == pytest.approx(0.0)
+    assert "上行空间" in full["verdict"]
+
+    # 静默优先于动态门
+    silent = lm.preview(mode="dynamic", talk_value=0.2, adjust=0.0)
+    assert silent["silent"] is True
+    assert "静默" in silent["verdict"]
 
 
 # ---------------------------------------------------------------- 触发阈值

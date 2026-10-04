@@ -21,8 +21,10 @@
   等于把她彻底静音。
 - 熬夜与感冒可以叠加（那是两种不同的不适），但各自只在对应健康因子里出一次。
 
-**曲线按宿主模式分两套**：``frequency`` 计数门下整段只映射到 1→4 条消息，
-``reply_necessity`` 评分门下则覆盖 4→13 条以及 0.6 的断崖两侧。两套都可独立调，
+**曲线按宿主模式分三套**（``curves.frequency`` / ``curves.necessity`` / ``curves.dynamic``，
+都可在 ``[emotion_energy.curves]`` 下独立调）：``frequency`` 计数门下整段只映射到 1→4 条
+消息；``reply_necessity`` 评分门（宿主 ≤1.3.1）下则覆盖 4→13 条以及 0.6 的断崖两侧；
+``dynamic`` 动态门（宿主 1.3.2）下倍率是「1 小时窗口内的目标回复比例」，≥1 就没有上行空间。
 插件读 ``chat.reply_timing.reply_trigger_mode`` 自动选，读不到按宿主默认走计数门。
 """
 
@@ -207,6 +209,7 @@ class FactorConfig:
         default_factory=lambda: dict(DEFAULT_HEALTH_FACTORS)
     )
     curves_necessity: CurveSet = field(default_factory=CurveSet)
+    curves_dynamic: CurveSet = field(default_factory=CurveSet)
     curves_frequency: CurveSet = field(default_factory=CurveSet)
     quiet_hours: tuple[tuple[int, int], ...] = ()
     max_adjust: float = 2.0
@@ -220,8 +223,15 @@ class FactorConfig:
     silence_floor: float = 0.0
 
     def curve_set_for(self, mode: str) -> CurveSet:
-        """按宿主模式取曲线组；未知模式按计数门（宿主默认）处理。"""
+        """按宿主模式取曲线组；未知模式按计数门（宿主默认）处理。
 
+        三套曲线（``frequency`` / ``necessity`` / ``dynamic``）语义不同，别串用：
+        ``dynamic`` 是 MaiBot 1.3.2 的模式，倍率在那里是「窗口内目标回复比例」，
+        见 ``life_host_model.dynamic_keep_ratio``。
+        """
+
+        if str(mode) == "dynamic":
+            return self.curves_dynamic
         return self.curves_necessity if str(mode) == "reply_necessity" else self.curves_frequency
 
 
@@ -300,7 +310,14 @@ def compute_adjust(
             )
 
     curve = config.curve_set_for(mode)
-    curve_name = "necessity" if str(mode) == "reply_necessity" else "frequency"
+    # 拆解里印的曲线组名要跟真实取到的那一套一致（dynamic 是 v1.6.0 加进来的第三套）
+    mode_text = str(mode)
+    if mode_text == "dynamic":
+        curve_name = "dynamic"
+    elif mode_text == "reply_necessity":
+        curve_name = "necessity"
+    else:
+        curve_name = "frequency"
 
     factors: list[tuple[str, float]] = []
     raw = 1.0

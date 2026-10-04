@@ -67,6 +67,8 @@ try:
     from .life_activity import (
         ACTIVITY_LABELS,
         ALLOWED_ACTIVITIES,
+        DAILY,
+        SICK_REST,
         SLEEP,
         SOURCE_LABELS,
         ActivityDecision,
@@ -74,6 +76,7 @@ try:
         ScheduleConfig,
         ScheduleFacts,
         build_prompt,
+        in_window,
         parse_response,
         parse_schedule_window,
         parse_window,
@@ -120,6 +123,7 @@ try:
         LifeState,
         SimConfig,
         active_materials,
+        activity_effect_lines,
         activity_minutes,
         append_social_event,
         apply_activity,
@@ -149,6 +153,7 @@ try:
         IntakeContext,
         SocialPolicy,
         SocialStatus,
+        flag_value,
         intake_digest,
         intake_live,
         live_signal,
@@ -157,6 +162,7 @@ try:
         prune_seen,
         prune_signals,
         sanitize_seen,
+        session_ids,
         social_lines,
         unavailable as social_unavailable,
     )
@@ -164,6 +170,8 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_activity import (
         ACTIVITY_LABELS,
         ALLOWED_ACTIVITIES,
+        DAILY,
+        SICK_REST,
         SLEEP,
         SOURCE_LABELS,
         ActivityDecision,
@@ -171,6 +179,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         ScheduleConfig,
         ScheduleFacts,
         build_prompt,
+        in_window,
         parse_response,
         parse_schedule_window,
         parse_window,
@@ -214,6 +223,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         LifeState,
         SimConfig,
         active_materials,
+        activity_effect_lines,
         activity_minutes,
         append_social_event,
         apply_activity,
@@ -243,6 +253,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         IntakeContext,
         SocialPolicy,
         SocialStatus,
+        flag_value,
         intake_digest,
         intake_live,
         live_signal,
@@ -251,6 +262,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         prune_seen,
         prune_signals,
         sanitize_seen,
+        session_ids,
         social_lines,
         unavailable as social_unavailable,
     )
@@ -467,11 +479,31 @@ class SimulationConfig(PluginConfigBase):
     energy_full_wake: bool = Field(
         default=True,
         description=(
-            "睡眠中体力恢复到上限（动态值：连熬 3 晚后是 8.5）且本次睡眠已满最短时长，"
-            "就强制唤醒（感冒醒到养病）。睡觉的目的是恢复体力，满了继续睡只是空转；"
-            "关掉则回到「模型提议醒 / 睡满每日上限」两条路"
+            "睡眠中体力恢复到上限（动态值：连熬 3 晚后是 8.5）就**立刻**强制唤醒"
+            "（感冒醒到养病），不再要求睡满最短时长。睡觉的目的是恢复体力，满了继续躺只是空转；"
+            "关掉则回到「模型提议醒 / 睡满每日上限」两条路。"
+            "注意：若模型在她满体力时仍反复提议睡觉且处于睡眠窗口内，会出现睡下即被唤醒的短周期往复"
         ),
-        json_schema_extra={"label": "体力满强制唤醒", "order": 10},
+        json_schema_extra={"label": "体力满立刻唤醒", "order": 10},
+    )
+    wake_on_at: bool = Field(
+        default=True,
+        description=(
+            "睡眠时被 @ 就立刻醒来（`唤醒保持` 分钟后自动回睡）。宿主的判定顺序是"
+            "「先判频率是否静默、再判 @ 强制触发」，所以倍率为 0 时这条 @ 会被静默轮吃掉、"
+            "**根本进不了 Planner**；打开后插件在消息钩子里就把该会话的倍率临时抬到清醒值，"
+            "让这条 @ 真的被看见。只在 `activity = sleep` 时生效，`[frequency] quiet_hours`"
+            "（你自己设的静默时段）不受影响；关掉即回到「睡就是睡」"
+        ),
+        json_schema_extra={"label": "睡眠时被 @ 唤醒", "order": 11},
+    )
+    wake_minutes: int = Field(
+        default=10,
+        description=(
+            "被 @ 唤醒后保持清醒的分钟数；窗口内再来 @ 只顺延窗口、不重复写宿主。"
+            "窗口结束且她仍在睡就自动回到静默（不需要再写一次 0）"
+        ),
+        json_schema_extra={"label": "唤醒保持（分钟）", "order": 12, "step": 5},
     )
 
 
@@ -740,7 +772,7 @@ class CurveConfig(PluginConfigBase):
 
 
 class CurvesConfig(PluginConfigBase):
-    """按宿主触发模式分两套曲线，插件自动选。"""
+    """按宿主触发模式分三套曲线，插件自动选。"""
 
     __ui_label__ = "曲线（按模式）"
     __ui_icon__ = "trending-up"
@@ -753,8 +785,17 @@ class CurvesConfig(PluginConfigBase):
     )
     necessity: CurveConfig = Field(
         default_factory=CurveConfig,
-        description="宿主模式为 reply_necessity（评分门）时使用",
+        description="宿主模式为 reply_necessity（评分门，宿主 ≤1.3.1）时使用",
         json_schema_extra={"label": "评分门曲线（reply_necessity）", "order": 1},
+    )
+    dynamic: CurveConfig = Field(
+        default_factory=CurveConfig,
+        description=(
+            "宿主模式为 dynamic（动态触发，MaiBot 1.3.2 起）时使用。"
+            "该模式下倍率是「1 小时窗口内的目标回复比例」：≥1 即全放行、没有上行空间，"
+            "所以这条曲线主要决定「状态差时压到多低」，整体调高不会有额外效果"
+        ),
+        json_schema_extra={"label": "动态触发曲线（dynamic）", "order": 2},
     )
 
 
@@ -806,7 +847,10 @@ class FrequencyConfig(PluginConfigBase):
 
     mode_source: str = Field(
         default="auto",
-        description="auto = 读宿主的 reply_trigger_mode 自动选曲线；也可强制 frequency / reply_necessity",
+        description=(
+            "auto = 读宿主的 reply_trigger_mode 自动选曲线；也可强制 "
+            "frequency / dynamic / reply_necessity（后者仅宿主 ≤1.3.1 有）"
+        ),
         json_schema_extra={"label": "模式来源", "order": 0, "placeholder": "auto"},
     )
     max_adjust: float = Field(
@@ -834,7 +878,9 @@ class FrequencyConfig(PluginConfigBase):
         default=0.0,
         description=(
             "睡眠/静默时段落地时的倍率下限。0 = 真静默（零模型开销，但会丢掉其它插件的主动开口，"
-            "例如 group-welcome 的新人欢迎语）；>0 则不再静默，且 reply_necessity 模式下 @ 会穿透"
+            "例如 group-welcome 的新人欢迎语）；>0 则不再静默：宿主**先判静默、再判 @ 强制触发**，"
+            "所以任何触发模式下 @ 都会穿透进 Planner（不只是 reply_necessity），"
+            "并且睡眠期间其它插件的主动开口也会一并生效"
         ),
         json_schema_extra={"label": "静默时段倍率下限", "order": 5, "step": 0.01},
     )
@@ -1974,6 +2020,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             health_factors=health_factors or _default_health_factors(),
             curves_frequency=self._curve_set(curves.frequency),
             curves_necessity=self._curve_set(curves.necessity),
+            curves_dynamic=self._curve_set(curves.dynamic),
             quiet_hours=self._quiet_windows(self.config.frequency.quiet_hours),
             max_adjust=max_adjust,
             min_adjust=min_adjust,
@@ -2511,7 +2558,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         """读宿主的回复触发模式与 talk_value（决定选哪套曲线、以及怎么展示后果）。"""
 
         forced = str(self.config.frequency.mode_source or "auto").strip().lower()
-        if forced in ("frequency", "reply_necessity"):
+        # 参考宿主当前全部合法模式（frequency / dynamic），外加 1.3.1 及更早的 reply_necessity
+        if forced in ("frequency", "reply_necessity", "dynamic"):
             self._host_mode = forced
             self._host_mode_source = "config"
         else:
@@ -2907,6 +2955,151 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         self._state_dirty = True
         return len(written)
 
+    def _wake_active(self, now: float) -> bool:
+        """此刻是否处在「睡眠中被 @ 唤醒」的临时清醒窗口里。
+
+        四个条件缺一不可：开关打开、她**正躺着睡**（``activity == sleep``）、窗口没过、
+        没落在 ``[frequency] quiet_hours`` 里。后两条是刻意的：``quiet_hours`` 是你自己设的
+        「谁都不许说话」时段，``paused`` 是手动暂停 —— 这两个不该被一句 `@` 顶掉。
+        ``quiet_hours`` 必须在这里判，不能只靠 ``compute_adjust`` 里那道硬闸：那边会把倍率
+        重新压回 0，而窗口与状态卡却已经按「被唤醒」显示，等于**写一个 0 出去、日志和卡片
+        却说她醒了**。
+        """
+
+        if not bool(self.config.simulation.wake_on_at):
+            return False
+        if not bool(self.config.plugin.enabled) or self._is_paused():
+            return False
+        if self._state.activity != SLEEP:
+            return False
+        if self._in_quiet_hours(now):
+            return False
+        return float(self._state.at_wake_until) > float(now)
+
+    def _in_quiet_hours(self, now: float) -> bool:
+        """当前是否落在 ``[frequency] quiet_hours`` 里。
+
+        唤醒窗口与倍率硬闸必须用**同一套**窗口解析（``_quiet_windows`` + ``in_window``），
+        各写一份迟早会出现「硬闸按 23:30-08:00 压成 0、唤醒按另一个区间放行」的错位。
+        """
+
+        sim_config = self._sim_config()
+        local_now = local_datetime(now, sim_config.tz_offset_minutes)
+        now_minutes = local_now.hour * 60 + local_now.minute
+        return any(
+            in_window(now_minutes, window)
+            for window in self._quiet_windows(self.config.frequency.quiet_hours)
+        )
+
+    def _effective_activity(self, now: float) -> str:
+        """倍率计算用的活动：睡眠期间被 @ 唤醒时按清醒算，其余情况就是 ``state.activity``。
+
+        **只影响倍率，不改 ``state.activity``**：她本人仍然在睡（``sleep_minutes_today``
+        照常记账、状态卡也照实说「睡觉」），只是这 10 分钟里宿主看得见她。窗口一过，
+        只要 ``activity`` 还是 ``sleep``，倍率自动回到 0 —— 「回睡」不需要任何额外写入。
+        """
+
+        if self._wake_active(now):
+            # 与 ``life_activity._wake_target`` 同一套去处：感冒就醒到养病，否则回归日常
+            return SICK_REST if is_cold(self._state, now) else DAILY
+        return self._state.activity
+
+    def _wake_note(self, now: float) -> str:
+        """「清醒窗口到 HH:MM」；不在窗口里返回空串。
+
+        状态卡、`/生活 频率`、注入提示词三处共用同一套口径：窗口判断与时间显示各写一份，
+        迟早会出现「卡片说被唤醒、提示词说她睡着」这种自相矛盾的现场。
+        """
+
+        if not self._wake_active(now):
+            return ""
+        sim_config = self._sim_config()
+        return local_datetime(
+            float(self._state.at_wake_until), sim_config.tz_offset_minutes
+        ).strftime("%H:%M")
+
+    async def _at_wake_from_hook(
+        self, session_id: str, info: dict[str, Any], now: float
+    ) -> None:
+        """睡眠中被 `@`：开一个临时清醒窗口，并**立刻**把这个会话的倍率抬到清醒值。
+
+        为什么必须在这里写：宿主对这条消息的处理顺序是
+        ``bot.py:812``（本钩子）→ ``bot.py:841``（入队）→ ``heartflow_message_processor.py:62``
+        → ``runtime.register_message()``（``:923`` 武装 `@` 强制轮、``:935`` 调度）。
+        钩子先于武装与调度返回，所以这一笔写在「这条 `@` 算不算数」之前，宿主随后才会
+        走**强制触发**（``turn_trigger/scheduler.py:65``）而不是**静默消费**（``:57``）。
+        等下一轮巡检（``[apply] interval_seconds`` ≥ 15 秒）再写就已经晚了：那条消息
+        早被静默轮吃掉（`reasoning_engine.py:1197` 还会清掉强制轮标记）。
+
+        只在**窗口第一次打开**时写；窗口内的后续 `@` 只顺延截止时间（宿主上那个值已经是
+        清醒值，重写一遍白花一次读 + 一次写）。``activity != sleep`` 不写，``quiet_hours``
+        与暂停不写 —— 那两个是你自己设的硬闸（见 ``_wake_active``）。
+        """
+
+        if not bool(self.config.simulation.wake_on_at):
+            return
+        if not bool(self.config.plugin.enabled) or self._is_paused():
+            return
+        if self._state.activity != SLEEP:
+            return
+        if self._in_quiet_hours(now):
+            # 你自己设的静默时段优先于一句 `@`：不开窗口、不写宿主，只留一条 debug
+            self.ctx.logger.debug(
+                "睡眠中被 @，但此刻在 [frequency] quiet_hours 内：保持静默（session=%s）",
+                session_id,
+            )
+            return
+        window_minutes = int(self.config.simulation.wake_minutes)
+        if window_minutes <= 0:
+            # 0 = 关闭唤醒（与 ``reseed_after_hours=0`` 同一种「0 即关」约定）：
+            # 写成 0 长度窗口会让倍率立刻回到 0，那条 `@` 照样进不来，只会让人误以为生效
+            return
+        if not self._target_matches(session_id, info):
+            return
+
+        window = float(window_minutes) * 60.0
+        was_awake = float(self._state.at_wake_until) > now
+        self._state.at_wake_until = max(float(self._state.at_wake_until), now + window)
+        self._state_dirty = True
+
+        sim_config = self._sim_config()
+        until_text = local_datetime(
+            float(self._state.at_wake_until), sim_config.tz_offset_minutes
+        ).strftime("%H:%M")
+
+        if was_awake:
+            self.ctx.logger.info(
+                "睡眠中被 @：清醒窗口顺延到 %s（session=%s，不再重复写宿主）",
+                until_text, session_id,
+            )
+            return
+
+        # 窗口已经写进 state，所以这次拆解用的就是清醒活动（``_effective_activity``）
+        breakdown = self._compute_breakdown(now)
+        outcome = await self._apply_one_session(
+            session_id, breakdown.adjust, now, reason="被 @ 唤醒"
+        )
+        if outcome == "wrote":
+            self.ctx.logger.info(
+                "睡眠中被 @ 唤醒：session=%s 倍率 → %.3f，清醒到 %s（%d 分钟后自动回睡）",
+                session_id, breakdown.adjust, until_text, window_minutes,
+            )
+        elif outcome == "failed":
+            self.ctx.logger.warning(
+                "睡眠中被 @ 唤醒：session=%s 写入失败，这条 @ 大概率仍被静默消费", session_id
+            )
+        elif outcome == "read_failure":
+            self.ctx.logger.warning(
+                "睡眠中被 @ 唤醒：session=%s 读不到宿主现值，本次不写（避免盲写覆盖别人的倍率）",
+                session_id,
+            )
+        else:
+            # dry_run / same / skipped / backoff：都不算故障，各留一条可排查的线索
+            self.ctx.logger.info(
+                "睡眠中被 @ 唤醒：session=%s 未下发（%s，目标倍率 %.3f）",
+                session_id, outcome, breakdown.adjust,
+            )
+
     def _compute_breakdown(self, now: float) -> Any:
         """当前状态 → 倍率拆解（含硬闸与素材加成）。"""
 
@@ -2916,7 +3109,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         sim_config = self._sim_config()
         local_now = local_datetime(now, sim_config.tz_offset_minutes)
         return compute_adjust(
-            activity=self._state.activity,
+            activity=self._effective_activity(now),
             emotion=self._state.emotion,
             energy=self._state.energy,
             sick=is_cold(self._state, now),
@@ -2930,6 +3123,75 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             mode=self._host_mode,
         )
 
+    async def _apply_one_session(
+        self, session_id: str, factor: float, now: float, *, reason: str = ""
+    ) -> str:
+        """把一个倍率下发到**单个**会话，返回结果标签（供巡检聚合日志）。
+
+        标签：``wrote`` / ``same``（宿主现值已是目标值）/ ``skipped``（还在退避窗口里）/
+        ``backoff``（刚发现上一笔没生效，已进入退避）/ ``read_failure`` / ``dry_run`` /
+        ``failed``（RPC 失败）。
+
+        ``@`` 唤醒必须在消息钩子里**立刻**下发同一个倍率（见 ``_at_wake_from_hook``），
+        所以这段逻辑只能有一份实现：复制一份出来会让「自证记账」
+        （``state.applied`` / ``state.observed``）在两处漂移，而它正是与
+        budget-pacer 之类写同一个标量的插件做乘性合成的唯一依据 —— 漂了就会把别人的
+        基数认成自己的（或反过来），生活倍率被乘两次。
+        """
+
+        compose = self._compose_external()
+        before_retry_at = float(self._state.unbacked.get(session_id, 0.0))
+        if compose:
+            if before_retry_at > now:
+                attempted = self._state.unbacked_target.get(session_id)
+                if attempted is None or abs(float(attempted) - float(factor)) <= _ADJUST_EPSILON:
+                    # 目标没变：仍在退避期，别白写
+                    return "skipped"
+                # 目标变了（例如进入睡眠要归零、或被 @ 叫醒要抬起来）⇒ 无视退避立刻按新目标
+                # 重试，否则她会带着全速倍率睡觉（或带着 0 睡过一整条 @）最长一个退避窗口
+            resolved = await self._resolve_target(session_id, factor, now)
+            if resolved is None:
+                # 分清两种原因（原因见 _resolve_target）：
+                # - 上一笔没生效：宿主没有 heartflow chat 时的**常态** → info
+                #   判据是「退避窗口被重新写入（时间戳变大）」，不能用「字典里有这条」：
+                #   过期未清的旧条目也满足后者。
+                # - 读不到宿主现值：真异常 → warning
+                after_retry_at = float(self._state.unbacked.get(session_id, 0.0))
+                if after_retry_at > before_retry_at:
+                    return "backoff"
+                if session_id in self._state.unbacked:
+                    return "skipped"
+                return "read_failure"
+            target, current = resolved
+        else:
+            # 关闭合成＝旧行为：不读，直接覆盖
+            target, current = float(factor), None
+
+        if self.config.simulation.dry_run:
+            self.ctx.logger.info(
+                "[演算] session=%s 倍率 %.3f%s",
+                session_id,
+                target,
+                f"（{reason}）" if reason else "",
+            )
+            return "dry_run"
+        if current is not None and abs(current - target) <= _ADJUST_EPSILON:
+            # 宿主现值已是目标值（可能是我们上轮写的，也可能别人恰好写成这样）。
+            # 记成「自己写的」以避免下轮把自己的因子误认成外部基数而重复相乘。
+            self._state.applied[session_id] = target
+            return "same"
+        if not compose:
+            previous = self._state.applied.get(session_id)
+            if previous is not None and abs(float(previous) - target) <= _ADJUST_EPSILON:
+                return "same"
+        if await self._set_adjust(session_id, target):
+            self._state.applied[session_id] = target
+            if current is not None:
+                # 记下写入前的值：下一轮用它判断这一笔到底有没有生效
+                self._state.observed[session_id] = current
+            return "wrote"
+        return "failed"
+
     async def _apply_sweep(self, now: float) -> None:
         """把当前倍率同步到所有目标会话（只在值真的会变时才调 RPC）。"""
 
@@ -2937,65 +3199,24 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         self._last_breakdown = breakdown
 
         targets = await self._target_sessions()
-        compose = self._compose_external()
         read_failures = 0          # 读不到宿主现值（真异常，值得 warning）
         new_backoff = 0            # 这一轮刚发现「上一笔没生效」→ 进入退避（死会话常态）
         still_backing_off = 0      # 还在退避窗口里，本轮不写
         wrote = 0
+        reason = reason_label(breakdown.reason)
 
         for session_id in targets:
-            if compose:
-                retry_at = float(self._state.unbacked.get(session_id, 0.0))
-                if retry_at > now:
-                    attempted = self._state.unbacked_target.get(session_id)
-                    if attempted is None or abs(float(attempted) - breakdown.adjust) <= _ADJUST_EPSILON:
-                        # 目标没变：仍在退避期，别白写
-                        still_backing_off += 1
-                        continue
-                    # 目标变了（例如进入睡眠要归零）⇒ 无视退避立刻按新目标重试，
-                    # 否则她会带着全速倍率睡觉最长一个退避窗口
-                before_retry_at = float(self._state.unbacked.get(session_id, 0.0))
-                resolved = await self._resolve_target(session_id, breakdown.adjust, now)
-                if resolved is None:
-                    # 分清两种原因（原因见 _resolve_target）：
-                    # - 上一笔没生效：宿主没有 heartflow chat 时的**常态** → info
-                    #   判据是「退避窗口被重新写入（时间戳变大）」，不能用「字典里有这条」：
-                    #   过期未清的旧条目也满足后者。
-                    # - 读不到宿主现值：真异常 → warning
-                    after_retry_at = float(self._state.unbacked.get(session_id, 0.0))
-                    if after_retry_at > before_retry_at:
-                        new_backoff += 1
-                    elif session_id in self._state.unbacked:
-                        still_backing_off += 1
-                    else:
-                        read_failures += 1
-                    continue
-                target, current = resolved
-            else:
-                # 关闭合成＝旧行为：不读，直接覆盖
-                target, current = float(breakdown.adjust), None
-
-            if self.config.simulation.dry_run:
-                self.ctx.logger.info(
-                    "[演算] session=%s 倍率 %.3f（%s）", session_id, target,
-                    reason_label(breakdown.reason),
-                )
-                continue
-            if current is not None and abs(current - target) <= _ADJUST_EPSILON:
-                # 宿主现值已是目标值（可能是我们上轮写的，也可能别人恰好写成这样）。
-                # 记成「自己写的」以避免下轮把自己的因子误认成外部基数而重复相乘。
-                self._state.applied[session_id] = target
-                continue
-            if not compose:
-                previous = self._state.applied.get(session_id)
-                if previous is not None and abs(float(previous) - target) <= _ADJUST_EPSILON:
-                    continue
-            if await self._set_adjust(session_id, target):
-                self._state.applied[session_id] = target
+            outcome = await self._apply_one_session(session_id, breakdown.adjust, now, reason=reason)
+            if outcome == "wrote":
                 wrote += 1
-                if current is not None:
-                    # 记下写入前的值：下一轮用它判断这一笔到底有没有生效
-                    self._state.observed[session_id] = current
+            elif outcome == "backoff":
+                new_backoff += 1
+            elif outcome == "skipped":
+                # ``skipped`` 现在同时覆盖「目标没变、仍在退避」与「读不到但已在退避里」两种，
+                # 与原实现的计数口径一致（原实现只在 ``resolved is None`` 那条分支里数它）
+                still_backing_off += 1
+            elif outcome == "read_failure":
+                read_failures += 1
 
         # 读失败是真异常：保留 warning（同状态只报一次）
         if read_failures:
@@ -3123,6 +3344,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         llm_config = self.config.activity.llm
         sim_config = self._sim_config()
+        factor_config = self._factor_config()
         state = self._state
         context = date_context(state, now, sim_config)
         allowed, block_reason = can_switch(state, now, sim_config)
@@ -3130,6 +3352,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         # 人设上限是配置项（默认 600 字）：超出部分**静默丢弃**，所以人设长了要调大它。
         # 0 = 不带人设（省 token）。
         persona_limit = int(llm_config.persona_max_chars)
+        economy_hint = self._economy_hint(now)
         prompt_input = PromptInput(
             bot_name=self._bot_name,
             persona=self._persona if persona_limit > 0 else "",
@@ -3161,8 +3384,17 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 pick=str(llm_config.recent_pick_mode),
                 max_per_label=int(llm_config.recent_max_per_label),
             ),
-            economy_hint=self._economy_hint(now),
+            economy_hint=economy_hint,
             schedule_lines=self._schedule_facts_now(now).prompt_lines,
+            # 「选这个活动会影响什么」：数字全部来自 sim_config / 活动因子表（同一份真值），
+            # 改配置提示词就跟着变。只告诉她结论与机制，不列活动→倍率的数值清单
+            # （那会诱导她「为了少说话而挑活动」）。
+            effect_lines=activity_effect_lines(
+                sim_config,
+                activity_factors=factor_config.activity_factors,
+                at_wake=bool(self.config.simulation.wake_on_at),
+                mention_economy=bool(economy_hint),
+            ),
         )
         prompt = build_prompt(prompt_input)
         self._last_llm_attempt_at = now
@@ -3516,6 +3748,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         materials = active_materials(state, now, floor=sim_config.material_decay_floor)
         if materials:
             lines.append(f"最近想说的：{sanitize_text(materials[0].get('text', ''), max_chars=60)}")
+        wake_note = self._wake_note(now)
+        if wake_note:
+            lines.append(
+                f"（她本来在睡，刚刚被 @ 吵醒，清醒窗口到 {wake_note}；"
+                "语气可以短一点、带刚醒的迷糊，但别把自己说成一直醒着）"
+            )
         return "\n".join(lines)
 
     def _material_line(self, now: float, sim_config: SimConfig) -> str:
@@ -3543,6 +3781,13 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             f"　来源：{self._source_label(state.activity_source)}"
             f" · 已持续 {activity_minutes(state, now)} 分钟",
         ]
+        wake_note = self._wake_note(now)
+        if wake_note:
+            # 她本人仍在睡（睡眠记账照常），只是这 10 分钟里宿主看得见她；
+            # 不写这一行的话，卡片上「睡觉」与「倍率不是 0」会让人以为硬闸失效
+            lines.append(
+                f"　被 @ 唤醒：清醒到 {wake_note}（之后自动回睡；睡眠记账不受影响）"
+            )
         lines.extend(self._schedule_lines(now))
         lines.extend([
             f"情绪 {state.emotion:.1f}/10　体力 {state.energy:.1f}/10"
@@ -3695,6 +3940,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         lines.append(f"曲线组：{breakdown.curve_set}")
         lines.extend(breakdown.as_lines())
+        wake_note = self._wake_note(now)
+        if wake_note:
+            lines.append(
+                f"⚠ 此刻正被 @ 唤醒（清醒到 {wake_note}）：倍率按清醒活动算，"
+                "所以这里不是睡眠的 0；窗口一过、只要她还在睡就自动回到 0"
+            )
 
         fallback = max(0.0, self.config.frequency.min_adjust)
         if fallback > 0 and breakdown.raw + breakdown.material_bonus < fallback:
@@ -3716,16 +3967,30 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             adjust=composed,
             pending_count=1,
         )
-        lines.append(f"触发阈值：{out.get('threshold')} 条消息")
-        if "necessity_factor" in out:
+        if out.get("probability_gate"):
             lines.append(
-                f"必要性系数：{out['necessity_factor']:.3f}（评分线 {out.get('score_line')}）"
+                f"条数门槛：{out.get('threshold')} 条消息"
+                "（动态门下只用于宿主日志与等待节奏，不是放行条件）"
             )
+            lines.append(
+                f"动态门：目标回复比例 {out['dynamic_keep_ratio']:.3f}"
+                f"（统计窗口 {out.get('dynamic_window_seconds', 0) / 3600:.0f} 小时）"
+                f"　·　小样本静态概率门槛 {out['dynamic_static_threshold']:.3f}"
+            )
+        else:
+            lines.append(f"触发阈值：{out.get('threshold')} 条消息")
+            if "necessity_factor" in out:
+                lines.append(
+                    f"必要性系数：{out['necessity_factor']:.3f}（评分线 {out.get('score_line')}）"
+                )
         needed = out.get("plain_chatter_messages_needed")
-        lines.append(
-            "纯闲聊需要："
-            + (str(needed) if needed is not None else "不可达（只回 @/提及/私聊或带问题的消息）")
-        )
+        if out.get("probability_gate"):
+            lines.append("纯闲聊需要：不适用（动态门按每批消息的回复可能性放行，不数条数）")
+        else:
+            lines.append(
+                "纯闲聊需要："
+                + (str(needed) if needed is not None else "不可达（只回 @/提及/私聊或带问题的消息）")
+            )
         lines.append(f"结论：{out.get('verdict', '')}")
 
         if stream_id:
@@ -3739,14 +4004,21 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                     )
             if actual_effective is not None:
                 lines.append(f"宿主侧生效频率：{actual_effective:.3f}")
-                real_threshold = preview(
+                real_out = preview(
                     mode=self._host_mode, talk_value=1.0, adjust=actual_effective
-                ).get("threshold")
-                if real_threshold is not None:
+                )
+                if real_out.get("probability_gate"):
                     lines.append(
-                        f"　（宿主侧实际触发阈值：{real_threshold} 条消息——"
-                        "与上面算出的不同，说明宿主用的基础频率不是配置里那个值）"
+                        f"　（宿主侧目标回复比例：{real_out['dynamic_keep_ratio']:.3f}"
+                        "——动态门按概率放行，条数门槛只进日志）"
                     )
+                else:
+                    real_threshold = real_out.get("threshold")
+                    if real_threshold is not None:
+                        lines.append(
+                            f"　（宿主侧实际触发阈值：{real_threshold} 条消息——"
+                            "与上面算出的不同，说明宿主用的基础频率不是配置里那个值）"
+                        )
             if self.config.apply.compose_external:
                 foreign = self._state.foreign.get(stream_id)
                 if foreign is None:
@@ -4090,14 +4362,17 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def note_session(self, message: dict | None = None, **kwargs: Any) -> dict[str, Any]:
-        """记录会话与对方发言时间；**不发 RPC**。
+        """记录会话与对方发言时间；**正常轮次不发 RPC**（唯一例外是睡眠中被 `@`）。
 
         刻意不在这里写宿主频率：``adjust_talk_frequency`` 内部会重新调度消息轮
-        （``runtime.py:563``），从消息链路里调用是构造性重入，还会给每条消息加 RPC 延迟。
+        （``runtime.py:559-562``），从消息链路里调用有一定重入代价，还会给这条消息加
+        RPC 延迟。所以**只在「她正睡着 + 这条是 `@`」时**才写（每条消息平均不到一次，
+        并且一整个唤醒窗口只写一次）：那是唯一能让她看见这条 `@` 的时机 —— 宿主先判
+        静默、再判 `@` 强制触发，等下一轮巡检（≥15 秒）再写就已经晚了。
         """
 
         target = message if isinstance(message, dict) else {}
-        session_id = str(target.get("session_id") or target.get("stream_id") or "").strip()
+        session_id, group_id, user_id = session_ids(target)
         if not session_id:
             return {"action": "continue"}
         now = time.time()
@@ -4114,13 +4389,25 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             self._state_dirty = True
         info = self._seen_sessions.get(session_id)
         if info is None:
-            self._seen_sessions[session_id] = {
+            # ``group_id`` / ``user_id`` 要走 ``session_ids``：真机载荷把群号/QQ 号放在
+            # ``message_info.group_info`` / ``message_info.user_info`` 下（v1.7.0 修），
+            # 只读顶层会让这两个字段在真机上恒为空串、范围匹配悄悄失效
+            info = {
                 "session_id": session_id,
                 "stream_id": session_id,
-                "group_id": str(target.get("group_id") or ""),
-                "user_id": str(target.get("user_id") or ""),
-                "is_group_session": bool(target.get("group_id")),
+                "group_id": group_id,
+                "user_id": user_id,
+                "is_group_session": bool(group_id),
             }
+            self._seen_sessions[session_id] = info
+        # 睡眠中被 `@` ⇒ 开一个临时清醒窗口，并立刻把倍率抬起来（见方法说明）。
+        # 放在社交信号之前：唤醒是「这条消息能不能被看见」的关键路径，不能被后面的
+        # 旁路逻辑挡在前面。整段自己兜异常，绝不让消息主链受插件影响。
+        if flag_value(target, "is_at"):
+            try:
+                await self._at_wake_from_hook(session_id, info, now)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("%s 睡眠唤醒失败：%s", __plugin_id__, exc)
         # 社交信号：只做一次 append（**无 RPC、无落盘、无 O(n) 扫描**）。
         # 这个钩子挂在消息主链上，任何异常都可能影响别人的回复：除了装饰器上的
         # error_policy=SKIP，这里自己再兜一层，并且只在 debug 级留痕

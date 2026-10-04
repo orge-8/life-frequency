@@ -213,19 +213,27 @@ def parse_digest(
 # ---------------------------------------------------------------- 入站信号
 
 
-def _flag(source: Mapping[str, Any], key: str) -> bool:
-    """严格真值：只认**真布尔** ``True`` 与少数明确写法。
+def flag_value(source: object, key: str) -> bool:
+    """严格真值：只认**真布尔** ``True`` 与少数明确写法（``"true"`` / ``"1"`` / ``"yes"`` / ``"on"``）。
 
     ``bool("false")`` 是 ``True`` —— 宿主把字段序列化成字符串时，这条纪律能防止
     「没被 @ 」被误判成「被 @ 了」（better-diary 在权限判定上踩过同一个坑）。
+    公开出来是因为 ``plugin.note_session`` 也要判 ``is_at``（睡眠唤醒），
+    两处必须同一套口径，否则一条消息在两个模块里会得到不一样的结论。
     """
 
+    if not isinstance(source, Mapping):
+        return False
     value = source.get(key)
     if value is True:
         return True
     if isinstance(value, str) and value.strip().lower() in ("true", "1", "yes", "on"):
         return True
     return False
+
+
+def _flag(source: Mapping[str, Any], key: str) -> bool:
+    return flag_value(source, key)
 
 
 def _deep(source: Mapping[str, Any], *keys: str) -> Any:
@@ -237,6 +245,29 @@ def _deep(source: Mapping[str, Any], *keys: str) -> Any:
     return node
 
 
+def session_ids(message: object) -> tuple[str, str, str]:
+    """从 Hook 载荷里取 ``(session_id, group_id, user_id)``；认不出就给空串。
+
+    ⚠ 真机载荷是**嵌套**的：``session_id`` 在顶层，群号/QQ 号在
+    ``message_info.group_info.group_id`` / ``message_info.user_info.user_id`` 下
+    （宿主 ``plugin_runtime/host/message_utils.py:412-450`` 的
+    ``_session_message_to_dict``）。平铺的 ``group_id`` / ``user_id`` 只是测试脚手架
+    的写法——只认顶层会让真机上的群号读成空串，于是会话表的范围匹配悄悄失效。
+    两个形状都认，并且**顶层优先**（插件自己写的载荷/未来版本若加了平铺键，行为不变）。
+    """
+
+    if not isinstance(message, Mapping):
+        return "", "", ""
+    session_id = str(message.get("session_id") or message.get("stream_id") or "").strip()
+    group_id = str(
+        message.get("group_id") or _deep(message, "message_info", "group_info", "group_id") or ""
+    ).strip()
+    user_id = str(
+        message.get("user_id") or _deep(message, "message_info", "user_info", "user_id") or ""
+    ).strip()
+    return session_id, group_id, user_id
+
+
 def live_signal(message: object, *, now: float) -> dict[str, Any] | None:
     """把一条入站消息压成**无原文**的信号；不值得记就返回 ``None``。
 
@@ -246,7 +277,7 @@ def live_signal(message: object, *, now: float) -> dict[str, Any] | None:
 
     if not isinstance(message, Mapping):
         return None
-    session_id = str(message.get("session_id") or message.get("stream_id") or "").strip()
+    session_id, group_id, _user_id = session_ids(message)
     if not session_id:
         return None
     if _flag(message, "is_command"):
@@ -255,9 +286,6 @@ def live_signal(message: object, *, now: float) -> dict[str, Any] | None:
     mentioned = _flag(message, "is_mentioned") or _flag(message, "is_at")
     if not body and not mentioned:
         return None  # 纯图片/语音，且没人叫她 —— 不算「有人找她」
-    group_id = str(
-        message.get("group_id") or _deep(message, "message_info", "group_info", "group_id") or ""
-    ).strip()
     return {
         "at": float(now),
         "session_id": session_id,
