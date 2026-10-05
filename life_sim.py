@@ -629,6 +629,12 @@ class LifeState:
     #: 生活日 → 该日已经花掉的社交情绪额度。防止「群里刷屏 = 无限情绪」：
     #: 额度的松紧必须由配置决定，而不是由今天群里多热闹决定。
     social_daily: dict[str, float] = field(default_factory=dict)
+    #: 「外面的世界」经历的去重表（键 → 首次入库时间）。命名空间见 ``life_world``：
+    #: ``live!<房间>!<生活日>`` / ``push!<url>`` / ``newcomer!<群>!<QQ>`` / ``song!<歌名>!<命中时刻>``。
+    #: 与 ``social_seen`` 分开：两边的键命名空间独立，混用会让 prune 互相挤掉。
+    world_seen: dict[str, float] = field(default_factory=dict)
+    #: 生活日 → 该日已经花掉的「世界」情绪额度。外部世界不能挤掉她自己的情绪基线。
+    world_daily: dict[str, float] = field(default_factory=dict)
 
     skip_ledger: dict[str, int] = field(default_factory=dict)
     # 会话 id → 我们最后写到宿主上的倍率。用来区分「宿主上的值是本人写的」还是
@@ -724,6 +730,8 @@ class LifeState:
         )
         state.social_seen = _sanitize_float_map(state.social_seen)
         state.social_daily = _sanitize_float_map(state.social_daily)
+        state.world_seen = _sanitize_float_map(state.world_seen)
+        state.world_daily = _sanitize_float_map(state.world_daily)
         return state
 
 

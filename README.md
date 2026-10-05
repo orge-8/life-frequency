@@ -790,6 +790,52 @@ digest = await self.ctx.api.call(
 
 ---
 
+### 7. 外面的世界：四个上游插件的只读 API（v1.8.0，默认开）
+
+她的经历此前只有「她自己碰上的事」与「和她说话的人」。v1.8.0 起接上**外面的世界**：
+关注的 UP 主开播了、发了新动态，群里来了新人，有人聊到了某首歌。数据全部来自四个
+上游插件的**只读** API（`version="1"`、`public=True`、零网络零写盘），本插件只读不写：
+
+| 事件 | 上游插件 / API | 去重键 | 默认情绪 |
+|---|---|---|---|
+| UP 主开播了 | `bilibili-live-gateway.get_live_status` | `live!<房间号>!<生活日>` | +0.20 |
+| UP 主发了新视频 / 新动态 | `bilibili-dynamic-push.get_recent_pushes` | `push!<url>` | +0.15 |
+| 群里来了个新人 | `group-welcome.get_recent_newcomers` | `newcomer!<群号>!<QQ号>` | +0.10 |
+| 有人聊到了《X》 | `cv_lyric_context.get_recent_songs` | `song!<歌名>!<命中时刻>` | +0.12 |
+| （仅状态卡）订阅了几位 UP 主 | `bilibili-dynamic-push.get_subscriptions` | — | — |
+
+配置在 `[world]`：**总开关默认开、每个源独立可关**（`live_enabled` / `video_enabled` /
+`newcomer_enabled` / `song_enabled`），取数间隔默认 10 分钟。**未装那些插件不会报错**——
+每个源独立降级（未安装 / 未升级 / 超时 / 返回坏结构都只少那一类事件，其余照常），
+四个源全取不到时退避重试并且**只告警一次**（日志里写明是哪一项没接上）。
+
+三条设计约束（与 `[social]` 同源）：
+
+1. **外部世界不能挤掉她自己的生活**：每个生活日最多接进 `max_events_per_day`（默认 6）条，
+   情绪另有 `daily_emotion_cap`（默认 1.0）——用完只记事、不加情绪；
+2. **睡眠中照常记录、但不产生情绪增量**（沿用 `[social]` 的策略：醒来能在近层看到
+   「外面发生过什么」，情绪不吃这笔账）；
+3. **外部文本一律净化 + 限长**：UP 名 / 歌名 / 标题都走 `life_events.sanitize_text`
+   （去控制字符与 `<>{}`【】「」），并截到标签 24 字 / 正文 80 字。
+
+**三条数据边界**（不是缺陷，写出来免得以为是漏做）：
+
+- **新人没有昵称**：`group-welcome` 落盘只存 QQ 号 + 首次出现时间戳（昵称从不缓存），
+  所以事件只能写「群里来了个新人」，正文里是群号与 QQ 号；
+- **开播没有开始时刻**：上游只给「当前是否开播」与最近一次成功探测时刻，因此按
+  **生活日**去重——连续多天开播会每天各记一次；
+- **歌曲按「一次命中」去重**（键带命中时刻）：同一天反复聊到同一首歌会各记一次，
+  因为它们是不同的发生。另：上游手动 `/dyn test` 推送（旧动态）走 `record=False`，
+  **不会**产生事件，免得把旧动态当成「UP 主刚发了新动态」。
+
+> 状态卡（`/生活 状态`）新增「外面的世界」几行：订阅数、直播状态、动态 / 新人 / 歌曲
+> 各自的接入情况与今日条数。「没接上」会显示具体原因，不会看起来像「没问题」。
+>
+> 新增状态字段 `world_seen` / `world_daily`（去重表与每日额度）：`state_version` 不变、
+> **旧状态文件零迁移**（缺字段走默认值，坏条目由 `_sanitize_float_map` 丢掉）。
+
+---
+
 ## 与两个参考仓库的关系
 
 本项目参考了社区实现的设计，但**没有**照抄它们的代码路径：
@@ -1023,6 +1069,7 @@ $env:LF_MAIBOT_SRC = "D:\repos\MaiBot"      # 或把检出放在仓库的 repos/
 
 | 版本 | 变更 |
 |---|---|
+| 1.8.0 | **外面的世界：接四个上游插件的只读 API（`[world]`，默认开、每源可关）+ 一处真机加载缺陷**。新增 `life_world.py`（纯模块，照 `life_economy` / `life_social` 的写法）：契约解析（四源各一个 `parse_*`，坏结构一律降级为 `reason` 而不是抛）、事件规范化（`kind/label/emotion/energy/at/key`）、入库（去重、每日条数与情绪额度、睡眠策略）、状态卡文案。事件四类：UP 主开播了（`bilibili-live-gateway.get_live_status`）／UP 主发了新视频或新动态（`bilibili-dynamic-push.get_recent_pushes`）／群里来了个新人（`group-welcome.get_recent_newcomers`）／有人聊到了《X》（`cv_lyric_context.get_recent_songs`），订阅表（`get_subscriptions`）只进状态卡。四条纪律：① **每源独立降级**——未安装／未升级／超时（每源 5 秒）／坏结构都只少那一类事件，四源全挂时退避重试且只告警一次；② **外部世界不能挤掉她自己的生活**——每日 `max_events_per_day`（6）条、情绪 `daily_emotion_cap`（1.0），用完只记事；③ 睡眠中照常记录但不产生情绪增量；④ 外部文本走 `life_events.sanitize_text` + 限长。新增状态字段 `world_seen` / `world_daily`（`state_version` 不变、旧状态零迁移）。**三条数据边界写进 README**（不是缺陷）：新人没有昵称（上游只落盘 QQ 号 + 时间戳，事件只能写「群里来了个新人」）、开播没有开始时刻（按生活日去重）、歌曲按「一次命中」去重（键带命中时刻，同一天反复聊到会各记一次）；上游手动 `/dyn test` 走 `record=False`，不会产生假的世界事件。**真机加载缺陷（冒烟测试抓到）**：`life_world.py` 最初写的是平铺导入 `from life_events import sanitize_text`，而真机是**包式加载**（插件目录不在 `sys.path` 上）⇒ 相对导入抛 `ImportError` 后平铺兜底也失败，`tests/smoke_test.py` 立刻红（`PASS=65 FAIL=0` → `ModuleNotFoundError: No module named 'life_activity'`）；已改为仓库统一的 `try: from .life_events import ... except ImportError: from life_events import ...` 双路径，并把 `life_world` 登记进冒烟的 `FLAT_MODULES` 泄漏检查。**契约测试 4 份**（`test_bilibili_live_contract` / `test_group_welcome_contract` / `test_bilibili_dynamic_contract` / `test_cv_lyric_contract`）：直接加载上游源码、调真 `@API` handler，每个覆盖 结构契约（public + version 1 + handler 名）/ 正常返回 / 空与坏数据降级 / **只读性**（调用前后对方状态与文件不变）。两个落地坑已避掉：上游目录**不能留在 `sys.path` 上**（上游也有 `plugin.py`，而本仓库 `test_plugin_helpers.py` / `test_interop.py` 会裸 `import plugin as P`）⇒ 测试用「临时插路径 → 取兄弟模块句柄 → 立刻撤」；`fakehost` 在两个插件里同名 ⇒ 契约测试一律用最小 ctx 替身。另按新维度**加强** `test_economy.py::test_sim_tick_refreshes_economy_before_asking_the_model` 的顺序断言（按 API 名分辨调用，并断言四个世界源同样发生在活动决策之前），原断言把所有 `api.call` 都当成经济取数、已不成立。全量 682 → **707** 条通过；`check_plugin` 39 PASS / FAIL 0；冒烟 65 PASS / FAIL 0；`check_submission` FAIL 0 |
 | 1.7.1 | **把「选这个活动会影响什么」如实告诉模型**（活动决策提示词新增一节，默认 8 行事实）。起因：模型此前**完全不知道后果**——我在真提示词里数过，「频率 / 因子 / 倍率」出现 **0 次**，它只知道 15 个活动的名字与中文标签，加上「睡眠时段 / 最短停留 / 每日清醒」三条约束。后果有两处：① 你把 `[activity] activity_factors` 改成什么样（尤其 `replace` 模式）都与它的选择无关；② 它不知道 `sleep` 意味着彻底静默、熬夜会压体力上限、感冒从哪来。现在每轮多一节 `【这些选择会影响什么】`：体力每小时增减（逐活动，取自 `SimConfig.energy_delta_per_hour`，即 `settle` 用的同一张表）／情绪回归速率与事件概率／今日已睡·清醒的记账与上下限／睡觉怎么结束／熬夜与体力上限／感冒概率与持续／作息班表（仅启用时）／钱与活动无关（仅在有经济提示时）／「睡觉＝完全静默」（`wake_on_at` 开着就说「被 @ 会临时醒来一次」，关着就说「连 @ 也不回」）＋「其余活动最多相差约 N 倍」。**数值全部从配置现算、一个都不写死**：提示词印一个和实现不同的数比不印更糟（模型按错因果选择、`enforce` 按真值收口，两边永远对不上），用户改 `fire_probability` / `max_sleep_hours` 等提示词必须跟着变（`test_effect_lines_track_config` 用整份换配置反向验证）。另配一句纪律「请按生活合理性选活动，不要为了数值挑活动」——把「睡觉 +1.20/小时」交给模型而不配这句，等于请它刷数值。**刻意不给**活动→倍率的数值清单（只说「睡觉＝静默」与「最多相差约 N 倍」），列出来会诱导「为了少说话而挑活动」。用例：`test_effect_lines_track_config` / `test_effect_lines_state_the_at_wake_and_money_facts` / `test_effect_lines_quote_the_activity_factor_range_not_a_hardcoded_one` / `test_effect_lines_render_with_discipline_header` / `test_effect_lines_are_optional_and_sanitized`（伪造分节符被中和）/ `test_activity_prompt_discloses_choice_effects_from_live_config`（断言 `ctx.llm.generate` **实际发出的 prompt**，不是自拼模板）。代价：每轮多 **722 字 / 9 行**（默认配置实测，≈500 token 量级），默认 600 秒一轮 ⇒ 约 **7 万 token/日的输入增量**，嫌贵调大 `[activity.llm] min_interval_seconds`。**行为零变化**（只改提示词，倍率算法与强制层未动）。全量 676 → **682** 条通过 |
 | 1.7.0 | **睡眠时被 `@` 唤醒（`[simulation] wake_on_at`，默认开）+ 一处真机才暴露的载荷缺陷**。起因：真机 1.3.2 的判定顺序是「先判频率是否静默（`turn_trigger/scheduler.py:57`）→ 再判 `@` 强制触发（`:65`）→ 最后才是概率门/计数门（`:80`/`:94`）」，而 `_handle_silent_turn` 在静默轮里第一件事就是 `_clear_forced_turn_state()`（`reasoning_engine.py:1197`）——所以倍率为**精确 0** 时，睡眠期间连 `@` 都进不了 Planner（状态卡却只显示「睡觉」）。现在：`chat.receive.after_process` 钩子检测到「正睡着 + 被 `@`」时写一条临时清醒窗口（新增 `LifeState.at_wake_until`，`state_version` 不变、旧状态文件零迁移、坏时间戳净化）并**立刻**下发清醒倍率。三条设计约束：① **必须在钩子里写** —— 钩子（`bot.py:812`）先于 `runtime.register_message()`（`:923` 武装 `@`、`:935` 调度）返回，等下一轮巡检（≥ `apply.interval_seconds`）那条消息早被静默轮吃掉；② **只开窗口、不改 `state.activity`** —— 她仍在睡（睡眠记账照常，主动开口照旧被睡眠硬闸挡着），窗口一过自动回到 0，不需要额外写入或定时器；③ **只认 `@`**（提及不唤醒，与宿主 `mentioned_bot_reply` 默认 false 对齐），`[frequency] quiet_hours` / 暂停 / `[apply]` 范围优先于一句 `@`（否则会出现「写一个 0 出去、卡片却说被唤醒」的自相矛盾）。配套：状态卡与 `/生活 频率` 显示「被 @ 唤醒：清醒到 HH:MM」，注入提示词补一句「她本来在睡、刚被 @ 吵醒」避免语气失真；`_apply_sweep` 的单会话写入抽成 `_apply_one_session`，唤醒与巡检共用同一份**自证记账**（`applied`/`observed`）——否则与 budget-pacer 的乘性合成会在两条路径上漂移、倍率被乘两次（守备用例 `test_wake_keeps_compose_bookkeeping_single_written`）。**顺带修真机缺陷**：`note_session` 原来只从 Hook 载荷顶层读 `group_id`/`user_id`，而宿主把群号/QQ 号嵌在 `message_info.group_info` / `message_info.user_info` 下（`plugin_runtime/host/message_utils.py:412-450`），真机上 `_seen_sessions` 这两个字段恒为空串、`[apply]`/`[proactive]` 的 `group:xxx`/`private:xxx` 兜底匹配悄悄失效（本地夹具用平铺键，所以一直绿）；现在统一走 `life_social.session_ids`（平铺与嵌套都认），`is_at` 判定与社交信号也统一到 `flag_value`。`silence_floor` 文案同时订正为「任何模式下 `@` 都会穿透」。用例新增 10 条（唤醒/不唤醒/提及不唤醒/quiet_hours 与范围优先/窗口顺延不重复写/过期回睡/关闭开关与 `wake_minutes=0`/演算模式不写/卡片与提示词显示/嵌套载荷取名），全量 664 → **674** 条通过；反向验证：关掉 `wake_on_at` 后核心断言「写入 > 0」立刻失效。⚠ 真机时序未联调，见「已知限制」 |
 | 1.6.1（文档订正） | **把「`silence_floor > 0` 会漏 `@`」的范围写对**（来源：1.3.2 源码复核）。旧文案（配置字段说明与 README「静默是有代价的」）只在 `reply_necessity` 那一行点了 `@` 穿透，容易读成「动态门/计数门不漏」。实际宿主的判定顺序是**先判静默（`turn_trigger/scheduler.py:57`）、再判 `@` 强制触发（`:65`）、最后才是概率门与计数门（`:80`/`:94`）** ⇒ 只要倍率不是**精确的 0**，任何模式下 `@` 都会进 Planner，且不受 `talk_value` 与动态门概率影响；`_handle_silent_turn` 反过来在静默轮里第一件事就是 `_clear_forced_turn_state()`（`reasoning_engine.py:1197`），把 `@` 刚武装的强制轮抹掉——这就是「睡就是睡」能压住 `@` 的唯一原因。同时订正两处过时引用：静默分支的 1.3.2 行号（`turn_scheduler.py:90` → `turn_trigger/scheduler.py:57`）、1.6.0 行里 `@` 的预期回复数（0.9 → **0.91**，与源码 `FORCED_TURN_EXPECTED_REPLIES` 一致）。**纯文档改动，行为零变化**（仍默认 `silence_floor = 0.0`） |

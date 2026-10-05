@@ -637,7 +637,12 @@ def test_economy_hint_is_not_injected_into_the_reply_prompt():
 
 
 def test_sim_tick_refreshes_economy_before_asking_the_model():
-    """取数必须发生在活动决策之前，否则这一轮的提示词拿不到「手头紧」。"""
+    """取数必须发生在活动决策之前，否则这一轮的提示词拿不到「手头紧」。
+
+    v1.8.0 起这条纪律同样适用于「外面的世界」四个源（同一个理由：这一轮的提示词
+    要能看到今天外面发生了什么），所以断言按 **API 名**分辨调用，而不是把所有
+    ``api.call`` 都当成经济取数。
+    """
 
     async def run():
         # skip_when_forced 默认开启，新状态未满最短停留期时会整轮跳过模型提问，
@@ -649,9 +654,9 @@ def test_sim_tick_refreshes_economy_before_asking_the_model():
 
         original = plugin.ctx.api.call
 
-        async def spy(*args, **kwargs):
-            order.append("economy")
-            return await original(*args, **kwargs)
+        async def spy(api_name, **kwargs):
+            order.append("economy" if str(api_name) == TARGET else f"world:{api_name}")
+            return await original(api_name, **kwargs)
 
         plugin.ctx.api.call = spy
         plugin._fetch_identity = lambda: asyncio.sleep(0)  # 不读人设，专心看顺序
@@ -663,6 +668,11 @@ def test_sim_tick_refreshes_economy_before_asking_the_model():
 
         plugin._ask_activity = fake_ask
         await plugin._sim_tick()
-        assert order[:2] == ["economy", "activity"], order
+
+        assert "economy" in order and "activity" in order, order
+        assert order.index("economy") < order.index("activity"), order
+        world_calls = [i for i, item in enumerate(order) if item.startswith("world:")]
+        assert world_calls, f"外面世界一个源都没取：{order}"
+        assert max(world_calls) < order.index("activity"), order
 
     asyncio.run(run())

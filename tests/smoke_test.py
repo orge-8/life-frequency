@@ -32,7 +32,7 @@ PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
 PKG_NAME = "life_frequency_under_test"
 FLAT_MODULES = (
     "life_activity", "life_events", "life_factors", "life_host_model",
-    "life_proactive", "life_sim",
+    "life_proactive", "life_sim", "life_world",
 )
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")

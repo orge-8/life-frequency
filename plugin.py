@@ -166,6 +166,25 @@ try:
         social_lines,
         unavailable as social_unavailable,
     )
+    from .life_world import (
+        LiveStatus,
+        NewcomerSource,
+        PushSource,
+        SongSource,
+        SubscriptionSource,
+        WorldContext,
+        WorldPolicy,
+        WorldStatus,
+        intake_world,
+        parse_live_status,
+        parse_recent_newcomers,
+        parse_recent_pushes,
+        parse_recent_songs,
+        parse_subscriptions,
+        prune_world_seen,
+        world_events,
+        world_lines,
+    )
 except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_activity import (
         ACTIVITY_LABELS,
@@ -265,6 +284,25 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         session_ids,
         social_lines,
         unavailable as social_unavailable,
+    )
+    from life_world import (
+        LiveStatus,
+        NewcomerSource,
+        PushSource,
+        SongSource,
+        SubscriptionSource,
+        WorldContext,
+        WorldPolicy,
+        WorldStatus,
+        intake_world,
+        parse_live_status,
+        parse_recent_newcomers,
+        parse_recent_pushes,
+        parse_recent_songs,
+        parse_subscriptions,
+        prune_world_seen,
+        world_events,
+        world_lines,
     )
 
 __plugin_id__ = "org.orge-8.life-frequency"
@@ -1444,6 +1482,139 @@ class SocialConfig(PluginConfigBase):
     )
 
 
+class WorldConfig(PluginConfigBase):
+    """``[world]``：把「外面的世界」接成她的经历。
+
+    四个**只读**数据源（全部 ``@API(version="1", public=True)``，零网络零写盘）：
+
+    - ``bilibili-live-gateway.get_live_status``       → UP 主开播了
+    - ``bilibili-dynamic-push.get_recent_pushes``     → UP 主发了新视频 / 新动态
+    - ``group-welcome.get_recent_newcomers``          → 群里来了个新人
+    - ``cv_lyric_context.get_recent_songs``           → 有人聊到了《X》
+    - ``bilibili-dynamic-push.get_subscriptions``     → 只用于状态卡（订阅了谁）
+
+    **总开关默认开、每个源独立可关**：每个源都自带降级（未装 / 未升级 / 超时 / 坏结构
+    都只少一类事件），所以「没装那些插件」不会报错、也不会拖住生活循环。
+    """
+
+    __ui_label__ = "外面的世界（跨插件联动）"
+    __ui_icon__ = "globe"
+    __ui_order__ = 15
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "把「UP 主开播 / 发了新动态 / 群里来新人 / 有人聊到某首歌」接成她的近期经历。"
+            "关掉则完全不调这些跨插件 API"
+        ),
+        json_schema_extra={"label": "接入外面的世界", "order": 0},
+    )
+    live_enabled: bool = Field(
+        default=True,
+        description="接入「UP 主开播」（bilibili-live-gateway 的 get_live_status）",
+        json_schema_extra={"label": "开播", "order": 1},
+    )
+    video_enabled: bool = Field(
+        default=True,
+        description="接入「UP 主发了新动态」（bilibili-dynamic-push 的 get_recent_pushes）",
+        json_schema_extra={"label": "新动态", "order": 2},
+    )
+    newcomer_enabled: bool = Field(
+        default=True,
+        description="接入「群里来了个新人」（group-welcome 的 get_recent_newcomers）",
+        json_schema_extra={"label": "新人", "order": 3},
+    )
+    song_enabled: bool = Field(
+        default=True,
+        description="接入「有人聊到了某首歌」（cv_lyric_context 的 get_recent_songs）",
+        json_schema_extra={"label": "歌曲", "order": 4},
+    )
+
+    live_plugin_id: str = Field(
+        default="org.mai-mai.bilibili-live-gateway",
+        description="直播间插件 ID（提供 get_live_status）",
+        json_schema_extra={"label": "直播插件 ID", "order": 5},
+    )
+    push_plugin_id: str = Field(
+        default="org.mai-mai.bilibili-dynamic-push",
+        description="动态推送插件 ID（提供 get_recent_pushes / get_subscriptions）",
+        json_schema_extra={"label": "动态插件 ID", "order": 6},
+    )
+    newcomer_plugin_id: str = Field(
+        default="org.orge-8.group-welcome",
+        description="群欢迎插件 ID（提供 get_recent_newcomers）",
+        json_schema_extra={"label": "群欢迎插件 ID", "order": 7},
+    )
+    song_plugin_id: str = Field(
+        default="org.mai-mai.cv-lyric-context",
+        description="歌词插件 ID（提供 get_recent_songs）",
+        json_schema_extra={"label": "歌词插件 ID", "order": 8},
+    )
+    api_version: str = Field(
+        default="1",
+        description="这些 API 的版本；上游做不兼容更新时会递增",
+        json_schema_extra={"label": "API 版本", "order": 9},
+    )
+
+    refresh_interval_minutes: int = Field(
+        default=10,
+        description=(
+            "多久取一次（分钟）。只读 RPC、不唤醒模型；每个源单独 5 秒超时，"
+            "任一源超时只少那一类事件"
+        ),
+        json_schema_extra={"label": "取数间隔（分钟）", "order": 10, "step": 5},
+    )
+    api_timeout_seconds: int = Field(
+        default=5,
+        description="单个源每次调用的超时（秒）。四个源串行最坏会累加，所以别设太大",
+        json_schema_extra={"label": "单源超时（秒）", "order": 11, "step": 1},
+    )
+    newcomer_window_seconds: int = Field(
+        default=86400,
+        description="向群欢迎插件要多久以内入群的新人（秒），默认 24 小时",
+        json_schema_extra={"label": "新人时间窗（秒）", "order": 12, "step": 3600},
+    )
+    max_items_per_source: int = Field(
+        default=10,
+        description="每个源单轮最多取几条（上游自己也有上限，这里再兜一层，1~50）",
+        json_schema_extra={"label": "单源条数上限", "order": 13, "step": 1},
+    )
+
+    live_emotion: float = Field(
+        default=0.20,
+        description="「关注的 UP 主开播了」值多少情绪（24 小时内的事才算）",
+        json_schema_extra={"label": "开播的情绪影响", "order": 14, "step": 0.05},
+    )
+    video_emotion: float = Field(
+        default=0.15,
+        description="「UP 主发了新视频/新动态」值多少情绪",
+        json_schema_extra={"label": "新动态的情绪影响", "order": 15, "step": 0.05},
+    )
+    newcomer_emotion: float = Field(
+        default=0.10,
+        description="「群里来了个新人」值多少情绪",
+        json_schema_extra={"label": "新人的情绪影响", "order": 16, "step": 0.05},
+    )
+    song_emotion: float = Field(
+        default=0.12,
+        description="「有人聊到了某首歌」值多少情绪",
+        json_schema_extra={"label": "歌曲的情绪影响", "order": 17, "step": 0.05},
+    )
+    daily_emotion_cap: float = Field(
+        default=1.0,
+        description="每个生活日「外面的世界」能给她多少情绪；用完只记事、不加情绪",
+        json_schema_extra={"label": "每日情绪额度", "order": 18, "step": 0.1},
+    )
+    max_events_per_day: int = Field(
+        default=6,
+        description=(
+            "每个生活日最多接进几条世界事件。**必须有上界**：否则热闹的群会把"
+            "她自己的生活事件挤掉"
+        ),
+        json_schema_extra={"label": "每日条数上限", "order": 19, "step": 1},
+    )
+
+
 class LifeFrequencyConfig(PluginConfigBase):
     """插件配置根模型。
 
@@ -1464,6 +1635,7 @@ class LifeFrequencyConfig(PluginConfigBase):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     economy: EconomyConfig = Field(default_factory=EconomyConfig)
     social: SocialConfig = Field(default_factory=SocialConfig)
+    world: WorldConfig = Field(default_factory=WorldConfig)
     # ⚠ 必须是**顶层**节：SDK 只在顶层把 "是配置模型类" 的字段展开成 section
     # （`maibot_sdk/config.py:209-227`），嵌在别的节里的配置对象会退化成
     # `type=object` 的普通字段、不带 `properties`，WebUI 只能把它渲染成
@@ -1535,6 +1707,13 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         #: 本生活日已接进经历的社交条数（给状态卡显示）
         self._social_today_count: int = 0
         self._social_today_day: str = ""
+        #: 外面的世界：最近一次取到的四个源状态（内存态；重启后下一轮取数刷新）
+        self._world: WorldStatus | None = None
+        self._world_next_try_at: float = 0.0
+        self._world_fail_streak: int = 0
+        #: 本生活日已接进经历的世界事件条数（给状态卡显示，并用于 max_events_per_day）
+        self._world_today_count: int = 0
+        self._world_today_day: str = ""
 
     def _warn_once(self, key: str, message: str, *args: Any) -> None:
         """同一类配置/状态问题只告警一次，别每轮巡检刷屏。"""
@@ -2419,6 +2598,243 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             emotion_used=float(self._state.social_daily.get(day_key, 0.0) or 0.0),
             daily_cap=max(0.0, float(social.daily_emotion_cap)),
             now=now,
+        )
+
+    # ------------------------------------------------------------ 外面的世界
+
+    def _world_interval_seconds(self) -> float:
+        return max(60.0, float(self.config.world.refresh_interval_minutes or 10) * 60.0)
+
+    def _world_policy(self) -> WorldPolicy:
+        """``[world]`` → 纯策略（给 ``life_world`` 用，便于脱机单测）。"""
+
+        cfg = self.config.world
+        return WorldPolicy(
+            live_enabled=bool(cfg.live_enabled),
+            video_enabled=bool(cfg.video_enabled),
+            newcomer_enabled=bool(cfg.newcomer_enabled),
+            song_enabled=bool(cfg.song_enabled),
+            live_emotion=float(cfg.live_emotion),
+            video_emotion=float(cfg.video_emotion),
+            newcomer_emotion=float(cfg.newcomer_emotion),
+            song_emotion=float(cfg.song_emotion),
+            daily_emotion_cap=float(cfg.daily_emotion_cap),
+            max_events_per_day=int(cfg.max_events_per_day),
+            newcomer_window_seconds=int(cfg.newcomer_window_seconds),
+            max_items_per_source=int(cfg.max_items_per_source),
+        )
+
+    def _world_due(self, now: float) -> bool:
+        if self._world is None:
+            return True
+        return float(now) >= float(self._world_next_try_at)
+
+    async def _world_call(
+        self, plugin_id: str, api_name: str, *, timeout: float, **kwargs: Any
+    ) -> Any:
+        """一次只读跨插件调用；失败返回**与 SDK 同形状**的失败字典。
+
+        这样解析层只用一套逻辑处理「调用失败」与「对方返回坏结构」，不需要额外的状态字段。
+        跨进程的 RPCError 认不得类型（msgpack 重建的类不是同一个对象），所以只取类名与文本。
+        """
+
+        plugin_id = str(plugin_id or "").strip()
+        if not plugin_id:
+            return {"success": False, "error": f"{api_name}: 未配置提供方插件 ID"}
+        target = f"{plugin_id}.{api_name}"
+        try:
+            return await asyncio.wait_for(
+                self.ctx.api.call(
+                    target, version=str(self.config.world.api_version or "1"), **kwargs
+                ),
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            raise  # 卸载 / 取消必须原样上抛，不能被吞成「取数失败」
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"{target}: {timeout:g} 秒内没有返回"}
+        except Exception as exc:  # noqa: BLE001 —— 跨插件调用失败必须降级
+            return {"success": False, "error": f"{target}: {type(exc).__name__}: {exc}"}
+
+    async def _refresh_world(self, now: float) -> None:
+        """按间隔取四个只读源；**每个源独立降级**，绝不影响生活循环。
+
+        四个源串行取（同一时刻只占一条 RPC，不给宿主压力），每个源单独超时；
+        任一源坏掉只少那一类事件，其余照常。
+        """
+
+        if not self.config.world.enabled:
+            self._world = None
+            return
+        if not self._world_due(now):
+            return
+
+        cfg = self.config.world
+        interval = self._world_interval_seconds()
+        timeout = max(1.0, float(cfg.api_timeout_seconds or 5))
+        limit = max(1, min(50, int(cfg.max_items_per_source or 10)))
+
+        live: LiveStatus | None = None
+        if cfg.live_enabled:
+            live = parse_live_status(
+                await self._world_call(cfg.live_plugin_id, "get_live_status", timeout=timeout),
+                fetched_at=now,
+            )
+
+        pushes: PushSource | None = None
+        if cfg.video_enabled:
+            pushes = parse_recent_pushes(
+                await self._world_call(
+                    cfg.push_plugin_id, "get_recent_pushes", timeout=timeout, limit=limit
+                ),
+                fetched_at=now,
+                limit=limit,
+            )
+
+        newcomers: NewcomerSource | None = None
+        if cfg.newcomer_enabled:
+            newcomers = parse_recent_newcomers(
+                await self._world_call(
+                    cfg.newcomer_plugin_id,
+                    "get_recent_newcomers",
+                    timeout=timeout,
+                    since_seconds=max(3600, int(cfg.newcomer_window_seconds or 86400)),
+                    limit=limit,
+                ),
+                fetched_at=now,
+                limit=limit,
+            )
+
+        songs: SongSource | None = None
+        if cfg.song_enabled:
+            songs = parse_recent_songs(
+                await self._world_call(
+                    cfg.song_plugin_id, "get_recent_songs", timeout=timeout, limit=limit
+                ),
+                fetched_at=now,
+                limit=limit,
+            )
+
+        # 订阅表只用于状态卡（订阅了几位 UP 主）：失败也不影响任何事件
+        subscriptions = parse_subscriptions(
+            await self._world_call(cfg.push_plugin_id, "get_subscriptions", timeout=timeout),
+            fetched_at=now,
+        )
+        self._world = WorldStatus(
+            live=live,
+            pushes=pushes,
+            newcomers=newcomers,
+            songs=songs,
+            subscriptions=subscriptions,
+        )
+
+        sources = [
+            ("直播", live),
+            ("动态", pushes),
+            ("新人", newcomers),
+            ("歌曲", songs),
+        ]
+        usable = [item for _name, item in sources if item is not None and item.ok and item.active]
+        if usable:
+            recovered = self._world_fail_streak > 0
+            self._world_fail_streak = 0
+            self._world_next_try_at = float(now) + interval
+            self._warned.discard("world_fetch")  # 下次再坏要能重新告警
+            if recovered:
+                self.ctx.logger.info(
+                    "%s 外面的世界已恢复接入：%s", __plugin_id__, "；".join(self._world_card_lines(now))
+                )
+            return
+
+        # 四个源都没取到：退避重试，只告警一次（没装那些插件时这是正常状态）
+        self._world_fail_streak += 1
+        backoff = min(interval * (2 ** min(self._world_fail_streak - 1, 4)), 3600.0)
+        self._world_next_try_at = float(now) + backoff
+        detail = "；".join(
+            f"{name}={item.error or item.reason or '不可用'}"
+            for name, item in sources
+            if item is not None
+        )
+        self._warn_once(
+            "world_fetch",
+            "外面的世界：四个源都没取到（%s）；已按「未接入」降级，%s 分钟后重试。"
+            "没装这些插件时属正常，把 [world] enabled 设为 false 可关闭本项",
+            detail or "未启用任何源",
+            f"{backoff / 60.0:g}",
+        )
+
+    def _intake_world(self, now: float, sim_config: SimConfig) -> None:
+        """把已取到的世界事件接进她的经历。
+
+        只加经历与情绪：**不碰倍率、不写宿主、不动素材**。额度与条数按生活日算，
+        睡眠中只记事不加情绪（沿用 ``[social]`` 的同一条策略）。
+        """
+
+        if not self.config.world.enabled or self._world is None:
+            return
+
+        state = self._state
+        day = state.day_key or day_key_of(
+            local_datetime(now, sim_config.tz_offset_minutes), sim_config.day_boundary_hour
+        )
+        if self._world_today_day != day:
+            self._world_today_day = day
+            self._world_today_count = 0
+
+        policy = self._world_policy()
+        asleep = state.activity == SLEEP
+        context = WorldContext(
+            now=now,
+            activity=state.activity,
+            asleep=asleep,
+            day_used=float(state.world_daily.get(day, 0.0) or 0.0),
+            day_events=self._world_today_count,
+            policy=policy,
+        )
+        events = world_events(
+            live=self._world.live,
+            pushes=self._world.pushes,
+            newcomers=self._world.newcomers,
+            songs=self._world.songs,
+            policy=policy,
+            now=now,
+            day_key=day,
+        )
+        intake = intake_world(events, context, state.world_seen)
+        if not intake.events:
+            return
+
+        for entry in intake.events:
+            append_social_event(state, entry, config=sim_config)
+        state.world_daily[day] = float(state.world_daily.get(day, 0.0) or 0.0) + intake.emotion_used
+        prune_world_seen(state.world_seen)
+        prune_daily(state.world_daily)
+        self._world_today_count += len(intake.events)
+        self._state_dirty = True
+        self.ctx.logger.info(
+            "%s 外面的世界：接进 %d 条（情绪 %+.2f，本生活日已用 %.2f/%g 情绪、%d/%d 条）%s",
+            __plugin_id__,
+            len(intake.events),
+            intake.emotion_used,
+            float(state.world_daily.get(day, 0.0) or 0.0),
+            policy.daily_emotion_cap,
+            self._world_today_count,
+            policy.max_events_per_day,
+            "；睡眠中只记事、不加情绪" if asleep and not policy.emotion_while_asleep else "",
+        )
+
+    def _world_card_lines(self, now: float) -> list[str]:
+        """``/生活`` 卡片上的「外面的世界」几行。"""
+
+        world = self.config.world
+        day_key = self._state.day_key
+        today = self._world_today_count if self._world_today_day == day_key else 0
+        return world_lines(
+            self._world,
+            enabled=bool(world.enabled),
+            today_events=today,
+            emotion_used=float(self._state.world_daily.get(day_key, 0.0) or 0.0),
+            daily_cap=max(0.0, float(world.daily_emotion_cap)),
         )
 
     # ------------------------------------------------------------ 作息班表
@@ -3644,6 +4060,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         # 社交经历同理：先取日记摘要、再入库，这一轮的提示词才能看到「她今天和谁聊了什么」
         await self._refresh_social(now)
         self._intake_social(now, sim_config)
+        # 外面的世界：四个只读源各自降级；同样要在「请模型决定活动」之前取 + 入库
+        await self._refresh_world(now)
+        self._intake_world(now, sim_config)
 
         if self._llm_ready(now):
             skip_reason = ""
@@ -3814,6 +4233,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             )
         lines.extend(self._economy_card_lines(now))
         lines.extend(self._social_card_lines(now))
+        lines.extend(self._world_card_lines(now))
         lines.extend([
             self._material_line(now, sim_config),
             f"宿主模式：{mode_label}　{talk_source}：{talk_value:.3f}",
