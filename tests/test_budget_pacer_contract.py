@@ -42,7 +42,6 @@ def _budget_pacer_entry_candidates() -> tuple[pathlib.Path, ...]:
         [
             PLUGIN_DIR.parent / "budget-pacer",            # 同级目录（开发机）
             pathlib.Path("plugins") / "budget-pacer",      # 装进 MaiBot 的常见位置
-            pathlib.Path(r"C:\path\to\budget-pacer"),  # 作者本机兜底
         ]
     )
     return tuple(directory / "plugin.py" for directory in candidates)

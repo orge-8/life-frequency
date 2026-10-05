@@ -37,7 +37,6 @@ def _entry_candidates() -> tuple[pathlib.Path, ...]:
         [
             PLUGIN_DIR.parent / UPSTREAM,
             pathlib.Path("plugins") / UPSTREAM,
-            pathlib.Path(r"C:\path\to") / UPSTREAM,
         ]
     )
     return tuple(directory / "plugin.py" for directory in candidates)

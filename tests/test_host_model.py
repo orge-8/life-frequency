@@ -34,9 +34,6 @@ def _host_source_candidates() -> tuple[pathlib.Path, ...]:
             pathlib.Path("repos/MaiBot/src/maisaka/reply_necessity.py"),
             pathlib.Path("../MaiBot/src/maisaka/reply_necessity.py"),
             pathlib.Path.home() / "repos" / "MaiBot" / "src" / "maisaka" / "reply_necessity.py",
-            # 作者本机的检出：仅作兜底（跨机器请用 LF_MAIBOT_SRC 或上面的相对路径）
-            pathlib.Path(r"C:\path\to\WorkBuddy\2026-09-29-10-10-17\repos\MaiBot"
-                         r"\src\maisaka\reply_necessity.py"),
         ]
     )
     return tuple(candidates)

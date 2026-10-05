@@ -43,7 +43,6 @@ def _entry_candidates() -> tuple[pathlib.Path, ...]:
     candidates.extend([
         PLUGIN_DIR.parent / "better-diary",                     # 同级目录（开发机）
         pathlib.Path("plugins") / "better-diary",               # 装进 MaiBot 的常见位置
-        pathlib.Path(r"C:\path\to\better-diary"),   # 作者本机兜底
     ])
     return tuple(directory / "plugin.py" for directory in candidates)
 
