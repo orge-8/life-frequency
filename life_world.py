@@ -753,7 +753,32 @@ class WorldStatus:
     subscriptions: SubscriptionSource | None = None
 
 
-def _source_state(ok: bool | None, active: bool, reason: str, error: str, empty: str) -> str:
+#: 上游在「健康、但确实暂无数据」时会照契约回一个说明性 ``reason``（例如 ``暂无推送记录``）。
+#: 这**不是劣化**，不该在状态卡上写成「降级」——真机上就出现过「动态：降级（暂无推送记录）」
+#: 这种把"还没数据"说成"坏了"的误读。只认四个上游在契约里承诺的空窗措辞；
+#: 出现未知措辞时一律按「降级」显示（宁可误报，不可漏报）。
+BENIGN_EMPTY_REASONS: frozenset[str] = frozenset(
+    {
+        "暂无推送记录",  # bilibili-dynamic-push.get_recent_pushes
+        "时间窗内没有推送记录",  # bilibili-dynamic-push.get_recent_pushes
+        "暂无任何成员记录",  # group-welcome.get_recent_newcomers
+        "时间窗内没有新成员",  # group-welcome.get_recent_newcomers
+        "暂无歌曲命中记录",  # cv_lyric_context.get_recent_songs
+    }
+)
+
+
+def _source_state(
+    ok: bool | None,
+    active: bool,
+    reason: str,
+    error: str,
+    empty: str,
+    *,
+    benign_empty: bool = False,
+) -> str:
+    """一行数据源状态：**「没接上」绝不能看起来像「没问题」**，反之亦然。"""
+
     if ok is None:
         return "未取过"
     if not ok:
@@ -761,7 +786,7 @@ def _source_state(ok: bool | None, active: bool, reason: str, error: str, empty:
     if not active:
         return f"上游未启用（{reason or '未就绪'}）"
     if reason:
-        return f"降级（{reason}）"
+        return f"已接入（{reason}）" if benign_empty else f"降级（{reason}）"
     return empty
 
 
@@ -796,15 +821,19 @@ def world_lines(
         state = "直播中" if live.is_live else "未开播"
         lines.append(f"　直播：{live.anchor_name or live.room_id} {state}（{live.live_status_name}）")
     for label, src, empty in (
-        ("动态", status.pushes, "暂无推送记录"),
-        ("新人", status.newcomers, "暂无新人记录"),
-        ("歌曲", status.songs, "暂无命中记录"),
+        ("动态", status.pushes, "已接入（暂无推送记录）"),
+        ("新人", status.newcomers, "已接入（暂无新人记录）"),
+        ("歌曲", status.songs, "已接入（暂无命中记录）"),
     ):
         ok = None if src is None else src.ok
         active = bool(src is not None and src.active)
         reason = "" if src is None else src.reason
         error = "" if src is None else src.error
         count = len(src.items) if src is not None else 0
-        lines.append(f"　{label}：{_source_state(ok, active, reason, error, f'已接入（{count} 条）' if count else empty)}")
+        # 只有「没条目 + 上游明确说是空窗」才算健康；带条目的 reason 与未知措辞都仍按降级显示
+        benign = count == 0 and reason in BENIGN_EMPTY_REASONS
+        lines.append(
+            f"　{label}：{_source_state(ok, active, reason, error, f'已接入（{count} 条）' if count else empty, benign_empty=benign)}"
+        )
     lines.append(tally)
     return lines
