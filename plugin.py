@@ -34,8 +34,10 @@ import random
 import re
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
+from uuid import uuid4
 
 # --- 唯一允许的宿主依赖入口：maibot_sdk（禁止 import src.*）---
 from maibot_sdk import (
@@ -111,6 +113,7 @@ try:
     )
     from .life_host_model import normalize_mode as normalize_host_mode
     from .life_proactive import (
+        NO_QUOTE_DISCIPLINE,
         REASON_INTERVAL,
         ProactiveConfig as ProactiveRules,
         bump_skip_ledger,
@@ -230,6 +233,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_host_model import MODE_LABELS, preview
     from life_host_model import normalize_mode as normalize_host_mode
     from life_proactive import (
+        NO_QUOTE_DISCIPLINE,
         REASON_INTERVAL,
         ProactiveConfig as ProactiveRules,
         bump_skip_ledger,
@@ -1643,6 +1647,84 @@ class LifeFrequencyConfig(PluginConfigBase):
     schedule: ScheduleConfigModel = Field(default_factory=ScheduleConfigModel)
 
 
+# ---------------------------------------------------------------- 主动开口：不引用
+#
+# 真机要求（2026-10-05）：**主动开口时不要挂引用** —— 她主动找话说时引用了别人刚说的话，
+# 看起来就像在回复那个人，语义完全错位。
+#
+# 与 group-welcome 同一个坑（那边 v1.0.2→v1.2.3 迭代了四轮，结论可复用）：
+#   * `set_quote` 是 **Planner 调 reply 工具时的参数**，插件改不了它（无法强制）；
+#   * 只写「不要引用任何消息」会把模型逼到无路可走 —— `reply` 必须带 `msg_id`，
+#     所以要给它一条可执行路径（引用对象只能是她自己）；
+#   * 光写进 `intent` 不够：intent 属「任务描述」，模型未必当硬约束 ⇒
+#     再往 Planner 请求的 `items` 追加一条系统级发言规则（更靠近决策的位置）。
+#
+# 纪律本身**写在代码层**（不是 `Field(default=...)`）：`config.toml` 首跑落盘后就不再跟随
+# 升级更新，纪律类规则若只写在配置默认值里，已部署实例永远不会生效。
+PROACTIVE_NO_QUOTE_MARKER = "[proactive-no-quote]"
+PROACTIVE_NO_QUOTE_HINT = (
+    f"{PROACTIVE_NO_QUOTE_MARKER} 本次发言规则：{NO_QUOTE_DISCIPLINE}"
+)
+
+#: 主动开口后多久内给该会话的 Planner 请求注入上面这条规则（秒）。
+#: 只在触发后的窗口内生效，其他场合的正常引用行为完全不受影响。
+PROACTIVE_NO_QUOTE_WINDOW_SECONDS = 180.0
+
+#: 窗口表上限：超过就顺手清一次过期项，避免字典随会话数无限增长
+_PROACTIVE_NO_QUOTE_MAX_WINDOWS = 8
+
+
+def _build_system_item(text: str) -> dict[str, Any]:
+    """构造一条可注入 Planner 请求的 System 消息项（对齐 Host 的 items 协议）。"""
+
+    return {
+        "item_type": "SystemMessageItem",
+        "meta": {
+            "item_id": uuid4().hex,
+            "logical_turn_id": None,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "parts": [{"type": "text", "text": text}],
+    }
+
+
+def _contains_marker(container: Any, marker: str) -> bool:
+    """递归判断注入标记是否已存在（幂等检查，避免同一请求被重复注入）。"""
+
+    if not marker:
+        return False
+    if isinstance(container, str):
+        return marker in container
+    if isinstance(container, (list, tuple)):
+        return any(_contains_marker(item, marker) for item in container)
+    if isinstance(container, dict):
+        if marker in str(container.get("text") or ""):
+            return True
+        if marker in str(container.get("content") or ""):
+            return True
+        return _contains_marker(container.get("parts"), marker)
+    return False
+
+
+def _inject_into_items(kwargs: dict[str, Any], text: str, marker: str) -> bool:
+    """往 Planner 请求的 ``items`` 追加一条系统提示；返回是否可用。
+
+    ``items`` 是当前 Host 版本真正生效的注入路径（``messages`` / ``prompt`` 属旧版本兜底，
+    这里只走 items，不做多形态猜测）。形态不匹配时返回 ``False``，由调用方打 warning ——
+    「注入了但没生效」必须留痕，否则真机上永远查不出来。
+    """
+
+    items = kwargs.get("items")
+    if not isinstance(items, list):
+        return False
+    if _contains_marker(items, marker):
+        return True  # 幂等：已经在里面了
+    new_items = list(items)
+    new_items.append(_build_system_item(text))
+    kwargs["items"] = new_items
+    return True
+
+
 # ===================================================================== 插件
 
 
@@ -1688,6 +1770,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         self._last_skipped_idle: int = 0
         #: 连续多少轮有会话写不进去（用于把长期故障升级成一次 warning）
         self._unbacked_rounds: int = 0
+        #: 主动开口后的「不引用」窗口：session_id → 截止时间戳。
+        #: 窗口内该会话的 Planner 请求会被注入「不要引用」规则（见 PROACTIVE_NO_QUOTE_*）
+        self._proactive_no_quote_until: dict[str, float] = {}
         #: 经济维度：最近一次取到的预算快照（内存态；重启后由下一轮取数刷新）
         self._economy: EconomySnapshot | None = None
         #: 下一次允许取预算数据的时间戳（间隔控制 + 失败退避）
@@ -3990,7 +4075,23 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             self.ctx.logger.info("宿主未受理主动任务：%s", result.get("error"))
             return False
         self.ctx.logger.info("%s 主动开口 session=%s score=%.3f", __plugin_id__, session_id, decision.score)
+        # 打开「不引用」窗口：接下来这一轮 Planner 请求会被注入发言规则
+        self._open_no_quote_window(session_id, now)
         return True
+
+    def _open_no_quote_window(self, session_id: str, now: float) -> None:
+        """记下该会话的「主动开口当轮」截止时间（供 ``inject_no_quote_hint`` 判断）。"""
+
+        if not session_id or PROACTIVE_NO_QUOTE_WINDOW_SECONDS <= 0:
+            return
+        if len(self._proactive_no_quote_until) > _PROACTIVE_NO_QUOTE_MAX_WINDOWS:
+            # 顺手清过期项，避免字典随会话数无限增长
+            self._proactive_no_quote_until = {
+                key: deadline
+                for key, deadline in self._proactive_no_quote_until.items()
+                if deadline > now
+            }
+        self._proactive_no_quote_until[session_id] = float(now) + PROACTIVE_NO_QUOTE_WINDOW_SECONDS
 
     # ------------------------------------------------------------ 后台循环
 
@@ -4867,6 +4968,53 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 return {"action": "continue"}
             digest = digest[:room]
         return {"action": "continue", "modified_kwargs": {"extra_prompt": original + digest}}
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="inject_no_quote_hint",
+        description="主动开口当轮，向 Planner 注入「不要引用任何消息」的发言规则",
+        # 与 group-welcome v1.3.0 同一套做法（那边真机验证过）：往 Planner 请求的 items
+        # 追加一条系统级规则。BLOCKING + EARLY 保证在别的 blocking 处理器 abort 之前注入。
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=3000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def inject_no_quote_hint(self, **kwargs: Any) -> dict[str, Any]:
+        """主动开口窗口内，向 Planner 注入「不要引用」规则（v1.8.1）。
+
+        为什么要在 intent 之外再注入一次：``build_intent`` 里已经写了同一条纪律，但
+        intent 属「任务描述」，模型未必当成硬约束。这里改在更靠近决策的位置 ——
+        且**只在刚主动开口的那个会话、180 秒窗口内**生效，其他场合的正常引用行为不受影响。
+
+        ⚠️ 仍是**引导而非强制**：``set_quote`` 是 Planner 调 ``reply`` 时的工具参数，
+        插件无法干预工具参数。本 hook 的作用是提高「选对」的概率。
+        """
+
+        now = time.time()
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            # 没有会话键就没法定位是哪个会话的窗口。**必须留痕**：否则这条规则在真机上
+            # 会表现为「永远不生效」，而日志里一条线索都没有（窗口是不是开了无从判断）。
+            if self._proactive_no_quote_until:
+                self._warn_once(
+                    "proactive_no_quote_no_session",
+                    "主动开口的「不要引用」规则无法注入：Planner 请求里没有 session_id",
+                )
+            return {"action": "continue"}
+        deadline = self._proactive_no_quote_until.get(session_id)
+        if not deadline or now > deadline:
+            return {"action": "continue"}
+
+        payload = dict(kwargs)
+        if not _inject_into_items(payload, PROACTIVE_NO_QUOTE_HINT, PROACTIVE_NO_QUOTE_MARKER):
+            # 形态不匹配必须留痕：否则真机上只会表现为「规则没生效」，查不出为什么
+            self.ctx.logger.warning(
+                "主动开口发言规则注入失败：items 形态不匹配（session=%s）", session_id
+            )
+            return {"action": "continue"}
+        self.ctx.logger.info("已注入主动开口发言规则（不引用）：session=%s", session_id)
+        return {"action": "continue", "modified_kwargs": payload}
 
 
 # ---------------------------------------------------------------- WebUI Schema 修正

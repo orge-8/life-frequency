@@ -13,7 +13,7 @@ bd-repo 踩过这个坑——平铺加载能过、真机却报 ``No module named
 3. 状态推进 → 倍率 → ``frequency.set_adjust`` 的完整链路
 4. LLM 决策生效；LLM 返回垃圾时保持上个活动
 5. 命令（状态 / 频率 / 暂停 / 恢复）与管理员闸（fail-closed）
-6. 工具、两个 Hook
+6. 工具、三个 Hook
 7. 卸载后还原 1.0、无残留任务、插件目录无 data/ 残留
 
 ⚠ 冒烟通过 ≠ 真机可用：真机还有 manifest 校验、能力授权、adapter 差异。

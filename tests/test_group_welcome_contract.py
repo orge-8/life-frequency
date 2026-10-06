@@ -17,6 +17,7 @@ import logging
 import os
 import pathlib
 import sys
+import time
 import types
 
 import pytest
@@ -118,7 +119,11 @@ def test_real_api_newcomers_map_to_world_events(welcome):
     """正常返回：两个新人 → 两条事件，且**没有昵称**（数据边界）。"""
 
     async def run():
-        now = 1791174000.0
+        # ⚠️ 必须用**墙钟**而不是写死的时间戳：上游按 ``cutoff = time.time() - since_seconds``
+        # 过滤（plugin.py:344-345），写死的时间戳会随真实时间漂移出 24h 窗口 ——
+        # 2026-10-06 就是这样炸的（写死的 now 之后第 24 小时，第二条成员掉出窗口，
+        # 断言 ``== 2`` 变成 1）。固定的 only 是**相对偏移**。
+        now = time.time()
         plugin = _make_plugin(
             welcome,
             seen={"123456": {"10001": now - 600, "10002": now - 1200}},
@@ -185,7 +190,7 @@ def test_readonly_does_not_touch_seen(welcome, tmp_path):
     """只读性：连读多次，``_seen`` / ``_last_trigger`` 不变、文件 mtime 不变。"""
 
     async def run():
-        now = 1791174000.0
+        now = time.time()
         plugin = _make_plugin(welcome, seen={"123456": {"10001": now - 10}}, data_dir=tmp_path)
         plugin._last_trigger["123456"] = now - 100
         plugin._save_state(force=True)

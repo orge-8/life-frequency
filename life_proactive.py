@@ -218,14 +218,32 @@ def select_material(
     return best
 
 
+#: 主动开口的发言纪律：**主动开口不是回复谁，不许挂引用**。
+#:
+#: 写在**代码层**（不是 ``Field(default=...)``）：``config.toml`` 首跑落盘后就不再跟随升级更新，
+#: 纪律类规则只写在配置默认值里，已部署实例永远不会生效（见 maibot-plugin-dev 铁律 11）。
+#: 本常量同时被 ``build_intent``（任务描述）与 ``plugin.PROACTIVE_NO_QUOTE_HINT``
+#: （Planner 请求注入）使用 —— 一处定义，避免两处措辞漂移。
+#:
+#: 措辞是 group-welcome v1.0.2→v1.2.3 四轮迭代后的结论：只说「不要引用」会把模型逼到无路
+#: 可走（``reply`` 必须带 ``msg_id``），必须给一条可执行路径：引用对象只能是她自己。
+NO_QUOTE_DISCIPLINE = (
+    "这是**主动开口**，不是回复谁：请调用 reply 生成一条新的发言，并把 set_quote 设为 false，"
+    "让这条发言独立出现 —— 不要引用任何消息（引用别人刚说过的话，会被误以为你在回他）；"
+    "若确实需要指定回复对象，请选你自己最近发出的一条消息，切勿引用他人的消息。"
+)
+
+
 def build_intent(material: Mapping[str, Any]) -> str:
-    """把素材拼成交给宿主的主动意图文本。"""
+    """把素材拼成交给宿主的主动意图文本（含代码层的发言纪律）。"""
 
     text = sanitize_text(material.get("text", ""), max_chars=80)
     label = sanitize_text(material.get("label", ""), max_chars=32)
     if text:
-        return f"想自然地聊聊刚发生的一件事（{label or '生活小事'}）：{text}"
-    return f"想自然地聊聊刚发生的一件事（{label or '生活小事'}）"
+        base = f"想自然地聊聊刚发生的一件事（{label or '生活小事'}）：{text}"
+    else:
+        base = f"想自然地聊聊刚发生的一件事（{label or '生活小事'}）"
+    return f"{base} {NO_QUOTE_DISCIPLINE}"
 
 
 # ---------------------------------------------------------------- 裁定
