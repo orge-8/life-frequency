@@ -94,8 +94,25 @@ def _text(value: Any, limit: int = MAX_NAME_CHARS) -> str:
 
     try:
         return sanitize_text(value, max_chars=limit)
-    except Exception:  # noqa: BLE001 —— __str__ 抛异常的怪对象也不许炸
+    except Exception:  # noqa: BLE001 —— 负载来自另一个插件的 msgpack 返回值
         return ""
+
+
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "on"})
+
+
+def _strict_bool(value: Any) -> bool:
+    """严格真值：只认**真布尔**与少数明确写法（与 ``life_social.flag_value`` 同一口径）。
+
+    v1.8.2 修：``active`` / ``is_live`` 以前用 ``bool(payload.get(...))``——
+    ``bool("false")`` 是 ``True``，上游把 bool 序列化成字符串时「未开播」会被
+    判成「开播了」，凭空产出假事件。本插件自己在 ``flag_value`` 文档化过这个坑，
+    这里对齐同一套口径。
+    """
+
+    if value is True:
+        return True
+    return isinstance(value, str) and value.strip().lower() in _TRUE_STRINGS
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -196,7 +213,8 @@ def _reason_of(payload: Mapping[str, Any]) -> str:
 
 
 def _active_of(payload: Mapping[str, Any]) -> bool:
-    return bool(payload.get("active"))
+    # v1.8.2 修：改用严格真值（bool("false") is True 的坑，见 _strict_bool）
+    return _strict_bool(payload.get("active"))
 
 
 # ---------------------------------------------------------------- 解析：开播
@@ -235,7 +253,7 @@ def parse_live_status(payload: Any, *, fetched_at: float = 0.0) -> LiveStatus:
         error="",
         room_id=_int_or_none(payload.get("room_id")),
         anchor_name=_text(payload.get("anchor_name")),
-        is_live=bool(payload.get("is_live")),
+        is_live=_strict_bool(payload.get("is_live")),
         live_status=_int_or_none(payload.get("live_status")),
         live_status_name=_text(payload.get("live_status_name"), 12),
         last_ok_at=_finite(payload.get("last_ok_at"), 0.0),

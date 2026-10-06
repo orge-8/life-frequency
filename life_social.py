@@ -36,6 +36,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
+try:
+    from .life_events import sanitize_text
+except ImportError:  # 平铺兜底（脚本直跑 / 测试）
+    from life_events import sanitize_text
+
 #: 事件正文的字符上限，与 ``life_sim._apply_event`` 保持一致（渲染时还会再截一次）
 MAX_TEXT_CHARS = 80
 #: 标签的字符上限（提示词里按 24 字渲染）
@@ -132,7 +137,17 @@ class DigestItem:
 
 
 def _text(value: object, limit: int) -> str:
-    return " ".join(str(value or "").split())[:limit].rstrip()
+    """外部文本 → 净化后的短文本（走项目统一的 ``sanitize_text``）。
+
+    v1.8.2 修：以前这里只做空白折叠 + 截断，**不剥控制字符与结构字符**——而
+    日记摘要的 what/who/quote 源自群聊原话的模型摘要（外部间接通道），带着
+    ``【】「」{}`` 原样入库。当时所有消费点都有二次净化所以不可利用，但任何
+    新增消费点会直接吃到伪造的分节/引用；与 ``life_world._text`` 对齐后，
+    入库前就剥干净。顺带这保证 quote 内不会再出现「」⇒ ``（原话：「…」）``
+    的引用边界不会被子串破坏。
+    """
+
+    return sanitize_text(value, max_chars=limit).rstrip()
 
 
 @dataclass(frozen=True)

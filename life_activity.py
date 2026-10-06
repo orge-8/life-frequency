@@ -766,9 +766,18 @@ def _strip_code_fence(text: str) -> str:
     stripped = text.strip()
     if not stripped.startswith("```"):
         return stripped
-    body = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+    body = stripped[3:]
     if body.rstrip().endswith("```"):
+        # 结尾围栏标记剥掉（单行 ```{...}``` 与多行 ```…``` 都靠这一步）
         body = body.rstrip()[:-3]
+    if "\n" in body:
+        first_line, rest = body.split("\n", 1)
+        if first_line.strip() and not first_line.lstrip().startswith(("{", '"')):
+            # 多行围栏的首行是 ```json 这类语言标记，不是 JSON 主体，丢弃
+            body = rest
+    # v1.8.2 修：以前 body 只在「有换行」时才取 split 后的第二段，
+    # 单行围栏 ```{...}``` 会得到空串 ⇒ 一次有效决策被整段丢弃（fail-closed）。
+    # 现在直接从 ``` 之后取 body，单行/多行都能剥干净。
     return body.strip()
 
 
@@ -811,6 +820,22 @@ def normalize_activity(value: object) -> str | None:
     if text in ALLOWED_ACTIVITIES:
         return text
     return _ACTIVITY_ALIASES.get(text) or _ACTIVITY_ALIASES.get(str(value or "").strip())
+
+
+def is_known_activity(name: object) -> bool:
+    """配置告警用：这个名字（含别名）能不能被 ``normalize_activity`` 接受。
+
+    v1.8.2 新增：事件 DSL 的 ``activities=`` 以前不校验，写错活动名（如 ``workk``）
+    时 ``matches()`` 永远为 False、事件静默永不触发且零告警。plugin 装配层用它
+    逐条对照并告警（life_events 不反 向 import 本模块，避免循环依赖）。
+    """
+
+    text = sanitize_text(name, max_chars=32).lower().replace(" ", "").replace("-", "_")
+    if not text:
+        return False
+    if text in ALLOWED_ACTIVITIES:
+        return True
+    return text in _ACTIVITY_ALIASES or str(name or "").strip() in _ACTIVITY_ALIASES
 
 
 def parse_response(text: object, *, max_scene_chars: int = 40) -> ActivityDecision | None:

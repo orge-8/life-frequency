@@ -41,19 +41,39 @@ def harden_stdio() -> None:
             pass
 
 
+def _child_env() -> dict:
+    """子进程环境：强制 UTF-8 标准流。
+
+    v1.8.2 修：Windows 管道下子进程默认用本地编码（GBK）输出，本脚本按 UTF-8
+    解码后中文全部变成 U+FFFD——门禁摘要里的关键告警文本不可读。
+    """
+
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
 def run_step(name: str, cmd: list[str], cwd: str, allow_skip: bool = False) -> tuple[str, str]:
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=600)
+                              errors="replace", timeout=600, env=_child_env())
     except FileNotFoundError:
         return "SKIP", f"命令不可用: {cmd[0]}"
     except subprocess.TimeoutExpired:
         return "FAIL", "执行超时（600s）"
     out = (proc.stdout or "") + (proc.stderr or "")
+    # 摘要优先取 **stdout** 的末行（各步骤的「结果行」都在 stdout）；
+    # 直接取 stdout+stderr 的末行会选中运行中途打印到 stderr 的 warning，
+    # 把真正的结果行顶掉（v1.8.2 修）。FAIL 时才看合并输出（traceback 在 stderr）。
+    stdout_tail = [line for line in (proc.stdout or "").strip().splitlines() if line.strip()]
+    combined_tail = [line for line in out.strip().splitlines() if line.strip()]
+    summary = (stdout_tail or combined_tail)
+    summary = summary[-1] if summary else ""
     if proc.returncode == 0:
         if "SKIP" in (proc.stdout or ""):
-            return "SKIP", out.strip().splitlines()[-1] if out.strip() else ""
-        return "PASS", out.strip().splitlines()[-1] if out.strip() else ""
+            return "SKIP", summary
+        return "PASS", summary
     # 可选步骤（冒烟 / pytest）在"工具/依赖缺失"时记 SKIP 而非 FAIL
     if allow_skip:
         # pytest 未收集到用例（退出码 5）不是缺陷——全新脚手架还没有 L3 单测

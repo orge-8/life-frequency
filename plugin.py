@@ -79,6 +79,7 @@ try:
         ScheduleFacts,
         build_prompt,
         in_window,
+        is_known_activity,
         parse_response,
         parse_schedule_window,
         parse_window,
@@ -203,6 +204,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         ScheduleFacts,
         build_prompt,
         in_window,
+        is_known_activity,
         parse_response,
         parse_schedule_window,
         parse_window,
@@ -2001,6 +2003,20 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         )
         if warnings:
             self.ctx.logger.warning("事件库配置告警：%s", "；".join(warnings[:5]))
+
+        # v1.8.2 修：``activities=`` 不校验白名单的静默死配置。写错活动名（如 workk）
+        # 时 ``matches()`` 永远为 False、这条事件永不触发且零告警——在装配层
+        # 对照告警一次（life_events 不反向 import life_activity，避免循环依赖）。
+        for event in self._events:
+            unknown = [a for a in event.activities if not is_known_activity(a)]
+            if unknown:
+                self.ctx.logger.warning(
+                    "事件「%s」的 activities=%s 不是已知活动（这条事件将永远不会触发）；"
+                    "已知活动：%s",
+                    event.label,
+                    "、".join(unknown),
+                    "/".join(ALLOWED_ACTIVITIES),
+                )
 
         festivals, festival_warnings = parse_festival_lines(self.config.date.festivals)
         self._festival_warnings = festival_warnings
@@ -4344,6 +4360,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             events=self._events,
             rng=self._rng,
             on_offline_gap=self._on_offline_gap,
+            on_clock_rollback=self._on_clock_rollback,
         )
 
         # 先让硬约束收口一次，保证喂给模型的状态本身是合法的
@@ -4410,6 +4427,21 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             "；已跨生活日边界，当日计数器按新的一天重置（不判熬夜）"
             if crossed_boundary
             else "；仍在同一生活日内，计数器保持原值",
+        )
+
+    def _on_clock_rollback(self, gap_minutes: int) -> None:
+        """时钟回拨的日志回调（v1.8.2）：锚点已在 settle 内重置，这里只留痕。
+
+        NTP 校正 / 虚拟机快照恢复会让墙钟倒退；以前回拨多久生活状态就静默冻结
+        多久（elapsed 恒为 0、锚点追不回来），日志一个字都没有。
+        """
+
+        self.ctx.logger.warning(
+            "%s 检测到时钟回拨约 %d 分钟（NTP 校正 / 虚拟机快照恢复？）："
+            "这段倒流的时间无从结算，推进锚点已重置到现在；"
+            "期间不计清醒/睡眠、不扣体力、不抽事件",
+            __plugin_id__,
+            gap_minutes,
         )
 
     def _reseed_activity_if_stale(self, now: float, sim_config: SimConfig) -> None:
@@ -5159,11 +5191,14 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         original = str(kwargs.get("extra_prompt") or "")
         limit = int(self.config.prompt.max_chars)
         if limit > 0:
-            room = max(0, limit - len(original))
+            # v1.8.2 修：已有提示词非空时补一个换行分隔（以前直接拼接，摘要头
+            # 「【她现在的生活…」会粘在别人提示词的最后一行上）；预算同扣这 1 个字符。
+            room = max(0, limit - len(original) - (1 if original else 0))
             if room <= 0:
                 return {"action": "continue"}
             digest = digest[:room]
-        return {"action": "continue", "modified_kwargs": {"extra_prompt": original + digest}}
+        merged = f"{original}\n{digest}" if original else digest
+        return {"action": "continue", "modified_kwargs": {"extra_prompt": merged}}
 
     @HookHandler(
         "maisaka.planner.before_request",

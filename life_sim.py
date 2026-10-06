@@ -574,6 +574,53 @@ def _sanitize_float_map(raw: object) -> dict[str, float]:
     return cleaned
 
 
+def _sanitize_int_map(raw: object) -> dict[str, int]:
+    """把 ``{键: 计数}`` 洗成真正的 int 映射；坏项丢弃（``skip_ledger``）。
+
+    v1.8.2 修：``from_dict`` 以前对这张表走通用 ``dict(value)``，坏值（``"abc"`` /
+    ``null``）会一路活到消费点 ``bump_skip_ledger`` 的 ``int(...)`` 才炸——异常发生在
+    ``_sim_tick`` 内部，被兜住但**整 tick 中止**，每个 tick 都重复一次。
+    """
+
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, int] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        if not name or isinstance(value, bool) or not isinstance(value, int):
+            continue
+        cleaned[name] = value
+    return cleaned
+
+
+def _sanitize_session_map(raw: object) -> dict[str, dict[str, Any]]:
+    """把 ``{会话: 会话记录}`` 洗成 ``dict`` 记录并校准时间/计数字段。
+
+    值不是 dict 的条目直接丢（消费点虽有 isinstance 守卫，坏条目不该进状态）；
+    记录里的时间戳/计数走数值净化：一个 ``NaN`` 的 ``last_user_message_at`` 会让
+    「对方刚说过话」这道闸的比较恒为假 ⇒ 静默失效。
+    """
+
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        session_id = str(key or "").strip()
+        if not session_id or not isinstance(value, dict):
+            continue
+        record = dict(value)
+        for stamp in ("last_user_message_at", "last_proactive_at"):
+            if stamp in record:
+                number = _as_float(record.get(stamp))
+                record[stamp] = number if number is not None else 0.0
+        for count in ("count", "unanswered_streak"):
+            if count in record:
+                number = _as_float(record.get(count))
+                record[count] = int(number) if number is not None else 0
+        cleaned[session_id] = record
+    return cleaned
+
+
 @dataclass
 class LifeState:
     """全部持久化状态。字段都有默认值，缺字段/损坏文件也能起来。"""
@@ -691,16 +738,36 @@ class LifeState:
                     # 「paused_override: "false"」变成「已暂停」这种静默反转。
                     setattr(state, key, value if isinstance(value, bool) else current)
                 elif isinstance(current, float):
-                    setattr(state, key, float(value))
+                    # v1.8.2 修：只认真的数字，且**必须有限**。以前 ``float(value)``
+                    # 会把 JSON 的 ``NaN``/``Infinity`` 字面量原样收进来——而
+                    # ``last_tick_at=NaN`` 让 settle 的比较恒为假 ⇒ 生活状态每 tick
+                    # 空转、记账零推进且**无任何日志**；``cold_until=inf`` 是永久感冒；
+                    # ``llm_last_success_at=NaN`` 让「模型失败重取种子」安全阀失效。
+                    # 字符串数字同样不猜（与 _sanitize_float_map 同一条原则）。
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    number = float(value)
+                    if not math.isfinite(number):
+                        continue
+                    setattr(state, key, number)
                 elif isinstance(current, int):
-                    setattr(state, key, int(value))
+                    # v1.8.2 修：先过 float 再取整。以前 ``int(value)`` 对
+                    # ``Infinity`` 抛 OverflowError——不在下面的 except 名单里，
+                    # 会穿透出去让**插件加载失败**（违背本方法的容错契约）。
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    number = float(value)
+                    if not math.isfinite(number):
+                        continue
+                    setattr(state, key, int(number))
                 elif isinstance(current, str):
-                    setattr(state, key, str(value))
+                    # 上限防御：坏文件里的超长字符串不该原样进状态文件（渲染层另有截断）
+                    setattr(state, key, str(value)[:2000])
                 elif isinstance(current, list):
                     setattr(state, key, list(value) if isinstance(value, list) else [])
                 elif isinstance(current, dict):
                     setattr(state, key, dict(value) if isinstance(value, dict) else {})
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
         if state.activity not in ALLOWED_ACTIVITIES:
             state.activity = DAILY
@@ -732,6 +799,11 @@ class LifeState:
         state.social_daily = _sanitize_float_map(state.social_daily)
         state.world_seen = _sanitize_float_map(state.world_seen)
         state.world_daily = _sanitize_float_map(state.world_daily)
+        # v1.8.2 修：这两张表以前走通用 dict(value) 不洗值——坏值会活到消费点才炸
+        # （skip_ledger 在 bump_skip_ledger 的 int() 处、sessions 的时间戳 NaN 会让
+        # 「对方刚说过话」的闸静默失效），与上面六张映射表对齐。
+        state.skip_ledger = _sanitize_int_map(state.skip_ledger)
+        state.sessions = _sanitize_session_map(state.sessions)
         return state
 
 
@@ -999,6 +1071,7 @@ def settle(
     events: Sequence[LifeEvent] = (),
     rng: random.Random | None = None,
     on_offline_gap: Callable[[int, bool], None] | None = None,
+    on_clock_rollback: Callable[[int], None] | None = None,
 ) -> LifeState:
     """用**当前**活动把 ``last_tick_at → now`` 这段时间结算掉。
 
@@ -1010,12 +1083,31 @@ def settle(
     「清醒 N 小时」并把硬约束的睡眠资格搞坏（真机事故见该函数说明）。
     ``on_offline_gap(gap_minutes, crossed_boundary)`` 是可选的日志回调：
     本模块不依赖 ctx，要日志就得由调用方注入。
+    ``on_clock_rollback(gap_minutes)`` 同理：时钟**回拨**超过 1 分钟时回调一次
+    （锚点已在本函数内重置，回调只负责留痕）。
     """
 
     rng = rng or random.Random(0)
     now = float(now)
-    if state.last_tick_at <= 0:
+    last = float(state.last_tick_at)
+    if not math.isfinite(last) or last <= 0:
+        # v1.8.2 修：NaN/负数锚点在这里自愈。``last_tick_at <= 0`` 对 NaN 恒为假，
+        # 以前 NaN 会穿过这道闸让 elapsed 恒为 0 ⇒ 状态每 tick 空转且无日志
+        # （settle 是纯模块，来自状态文件的 NaN 已由 from_dict 拦截，这里是第二道闸）
         state.last_tick_at = now
+        last = now
+
+    # v1.8.2 修：时钟回拨（NTP 校正 / 虚拟机快照恢复）。回拨后 ``now < last_tick_at``，
+    # elapsed 恒为 0 而锚点永远追不回来 ⇒ 生活状态静默冻结（睡眠/体力/事件/日结算
+    # 全部停摆）且日志干净。这段「倒流」的时间本就无从结算，把锚点拉回现在即可；
+    # 回拨超过 1 分钟时回调一次留痕（阈值之下多为毫秒级 NTP 抖动，不必刷日志）。
+    rollback_seconds = last - now
+    if rollback_seconds > 0.0:
+        state.last_tick_at = now
+        if rollback_seconds >= 60.0 and on_clock_rollback is not None:
+            on_clock_rollback(int(rollback_seconds // 60.0))
+        return _sweep(state, now, config)
+
     elapsed = max(0.0, now - float(state.last_tick_at))
 
     # 宽限取「配置值」与「3 个 tick」的较大者：单次 tick 比 tick_seconds 慢一些
@@ -1439,7 +1531,10 @@ def should_reseed(state: LifeState, *, now: float, hours: float) -> bool:
     # 锚点：最后一次成功；从未成功过时退到「当前活动是什么时候开始的」。
     # 不能用 ``last_tick_at``：它在每 tick 末尾都会被刷新成 ``now``，差分恒为 0，
     # 于是那种状态下兜底永远不会触发（旧写法就是这样）。
-    anchor = float(state.llm_last_success_at) or float(state.activity_since)
+    # v1.8.2 硬化：过 ``_as_float``（只认有限数）。``float("nan")`` 是**真值**，
+    # 旧写法 ``nan or activity_since`` 会选中 NaN、随后所有比较恒为假 ⇒ 安全阀
+    # 静默失效（审计 M1c 的机理；from_dict 已在入口拦 NaN，这里是第二道闸）。
+    anchor = _as_float(state.llm_last_success_at) or _as_float(state.activity_since) or 0.0
     if anchor <= 0:
         return False
     return (float(now) - anchor) >= limit * 3600.0

@@ -228,6 +228,11 @@ def trigger_threshold(mode: str, effective_frequency: float) -> int:
     frequency = clamp_frequency(effective_frequency)
     if frequency <= 0.0:
         return 0
+    # v1.8.2 修：钳一个下限。病态小值（如 1e-160，来自配坏的 min_adjust/silence_floor）
+    # 会让 1/f² 下溢为 0（ZeroDivisionError）或 1/f 溢出为 inf（ceil(inf) 抛
+    # OverflowError）——normalize_mode 的纪律是「绝不抛错」，这里对齐。
+    # 1e-6 以下在宿主眼里与 0 无异，门槛给个有限的大数即可（仅用于预览展示）。
+    frequency = max(frequency, 1e-6)
     if normalize_mode(mode) == MODE_REPLY_NECESSITY:
         return max(1, int(ceil(1.0 / (frequency * frequency))))
     return max(1, int(ceil(1.0 / frequency)))
