@@ -119,6 +119,7 @@ try:
         bump_skip_ledger,
         decide as decide_proactive,
         ledger_lines,
+        new_session_record,
         record_proactive,
         record_user_message,
     )
@@ -239,6 +240,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         bump_skip_ledger,
         decide as decide_proactive,
         ledger_lines,
+        new_session_record,
         record_proactive,
         record_user_message,
     )
@@ -1234,6 +1236,14 @@ class ProactiveConfigModel(PluginConfigBase):
         json_schema_extra={"label": "主动开口目标（每行一组）", "order": 10, "rows": 3,
                            "placeholder": "group:123456"},
     )
+    inject_context_fact: bool = Field(
+        default=True,
+        description=(
+            "开口前先往该会话写一条「她为什么突然开口」的上下文事实（活动 / 情绪体力 / "
+            "想聊什么）。模型因此知道来由，而不是突兀地自说自话。关掉则只靠意图文本"
+        ),
+        json_schema_extra={"label": "写入开口来由", "order": 11},
+    )
 
     _norm_proactive_quiet = _str_list_validator("quiet_hours")
     _norm_proactive_targets = _str_list_validator("target_chats")
@@ -1673,6 +1683,30 @@ PROACTIVE_NO_QUOTE_WINDOW_SECONDS = 180.0
 #: 窗口表上限：超过就顺手清一次过期项，避免字典随会话数无限增长
 _PROACTIVE_NO_QUOTE_MAX_WINDOWS = 8
 
+#: 每轮巡检最多用历史消息补几次「对方上次说话时间」（补过就不再补，见 ``_history_probed``）
+_HISTORY_PROBE_PER_TICK = 3
+#: 历史查询连续失败到这个次数就彻底停手（宿主可能没有这个能力 / 一直报错）
+_HISTORY_PROBE_MAX_FAILURES = 3
+
+
+def _history_messages(result: Any) -> list[dict[str, Any]]:
+    """从 ``message.get_by_time_in_chat`` 的返回里取消息列表。
+
+    兼容 SDK 归一化前后的几种形态（``list`` / ``{"messages": [...]}`` /
+    ``{"result": [...]}``）——参考 ``XXXxx7258/idle_proactive_chat`` 的同一处理。
+    """
+
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return []
+        for key in ("messages", "result", "data"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
 
 def _build_system_item(text: str) -> dict[str, Any]:
     """构造一条可注入 Planner 请求的 System 消息项（对齐 Host 的 items 协议）。"""
@@ -1773,6 +1807,10 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         #: 主动开口后的「不引用」窗口：session_id → 截止时间戳。
         #: 窗口内该会话的 Planner 请求会被注入「不要引用」规则（见 PROACTIVE_NO_QUOTE_*）
         self._proactive_no_quote_until: dict[str, float] = {}
+        #: 已用历史消息补过「对方上次说话时间」的会话（每个会话只补一次，不每轮打 RPC）
+        self._history_probed: set[str] = set()
+        #: 历史查询连续失败次数：到 ``_HISTORY_PROBE_MAX_FAILURES`` 就停手
+        self._history_probe_failures: int = 0
         #: 经济维度：最近一次取到的预算快照（内存态；重启后由下一轮取数刷新）
         self._economy: EconomySnapshot | None = None
         #: 下一次允许取预算数据的时间戳（间隔控制 + 失败退避）
@@ -3981,6 +4019,106 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
     # ------------------------------------------------------------ 主动开口
 
+    async def _ensure_last_user_baseline(
+        self,
+        session_id: str,
+        record: Any,
+        *,
+        day_key: str,
+        now: float,
+        probes_left: int,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """保证会话记录里有「对方上次说话时间」；没有就用历史消息补一次基线。
+
+        为什么需要：``last_user_message_at`` 只由入站钩子写。**首装当天 / ``/生活 重置``
+        之后**所有会话都是 0 ⇒ ``decide`` 里「对方刚说过话」这道闸形同不存在，她可能在
+        一个刚刚还在热聊的会话里突然开口。参考 ``XXXxx7258/idle_proactive_chat``：
+        它用 ``message.get_by_time_in_chat(filter_mai=True, filter_command=True)``
+        把最后一条**人类**消息的时间捞回来当基线。
+
+        每个会话只补一次（``_history_probed``）、每轮最多 ``_HISTORY_PROBE_PER_TICK`` 次，
+        连续失败 ``_HISTORY_PROBE_MAX_FAILURES`` 次就彻底停手（宿主可能没这个能力）。
+        返回 ``(记录, 本轮是否真的发起了查询)``；查不到/失败一律返回原记录，绝不挡住判定。
+        """
+
+        current = record if isinstance(record, dict) else None
+        last_user = _as_number((current or {}).get("last_user_message_at"), 0.0) or 0.0
+        if last_user > 0:
+            return current, False
+        if (
+            session_id in self._history_probed
+            or probes_left <= 0
+            or self._history_probe_failures >= _HISTORY_PROBE_MAX_FAILURES
+        ):
+            return current, False
+
+        self._history_probed.add(session_id)
+        restored = await self._restore_last_user_from_history(session_id, now)
+        if restored <= 0:
+            return current, True
+        if current is None:
+            current = new_session_record(stream_id=session_id, day_key=day_key)
+            self._state.sessions[session_id] = current
+        current["last_user_message_at"] = float(restored)
+        self._state_dirty = True
+        self.ctx.logger.debug(
+            "%s 用历史消息补上「对方上次说话」基线：session=%s 距今 %.0f 分钟",
+            __plugin_id__,
+            session_id,
+            max(0.0, (now - float(restored)) / 60.0),
+        )
+        return current, True
+
+    async def _restore_last_user_from_history(self, session_id: str, now: float) -> float:
+        """取该会话最后一条**人类**消息的时间戳；查不到/失败返回 ``0.0``。
+
+        ``filter_mai=True`` 排除机器人自己的消息、``filter_command=True`` 排除命令——
+        只有「对方真的在聊天」才算活跃基线。连续失败会累计到 ``_history_probe_failures``
+        并只告警一次（宿主 1.2.x 之前的版本没有这个能力时不该逐轮重试）。
+        """
+
+        try:
+            result = await self.ctx.message.get_by_time_in_chat(
+                session_id,
+                start_time="0",
+                end_time=str(now),
+                limit=1,
+                limit_mode="latest",
+                filter_mai=True,
+                filter_command=True,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 补基线失败只是少一层保护
+            self._note_history_probe_failure(exc)
+            return 0.0
+
+        if isinstance(result, dict) and result.get("success") is False:
+            # 宿主会把失败包装成返回值而不是抛出，必须单独判一次
+            self._note_history_probe_failure(result.get("error"))
+            return 0.0
+
+        stamps = [
+            value
+            for value in (
+                _as_number(item.get("timestamp", item.get("time")), 0.0) or 0.0
+                for item in _history_messages(result)
+            )
+            if value > 0
+        ]
+        return max(stamps) if stamps else 0.0
+
+    def _note_history_probe_failure(self, error: Any) -> None:
+        """记一次历史查询失败；到上限只告警一次并停手。"""
+
+        self._history_probe_failures += 1
+        if self._history_probe_failures >= _HISTORY_PROBE_MAX_FAILURES:
+            self._warn_once(
+                "history_probe",
+                "读取会话历史失败 %d 次，已停止用它补「对方上次说话」基线"
+                "（这道闸暂时只靠实时入站钩子；首装当天可能少一层保护）：%s",
+                self._history_probe_failures,
+                error,
+            )
+
     async def _maybe_proactive(self, now: float) -> None:
         """跑一次主动开口判定：每轮全局最多挑 1 个会话，并记录沉默原因。"""
 
@@ -3999,12 +4137,19 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         best: tuple[float, str, Any] | None = None
         reasons: dict[str, int] = {}
+        probes_left = _HISTORY_PROBE_PER_TICK
         for session_id, info in sessions:
             if not self._target_matches(session_id, info):
                 continue
             # v1.5.2：主动开口自己的范围闸（[apply] 是总闸，这里只能在总闸内再收窄）
             if not self._proactive_matches(session_id, info):
                 continue
+            record = state.sessions.get(session_id)
+            record, probed = await self._ensure_last_user_baseline(
+                session_id, record, day_key=day_key, now=now, probes_left=probes_left
+            )
+            if probed:
+                probes_left = max(0, probes_left - 1)
             decision = decide_proactive(
                 config=rules,
                 now=now,
@@ -4013,7 +4158,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 energy=state.energy,
                 emotion=state.emotion,
                 materials=state.materials,
-                session=state.sessions.get(session_id),
+                session=record,
                 day_key=day_key,
                 # 未回应退避（G1）仅私聊启用；判不出会话类型时按群聊处理（不退避）
                 private_chat=self._session_is_group(session_id) is False,
@@ -4046,27 +4191,46 @@ class LifeFrequencyPlugin(MaiBotPlugin):
     async def _trigger_proactive(
         self, session_id: str, decision: Any, day_key: str, now: float
     ) -> bool:
-        """把带着素材的意图交给宿主主动任务；Planner 仍有权沉默。"""
+        """把带着素材的意图交给宿主主动任务；Planner 仍有权沉默。
 
-        reason = json.dumps(
-            {
+        三条借自 ``XXXxx7258/idle_proactive_chat``（MIT，1.0.5 在跑）的做法：
+
+        1. ``reason`` 写**人话**——宿主日志/WebUI 会显示它，塞 JSON 没人看得懂；
+           结构化信息改放 ``metadata``；
+        2. ``priority="low"``——主动找话说**不该抢占**更高优先级的主动任务
+           （例如 group-welcome 的新人欢迎语）；
+        3. 触发前先把「她为什么突然开口」写成一条上下文事实，模型才知道来由
+           （``inject_context_fact``，失败只降级、绝不影响触发）。
+        """
+
+        material = decision.material if isinstance(decision.material, dict) else {}
+        label = sanitize_text(material.get("label", ""), max_chars=32)
+        motive = sanitize_text(material.get("text", ""), max_chars=80)
+        reason = f"生活状态主动开口：{label or '一件小事'}（分数 {float(decision.score):.2f}）"
+        metadata = {
+            "life_frequency_day": day_key,
+            "life_frequency_at": now,
+            "life_frequency": {
                 "source": __plugin_id__,
                 "score": round(float(decision.score), 3),
-                "topic": sanitize_text((decision.material or {}).get("label", ""), max_chars=32),
-                "motive": sanitize_text((decision.material or {}).get("text", ""), max_chars=80),
+                "topic": label,
+                "motive": motive,
                 "activity": self._state.activity,
                 "emotion": round(float(self._state.emotion), 2),
                 "energy": round(float(self._state.energy), 2),
                 "detail": decision.detail,
             },
-            ensure_ascii=False,
-        )
+        }
+
+        if self.config.proactive.inject_context_fact:
+            await self._append_proactive_fact(session_id, label, motive)
         try:
             result = await self.ctx.maisaka.proactive.trigger(
                 stream_id=session_id,
                 intent=decision.intent,
                 reason=reason,
-                metadata={"life_frequency_day": day_key, "life_frequency_at": now},
+                priority="low",
+                metadata=metadata,
             )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("触发主动任务失败 session=%s：%s", session_id, exc)
@@ -4078,6 +4242,38 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         # 打开「不引用」窗口：接下来这一轮 Planner 请求会被注入发言规则
         self._open_no_quote_window(session_id, now)
         return True
+
+    async def _append_proactive_fact(self, session_id: str, label: str, motive: str) -> None:
+        """把「她为什么突然开口」写成一条上下文事实（失败只降级，不影响触发）。
+
+        措辞是**世界内**的：不出现插件、定时任务、静默检测这类系统实现细节——
+        这条事实会进模型的上下文，写错等于教她自曝后台。
+        """
+
+        text = (
+            "（生活状态）她主动开口了，不是在回复谁。"
+            f"她现在的活动：{self._state.activity}；"
+            f"情绪 {float(self._state.emotion):.1f}/10、体力 {float(self._state.energy):.1f}/10。"
+            f"她想聊聊刚发生的{label or '一件小事'}"
+            + (f"：{motive}" if motive else "。")
+        )
+        try:
+            result = await self.ctx.maisaka.context.append(
+                session_id,
+                [{"type": "text", "content": text}],
+                visible_text=text,
+                source_kind=f"plugin:{__plugin_id__}",
+                message_id=f"life-frequency-proactive:{session_id}:{int(time.time())}",
+            )
+        except Exception as exc:  # noqa: BLE001 —— 来由写不进去只是少一层上下文，不该拦住开口
+            self._warn_once("proactive_fact", "写入主动开口来由失败（不影响开口）：%s", exc)
+            return
+        # 宿主会把组件异常**包装成返回值**而不是抛出（skill §5.5）：必须校验返回值，
+        # 否则会出现「日志说写了、实际没写」。
+        if isinstance(result, dict) and result.get("success") is False:
+            self._warn_once(
+                "proactive_fact", "写入主动开口来由被宿主拒绝（不影响开口）：%s", result.get("error")
+            )
 
     def _open_no_quote_window(self, session_id: str, now: float) -> None:
         """记下该会话的「主动开口当轮」截止时间（供 ``inject_no_quote_hint`` 判断）。"""

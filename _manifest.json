@@ -28,6 +28,8 @@
     "frequency.get_adjust",
     "frequency.get_current_talk_value",
     "maisaka.proactive.trigger",
+    "maisaka.context.append",
+    "message.get_by_time_in_chat",
     "llm.generate",
     "config.get",
     "api.call"

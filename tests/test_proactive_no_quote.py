@@ -269,6 +269,109 @@ def test_trigger_failure_does_not_open_the_window():
     assert "group-1" not in plugin._proactive_no_quote_until, "宿主没受理就不该开窗"
 
 
+# ------------------------------------------------- 4. 触发质量（借鉴 idle_proactive_chat）
+#
+# 参考仓库 XXXxx7258/idle_proactive_chat（MIT，1.0.5）：它给主动任务传
+# priority="low"、reason 写人话，并在触发前把「静默事实」写进会话上下文。
+# 这三条 life-frequency 原来都没有。
+
+
+def _trigger_calls(host):
+    """去重后的主动任务调用参数（FakeHost 对落穿能力会双记）。"""
+
+    calls = host.calls_of("maisaka.proactive.trigger")
+    unique = {}
+    for kwargs in calls:
+        unique[kwargs.get("stream_id")] = kwargs
+    return list(unique.values())
+
+
+def _fact_calls(host):
+    calls = host.calls_of("maisaka.context.append")
+    unique = {}
+    for kwargs in calls:
+        unique[kwargs.get("message_id")] = kwargs
+    return list(unique.values())
+
+
+def test_trigger_reason_is_human_readable_and_structured_data_moves_to_metadata():
+    """``reason`` 会被宿主日志/WebUI 显示 ⇒ 必须是句子，不是 JSON。"""
+
+    _module, plugin, host = _make_plugin()
+    asyncio.run(
+        plugin._trigger_proactive(
+            "group-1", _decision({"label": "刚泡了杯茶", "text": "茶有点苦"}), "2026-10-05", time.time()
+        )
+    )
+    call = _trigger_calls(host)[0]
+    reason = str(call.get("reason") or "")
+    assert reason and not reason.strip().startswith("{"), reason
+    assert "生活状态主动开口" in reason and "刚泡了杯茶" in reason
+    payload = (call.get("metadata") or {}).get("life_frequency") or {}
+    assert payload.get("topic") == "刚泡了杯茶"
+    assert payload.get("activity") and payload.get("emotion") is not None
+
+
+def test_trigger_asks_for_low_priority():
+    """主动找话说不能抢占更高优先级的主动任务（如新人欢迎语）。"""
+
+    _module, plugin, host = _make_plugin()
+    asyncio.run(
+        plugin._trigger_proactive("group-1", _decision({"label": "小事", "text": "刚泡了杯茶"}), "2026-10-05", time.time())
+    )
+    assert _trigger_calls(host)[0].get("priority") == "low"
+
+
+def test_trigger_writes_the_reason_into_the_chat_context():
+    """模型要知道「她为什么突然开口」，而且措辞必须在世界内、不暴露插件实现。"""
+
+    _module, plugin, host = _make_plugin()
+    asyncio.run(
+        plugin._trigger_proactive(
+            "group-1", _decision({"label": "刚泡了杯茶", "text": "茶有点苦"}), "2026-10-05", time.time()
+        )
+    )
+    facts = _fact_calls(host)
+    assert facts, "触发前应该写一条来由事实"
+    kwargs = facts[0]
+    assert kwargs.get("stream_id") == "group-1"
+    assert str(kwargs.get("source_kind") or "").startswith("plugin:org.orge-8.life-frequency")
+    assert kwargs.get("message_id"), "message_id 必须给，否则宿主去重会吃掉后续事实"
+    text = str(kwargs.get("visible_text") or "")
+    assert "主动开口" in text and "茶有点苦" in text
+    for banned in ("插件", "静默检测", "定时任务", "监控"):
+        assert banned not in text, f"来由事实里不该出现系统实现细节：{banned}"
+    assert kwargs.get("segments"), "segments 必填"
+
+
+def test_context_fact_can_be_disabled():
+    _module, plugin, host = _make_plugin(proactive={"inject_context_fact": False})
+    accepted = asyncio.run(
+        plugin._trigger_proactive("group-1", _decision({"label": "小事", "text": "刚泡了杯茶"}), "2026-10-05", time.time())
+    )
+    assert accepted
+    assert not _fact_calls(host), "关掉之后一个字节都不该写"
+
+
+def test_context_fact_rejection_does_not_block_the_opening():
+    """宿主拒绝/异常只降级：开口照旧，但要留一条 warning。"""
+
+    _module, plugin, host = _make_plugin()
+    host.returns["maisaka.context.append"] = {"success": False, "error": "宿主拒绝写入"}
+    capture = _Capture()
+    try:
+        accepted = asyncio.run(
+            plugin._trigger_proactive(
+                "group-1", _decision({"label": "小事", "text": "刚泡了杯茶"}), "2026-10-05", time.time()
+            )
+        )
+    finally:
+        capture.stop()
+    assert accepted, "来由写不进去不该拦住开口"
+    assert "group-1" in plugin._proactive_no_quote_until
+    assert any("来由" in line for line in capture.records), capture.records
+
+
 def test_window_table_is_pruned_when_it_grows():
     _module, plugin, _host = _make_plugin()
     now = time.time()
