@@ -2,6 +2,7 @@
 """L3：状态机——睡眠记账、熬夜判定、情绪体力动力学、身体、日期、持久化。"""
 
 import random
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -128,6 +129,12 @@ def test_short_sleep_counts_as_staying_up():
 
 
 def test_enough_sleep_resets_debt():
+    """v1.15.0（PR-S1）**滞回**：一晚好觉只清 ``sleep_debt_recovery_step`` 晚债。
+
+    旧行为（一晚清零）在默认「体力满即醒 + 最短睡眠目标」下会把连熬三晚洗白得太快；
+    连熬要连睡几晚才还清。``sleep_debt_recovery_step=0`` 可回到旧行为（下面第二条）。
+    """
+
     at = ts(2026, 2, 8, 4, 0)
     state = make_state(at=at, activity=A.SLEEP, sleep_started_at=at, sleep_debt_nights=2)
     S.settle(state, now=at + 8 * 3600, config=cfg(), events=[], rng=random.Random(1))
@@ -137,8 +144,34 @@ def test_enough_sleep_resets_debt():
         now=at + 8 * 3600,
         config=cfg(),
     )
-    assert state.sleep_debt_nights == 0
+    assert state.sleep_debt_nights == 1, "一期好觉只还 1 晚债（2 → 1）"
     assert state.energy_cap == pytest.approx(10.0)
+
+    # 再来一晚好觉 → 还清
+    second = at + 30 * 3600
+    state.activity = A.SLEEP
+    state.sleep_started_at = second
+    state.last_tick_at = second
+    state.sleep_minutes_today = 0
+    S.settle(state, now=second + 8 * 3600, config=cfg(), events=[], rng=random.Random(1))
+    S.apply_activity(
+        state,
+        A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
+        now=second + 8 * 3600,
+        config=cfg(),
+    )
+    assert state.sleep_debt_nights == 0
+
+    # 旧行为：step=0 = 一晚直接清零
+    legacy = make_state(at=at, activity=A.SLEEP, sleep_started_at=at, sleep_debt_nights=2)
+    S.settle(legacy, now=at + 8 * 3600, config=cfg(sleep_debt_recovery_step=0), events=[], rng=random.Random(1))
+    S.apply_activity(
+        legacy,
+        A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
+        now=at + 8 * 3600,
+        config=cfg(sleep_debt_recovery_step=0),
+    )
+    assert legacy.sleep_debt_nights == 0
 
 
 def test_sleep_debt_ignores_life_day_boundary():
@@ -591,11 +624,211 @@ def test_health_label_reflects_state():
     healthy = make_state(at=at, activity=A.DAILY)
     assert S.health_label(healthy, at, cfg()) == "健康"
 
-    cold = make_state(at=at, activity=A.DAILY, cold_until=at + 3600, cold_days=2)
-    assert "感冒中" in S.health_label(cold, at, cfg())
+    # v1.14.0：精确口径（状态卡）给出阶段 + 第几天 + 剩余小时
+    cold = make_state(
+        at=at, activity=A.DAILY, cold_until=at + 3600, cold_days=2,
+        cold_started_at=at - 86400, cold_stage=A.COLD_WORSENING,
+    )
+    admin = S.health_label_admin(cold, at, cfg())
+    assert "感冒加重" in admin and "第 2 天" in admin and "约剩 1.0 小时" in admin
+    # **模型口径不给精确剩余时间**（她会知道的只是「病第二天、烧得迷迷糊糊」）
+    prompt = S.health_label_prompt(cold, at, cfg())
+    assert "第 2 天" in prompt and "小时" not in prompt and "约剩" not in prompt
 
     deprived = make_state(at=at, activity=A.DAILY, sleep_debt_nights=3)
     assert "熬夜" in S.health_label(deprived, at, cfg())
+
+
+# ---------------------------------------------------------------- 病程（v1.14.0）
+
+
+def _cold_state(at, *, stage=A.COLD_ONSET, days=3, **overrides):
+    base = dict(
+        activity=A.SICK_REST,
+        cold_until=at + days * 86400.0,
+        cold_days=days,
+        cold_started_at=at,
+        cold_stage=stage,
+        sleep_debt_nights=0,
+        energy=8.0,
+    )
+    base.update(overrides)
+    return make_state(at=at, **base)
+
+
+def test_cold_path_starts_at_onset_with_material():
+    """中招不再无声无息：进 ``onset`` 且落一条起病素材与经历。"""
+
+    at = ts(2026, 2, 8, 2, 5)
+    state = make_state(at=at, activity=A.DAILY)
+    S.start_cold(state, now=at, config=cfg(), days=2)
+    assert state.cold_stage == A.COLD_ONSET
+    assert state.cold_until == at + 2 * 86400.0
+    assert S.cold_stage(state, at) == A.COLD_ONSET
+    assert any("感冒" in item["label"] for item in state.recent_events)
+    assert state.materials and "感冒" in state.materials[-1]["text"]
+    # 幂等：同一场病（同一起始时刻）再调一次不会重复产出
+    before = len(state.materials)
+    S.start_cold(state, now=at, config=cfg(), days=2)
+    assert len(state.materials) == before
+    # 换一场病（新的起始时刻 ⇒ 新的场次键）才会再发
+    S.start_cold(state, now=at + 10 * 86400.0, config=cfg(), days=2)
+    assert len(state.materials) == before + 1
+
+
+def test_cold_stage_rest_score_flows_forward_and_backward():
+    at = ts(2026, 2, 8, 2, 5)
+    config = cfg()
+
+    # 睡够 + 在养病 ⇒ 休息分 2 ⇒ 向好（初起直接跳好转）
+    good = _cold_state(at)
+    S.settle_cold_stage(good, now=at + 86400, config=config, rng=random.Random(1))
+    assert good.cold_stage == A.COLD_RECOVERING
+    assert good.cold_until < at + 3 * 86400.0, "向好应当小幅提前预期痊愈时刻"
+    assert any("退烧" in item["label"] for item in good.recent_events)
+
+    # 熬夜 + 体力过低 ⇒ 向坏
+    bad = _cold_state(at, sleep_debt_nights=2, energy=1.0)
+    S.settle_cold_stage(bad, now=at + 86400, config=config, rng=random.Random(1))
+    assert bad.cold_stage == A.COLD_WORSENING
+    assert bad.cold_until > at + 3 * 86400.0, "向坏应当小幅推后预期痊愈时刻"
+
+    # 每天只结算一次：同一生活日内再调不会二次推后 cold_until
+    fixed = bad.cold_until
+    S.settle_cold_stage(bad, now=at + 87000, config=config, rng=random.Random(2))
+    assert bad.cold_until == fixed, "同一天不该结算两次病程"
+
+
+def test_cold_stage_extension_is_capped():
+    """向坏只许小步推后，总量封顶 ``cold_max_days + 2`` 天——别造出永久感冒。"""
+
+    at = ts(2026, 2, 8, 2, 5)
+    config = cfg(cold_max_days=2)
+    state = _cold_state(at, days=2, sleep_debt_nights=5, energy=0.5)
+    for day in range(1, 8):
+        S.settle_cold_stage(
+            state, now=at + day * 86400, config=config, rng=random.Random(day)
+        )
+    cap = at + (2 + 2) * 86400.0
+    assert state.cold_until <= cap + 1e-6
+    assert state.cold_stage == A.COLD_WORSENING
+
+
+def test_cold_stage_inf_until_is_never_healed():
+    """``cold_until=inf``（永久感冒夹具/整活）不被流转改小、也不被自动治好。
+
+    两条路径都要钉：① 向好流转只许改阶段、不许动 ``inf``；
+    ② **好转期休息够也不许提前痊愈**（``finish_cold`` 会把 ``cold_until`` 归零——
+    这一条在真机上就是「整活的永久感冒被一次午睡治好了」）。
+    """
+
+    at = ts(2026, 2, 8, 2, 5)
+    state = _cold_state(at, days=1)
+    state.cold_until = float("inf")
+    S.settle_cold_stage(state, now=at + 86400, config=cfg(), rng=random.Random(1))
+    S._finish_cold_if_expired(state, now=at + 30 * 86400, config=cfg())
+    assert state.cold_until == float("inf")
+    assert S.is_cold(state, at + 30 * 86400) is True
+    assert state.cold_stage
+
+    # 好转期 + 休息分满（睡够 + 在养病）⇒ 仍不许痊愈
+    recovering = _cold_state(at, stage=A.COLD_RECOVERING, days=1)
+    recovering.cold_until = float("inf")
+    for day in range(1, 5):
+        S.settle_cold_stage(
+            recovering, now=at + day * 86400, config=cfg(), rng=random.Random(day)
+        )
+    assert recovering.cold_until == float("inf"), "永久感冒被提前治好了"
+    assert S.is_cold(recovering, at + 5 * 86400) is True
+
+
+def test_cold_heals_into_convalescence_and_immunity():
+    at = ts(2026, 2, 8, 2, 5)
+    config = cfg(cold_immunity_days=5, cold_convalescent_hours=24)
+    state = _cold_state(at, stage=A.COLD_RECOVERING, days=1)
+    S.finish_cold(state, now=at + 86400, config=config)
+    assert state.cold_stage == "" and state.cold_until == 0.0
+    assert state.cold_immunity_until == at + 86400 + 5 * 86400.0
+    assert S.in_convalescence(state, at + 86400 + 3600) is True
+    assert S.is_cold(state, at + 86400 + 3600) is False
+    # 余韵不算生病，但提示词与状态卡会带一句
+    assert "刚好利索" in S.health_label_prompt(state, at + 86400 + 3600, config)
+    assert "余韵" in S.health_label_admin(state, at + 86400 + 3600, config)
+    assert any("好了" in item["label"] for item in state.recent_events)
+    # 余韵过后回到健康——但免疫期还剩几天（状态卡要能看到，否则「她怎么又不病」无从解释）
+    later = at + 86400 + 25 * 3600
+    assert S.in_convalescence(state, later) is False
+    assert "免疫期" in S.health_label_admin(state, later, config)
+    assert S.health_label_prompt(state, later, config) == "健康"
+
+
+def test_offline_gap_still_heals_an_expired_cold():
+    """停机间隙不掷骰子、不结算流转，但**该痊愈的必须痊愈**。
+
+    否则插件停过一晚之后，她会一直挂着 ``cold_stage``（状态卡永远显示生病、
+    而她其实早过了 ``cold_until``）——一个「无日志、无自愈」的静默错位。
+    """
+
+    at = ts(2026, 2, 8, 2, 5)
+    state = make_state(
+        at=at, activity=A.SICK_REST, cold_until=at + 3600, cold_days=1,
+        cold_started_at=at - 86400, cold_stage=A.COLD_WORSENING,
+    )
+    later = at + 3 * 3600  # 超过 offline_gap_minutes(30) + 3 tick 的宽限 ⇒ 走停机分支
+    S.settle(state, now=later, config=cfg(), events=[], rng=random.Random(1))
+    assert S.is_cold(state, later) is False
+    assert state.cold_stage == ""
+    assert state.cold_immunity_until > later
+    assert S.in_convalescence(state, later) is True
+    assert any("好了" in item["label"] for item in state.recent_events)
+
+
+def test_immunity_blocks_the_cold_roll():
+    """免疫期内不掷骰子：修「病好第二天无缝再病」。"""
+
+    at = ts(2026, 2, 8, 2, 5)
+    state = make_state(at=at, activity=A.DAILY)
+    state.cold_immunity_until = at + 5 * 86400.0
+    config = cfg(cold_base_risk=1.0, cold_sleep_debt_risk=0.0)
+    S.settle(state, now=at + 600, config=config, events=[], rng=random.Random(4))
+    assert S.is_cold(state, at + 600) is False
+    assert state.cold_checked_day == "2026-02-07", "骰子照常记账，只是不掷"
+
+
+def test_season_factor_scales_the_risk():
+    """``cold_season_factors`` 是可选的季节倍率（默认空 = 不启用）。"""
+
+    at = ts(2026, 2, 8, 2, 5)
+    # 系数 0 ⇒ 一个月内一次都不会中招；系数 8 ⇒ 风险被钳到 0.95 上限
+    for month_factor, expected in ((0.0, False), (8.0, True)):
+        state = make_state(at=at, activity=A.DAILY)
+        config = replace(
+            cfg(cold_base_risk=0.2, cold_sleep_debt_risk=0.0),
+            cold_season_factors={"2": month_factor},
+        )
+        S.settle(state, now=at + 600, config=config, events=[], rng=random.Random(99))
+        assert S.is_cold(state, at + 600) is expected, (month_factor, expected)
+
+
+def test_sick_leave_event_recorded_on_workday_when_worsening():
+    at = ts(2026, 2, 9, 10, 0)  # 2026-02-09 是周一
+    schedule = A.ScheduleConfig(enabled=True, workdays=(1, 2, 3, 4, 5))
+    config = replace(cfg(), schedule=schedule)
+    state = _cold_state(at, sleep_debt_nights=1, energy=1.0)
+    S.settle_cold_stage(state, now=at + 86400, config=config, rng=random.Random(1))
+    assert state.cold_stage == A.COLD_WORSENING
+    assert any("病假" in item["label"] for item in state.recent_events)
+    assert "已请病假" in S.health_label_admin(state, at + 86400, config)
+
+    # 休息日不记病假；关掉开关也不记
+    rest_state = _cold_state(at, sleep_debt_nights=1, energy=1.0)
+    rest_config = replace(
+        config,
+        schedule=A.ScheduleConfig(enabled=True, workdays=(6, 7)),
+        cold_sick_leave=True,
+    )
+    S.settle_cold_stage(rest_state, now=at + 86400, config=rest_config, rng=random.Random(1))
+    assert not any("病假" in item["label"] for item in rest_state.recent_events)
 
 
 # ---------------------------------------------------------------- 日期规则
@@ -755,7 +988,8 @@ def test_enforce_and_apply_wakes_her_when_sleep_is_too_long():
     )
     state.activity_since = at - 30 * 3600  # 单次睡眠已 30 小时
     S.enforce_and_apply(state, now=at, config=cfg(), decision=None)
-    assert state.activity == A.DAILY
+    # v1.15.0（PR-R3）：长睡眠被强制唤醒先进 daze（赖床），不再直接落 daily
+    assert state.activity == A.DAZE
     assert state.activity_source == A.SOURCE_ENFORCED
 
 
@@ -1356,3 +1590,172 @@ def test_effect_lines_quote_the_activity_factor_range_not_a_hardcoded_one():
 
     # 没有因子表就不提频率（避免在不知道数值时乱说）
     assert "说话多少" not in _effects(activity_factors=None)
+
+
+# ---------------------------------------------------------------- 清醒疲劳（v1.16.0 M1）
+
+
+#: 默认曲线的**解析形态**。落盘值是一串 ``"小时=体力/小时"`` 字符串行，由插件用
+#: ``parse_curve_points`` 解析后传进 ``SimConfig``；纯模块用例直接给点集，
+#: 「默认行能解析成这条曲线」由 ``test_attribution.py`` 的接线用例守着。
+RAMP_CURVE = ((12.0, 0.0), (16.0, -0.15), (20.0, -0.4), (24.0, -0.7))
+
+
+def _run(state, *, at, hours, config):
+    """按 10 分钟一步推进（一次跳几小时会被判成停机间隙而整段不记账）。"""
+
+    for step in range(1, int(hours * 6) + 1):
+        S.settle(
+            state, now=at + 600 * step, config=config, events=(), rng=random.Random(1)
+        )
+    return state
+
+
+def test_fatigue_ramp_default_is_off_and_the_old_numbers_stand():
+    """空曲线 = 关闭 = 与加这一层之前**逐位一致**：体力严格等于「表值 × 时长」。"""
+
+    at = ts(2026, 2, 8, 8, 0)
+    state = make_state(at=at, activity=A.DAZE, energy=8.0)
+    _run(state, at=at, hours=10, config=cfg())
+
+    assert state.energy == pytest.approx(8.0 - 0.10 * 10)
+    assert state.continuous_awake_minutes == 600, "清醒时长照常累计（只是不参与消耗）"
+
+
+def test_fatigue_ramp_does_not_touch_the_first_twelve_hours():
+    """12 小时以内不额外掉体力——正常的一天不该被惩罚。"""
+
+    at = ts(2026, 2, 8, 8, 0)
+    plain = _run(make_state(at=at, activity=A.DAILY, energy=8.0), at=at, hours=12,
+                 config=cfg())
+    ramped = _run(make_state(at=at, activity=A.DAILY, energy=8.0), at=at, hours=12,
+                  config=cfg(fatigue_ramp_curve=RAMP_CURVE))
+    assert ramped.energy == pytest.approx(plain.energy)
+
+
+def test_fatigue_ramp_makes_a_quiet_day_actually_tired():
+    """P5 的正解：最闲的路径（daze -0.10/h）也必须能累到入睡阈值。
+
+    旧行为（无曲线）24 小时只掉 2.4 分（8.0 → 5.6），永远碰不到阈值 3.0；
+    新曲线下同一段路掉到 3.0 以下。
+    """
+
+    at = ts(2026, 2, 8, 8, 0)
+    new = _run(make_state(at=at, activity=A.DAZE, energy=8.0), at=at, hours=24,
+               config=cfg(fatigue_ramp_curve=RAMP_CURVE))
+    old = _run(make_state(at=at, activity=A.DAZE, energy=8.0), at=at, hours=24,
+               config=cfg())
+
+    assert old.energy == pytest.approx(5.6), "旧行为的 24 小时只掉 2.4 分"
+    assert new.energy < 3.0, f"新曲线下该累了，实际 {new.energy:.2f}"
+    assert old.energy - new.energy > 3.0, "差距必须显著，否则这条机制等于没生效"
+
+
+def test_quiet_day_now_ends_in_sleep_without_the_sleep_window():
+    """行为验收（M1）：困意由身体驱动——把睡眠窗口关掉她照样会睡着。
+
+    这样才证明她是因为**累**睡的，而不是被窗口拖上床的。
+    """
+
+    at = ts(2026, 2, 8, 8, 0)
+    config = cfg(fatigue_ramp_curve=RAMP_CURVE, sleep_window=(0, 0))
+    assert not A.in_window(at_minutes := 8 * 60, config.sleep_window)
+
+    state = make_state(at=at, activity=A.DAZE, energy=8.0)
+    slept_at = None
+    for step in range(1, 25 * 6 + 1):
+        now = at + 600 * step
+        S.settle(state, now=now, config=config, events=(), rng=random.Random(1))
+        S.enforce_and_apply(state, now=now, config=config, decision=None)
+        if S.is_asleep(state.activity):
+            slept_at = now
+            break
+
+    assert slept_at is not None, f"连续发呆一整天也睡不着（{at_minutes} 起算）"
+    assert slept_at - at <= 24 * 3600
+    # 睡着时**不算疲劳**（躺着是回血），计数也冻结着；醒来才清零
+    assert state.continuous_awake_minutes > 0
+    S.apply_activity(
+        state, A.ActivityDecision(A.DAILY, source=A.SOURCE_LLM),
+        now=slept_at + 600, config=config,
+    )
+    assert state.continuous_awake_minutes == 0, "一觉结束就该重新起算"
+
+    # 旧行为：同一条路走 30 小时也睡不着（体力只由活动表驱动）
+    old_config = cfg(sleep_window=(0, 0))
+    old = make_state(at=at, activity=A.DAZE, energy=8.0)
+    for step in range(1, 30 * 6 + 1):
+        now = at + 600 * step
+        S.settle(old, now=now, config=old_config, events=(), rng=random.Random(1))
+        S.enforce_and_apply(old, now=now, config=old_config, decision=None)
+    assert not S.is_asleep(old.activity), "关掉曲线就该保持旧行为（永远不累）"
+
+
+def test_continuous_awake_minutes_survive_the_day_boundary_but_not_a_nap():
+    """连续清醒是**跨生活日**的量：12:00 边界不清零，睡一觉才清零。"""
+
+    at = ts(2026, 2, 8, 10, 0)  # 跨 12:00 边界
+    state = make_state(at=at, activity=A.DAILY, energy=8.0)
+    _run(state, at=at, hours=4, config=cfg())
+
+    assert state.awake_minutes_today < 240, "当日计数器在 12:00 被清零了"
+    assert state.continuous_awake_minutes == 240, "连续清醒不该被边界切断"
+
+    # 一觉结束（醒来）才清零：刚睡下不算，否则「睡到一半的疲劳」会被凭空抹平
+    S.apply_activity(
+        state, A.ActivityDecision(A.NAP, source=A.SOURCE_LLM), now=at + 4 * 3600, config=cfg()
+    )
+    assert state.continuous_awake_minutes == 240, "睡下那一刻还在累（睡着期间冻结）"
+    S.apply_activity(
+        state, A.ActivityDecision(A.DAILY, source=A.SOURCE_LLM),
+        now=at + 4 * 3600 + 1800, config=cfg(),
+    )
+    assert state.continuous_awake_minutes == 0, "小睡醒来同样重新起算"
+
+
+def test_offline_gap_neither_grows_nor_resets_the_awake_counter():
+    """停机间隙不记账（也就不计疲劳），但也没发生「一觉」——不该被清零。"""
+
+    off = ts(2026, 10, 1, 21, 21)
+    on = ts(2026, 10, 2, 8, 0)
+    state = make_state(at=off, activity=A.GAME, energy=6.0, continuous_awake_minutes=300)
+
+    S.settle(
+        state,
+        now=on,
+        config=cfg(fatigue_ramp_curve=RAMP_CURVE),
+        events=(),
+        rng=random.Random(1),
+    )
+    assert state.continuous_awake_minutes == 300
+    assert state.energy == 6.0, "停机也不许按 game 扣体力（更别说疲劳）"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(0, 0), (-120, 0), (90.7, 90), ("abc", 0), (float("nan"), 0),
+     (float("inf"), 0), (10 ** 12, S.MAX_CONTINUOUS_AWAKE_MINUTES)],
+)
+def test_continuous_awake_minutes_are_sanitised_on_load(raw, expected):
+    """坏状态文件不许把它变成负数或天文数字（否则疲劳曲线直接吃端点值）。"""
+
+    state = S.LifeState.from_dict({"continuous_awake_minutes": raw})
+    assert state.continuous_awake_minutes == expected
+    assert S.LifeState.from_dict({}).continuous_awake_minutes == 0, "旧状态文件照常加载"
+
+
+def test_effect_lines_disclose_the_fatigue_rule_only_when_it_is_on():
+    """提示词不许比实现更旧：开了就说，关了不提（数值来自曲线本身）。"""
+
+    deltas = {A.SLEEP: 0.0, A.DAILY: -0.5}
+    off = "\n".join(
+        S.activity_effect_lines(cfg(), activity_factors=deltas)
+    )
+    assert "清醒疲劳" not in off
+
+    on = "\n".join(
+        S.activity_effect_lines(cfg(fatigue_ramp_curve=RAMP_CURVE), activity_factors=deltas)
+    )
+    assert "清醒疲劳" in on
+    assert "清醒 16 小时 -0.15/h" in on
+    assert "睡一觉（含小睡）就清零" in on

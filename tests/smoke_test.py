@@ -31,8 +31,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
 PKG_NAME = "life_frequency_under_test"
 FLAT_MODULES = (
-    "life_activity", "life_events", "life_factors", "life_host_model",
-    "life_proactive", "life_sim", "life_world",
+    "life_activity", "life_calendar", "life_dream", "life_events", "life_factors",
+    "life_host_model", "life_interrupt", "life_mood", "life_motives", "life_physio",
+    "life_relations", "life_proactive", "life_routines", "life_sim", "life_store",
+    "life_world",
 )
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -173,6 +175,10 @@ def main() -> int:
         config["events"]["fire_probability"] = 0.0
         config["frequency"]["quiet_hours"] = []
         config["proactive"]["enabled"] = False
+        # ⚠ physio / routines 用的是**真实墙钟**：13:07 跑冒烟会正好撞上午餐窗，
+        # 生理锚点先于模型命中、LLM 根本不被调用（v1.9.1 门禁实录）。
+        # 冒烟测的是「链路通」，不是生理窗 → 默认三餐表整体关掉，习惯行本来默认就空。
+        config["physio"]["meals"] = []
         bind_context(plugin, ctx, config)
         check(
             "嵌套配置节 [activity.llm] 注入成功",
@@ -396,7 +402,13 @@ def main() -> int:
         check("applied / foreign 记录已清空",
               not plugin._state.applied and not plugin._state.foreign,
               f"{plugin._state.applied} {plugin._state.foreign}")
-        check("插件目录没有 data/ 残留", not (PLUGIN_DIR / "data").exists())
+        # v1.10.0 起插件目录里的 data/ 是**合法的发布资产**（data/calendar.toml 日历表）；
+        # 断言收窄为「插件目录没有被写进运行时垃圾」——只检查已知会误写的文件名。
+        runtime_garbage = [
+            name for name in ("life_state.json", "life_store.db", "adjust_memory.json")
+            if (PLUGIN_DIR / name).exists()
+        ]
+        check("插件目录没有运行时状态文件残留", not runtime_garbage, str(runtime_garbage))
         check("状态写在授予的数据目录里",
               (host.paths.data_dir / "life_state.json").is_file())
         check("没有往插件目录写状态文件",

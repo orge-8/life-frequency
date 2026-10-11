@@ -11,8 +11,9 @@
 「深夜做题」抽不到「抽卡出了」，而「下午游戏」抽得到。活动 → 事件 → 素材 → 主动
 话题这条链全由作息活动开头（见 README 的「为什么作息活动权重最大」）。
 
-内建库 55 条（52 条对应参考设定里「23 条自写 + 29 条补充」的规模，
-v1.5.1 补 3 条养病事件），可用配置追加或覆盖：
+内建库 61 条（52 条对应参考设定里「23 条自写 + 29 条补充」的规模，
+v1.5.1 补 3 条养病事件；v1.14.0 病程系统把养病池改为**按阶段约束**、
+移出「退烧了」（升格为确定性事件）并补 7 条阶段/病中吃饭事件），可用配置追加或覆盖：
 
     [events]
     extra = [
@@ -27,6 +28,9 @@ v1.5.1 补 3 条养病事件），可用配置追加或覆盖：
 - ``weight``：``0`` ~ ``1``
 - ``material``：素材文本（入库前会被 ``sanitize_text`` 清洗并截断）
 - ``ttl``：素材有效小时数，``0.5`` ~ ``72``
+- ``stage``（v1.14.0，可选）：逗号分隔的病程阶段（``onset``/``worsening``/
+  ``recovering``），留空 = 与病程无关。非空时该事件只在对应阶段被抽到；
+  写了未知阶段会告警（而不是静默永不触发）
 
 坏行只告警、不抛错——配置写错绝不能导致插件加载失败或后台循环退出。
 """
@@ -46,7 +50,14 @@ DEFAULT_TTL_HOURS = 6.0
 MAX_MATERIAL_CHARS = 80
 MAX_LABEL_CHARS = 24
 
-_EVENT_KEYS = ("activities", "emotion", "energy", "weight", "material", "ttl")
+_EVENT_KEYS = ("activities", "emotion", "energy", "weight", "material", "ttl", "stage")
+
+#: 病程阶段名（v1.14.0，[health] 病程系统）。**在这里字面重复一份**是为了让
+#: ``stage=`` 里的错值能告警，而不是静默永不触发——与 ``activities=`` 的错值告警
+#: 同一条纪律（那边由 ``life_activity.is_known_activity`` 提供，本模块不反向 import）。
+#: 权威定义在 ``life_activity``（``COLD_ONSET`` / ``COLD_WORSENING`` /
+#: ``COLD_RECOVERING``），两边不一致时以那边为准，这里只用于告警。
+_KNOWN_STAGES: tuple[str, ...] = ("onset", "worsening", "recovering")
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 #: 结构字符：`<>{}` 是 JSON 输出模板的占位符，``【】「」`` 是提示词自己的分节/引用符。
@@ -77,7 +88,13 @@ def sanitize_text(text: object, *, max_chars: int = MAX_MATERIAL_CHARS) -> str:
 
 @dataclass(frozen=True)
 class LifeEvent:
-    """一条生活事件。``activities`` 为空元组表示「任意清醒活动都可以」。"""
+    """一条生活事件。``activities`` 为空元组表示「任意清醒活动都可以」。
+
+    ``stages`` 是 v1.14.0（病程系统）新增的**可选病程约束**：非空时只有处在
+    对应感冒阶段（``onset`` / ``worsening`` / ``recovering``）才可能被抽到。
+    「退烧了」这类事件只在好转期成立，放进无约束池会出现「一天退烧三次」。
+    空元组 = 与病程无关（绝大多数事件，也是旧配置行的语义）。
+    """
 
     label: str
     activities: tuple[str, ...] = ()
@@ -86,11 +103,20 @@ class LifeEvent:
     weight: float = 0.3
     material: str = ""
     ttl_hours: float = DEFAULT_TTL_HOURS
+    stages: tuple[str, ...] = ()
 
-    def matches(self, activity: str) -> bool:
-        """这条事件是否允许在给定活动下发生。"""
+    def matches(self, activity: str, stage: str = "") -> bool:
+        """这条事件是否允许在给定活动（与病程阶段）下发生。
 
-        return not self.activities or activity in self.activities
+        ``stage`` 缺省为空串 = 「不在任何病程里」⇒ 带阶段约束的事件一律不命中。
+        调用方（``life_sim.settle``）在有病程时传 ``state.cold_stage``，没有时传空串。
+        """
+
+        if self.activities and activity not in self.activities:
+            return False
+        if self.stages and str(stage or "") not in self.stages:
+            return False
+        return True
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -191,6 +217,21 @@ def parse_event_line(line: object) -> tuple[LifeEvent | None, list[str]]:
 
     material = sanitize_text(payload.get("material", ""), max_chars=MAX_MATERIAL_CHARS)
 
+    stages: tuple[str, ...] = ()
+    if "stage" in payload:
+        raw_stages = [
+            sanitize_text(part, max_chars=16).lower()
+            for part in re.split(r"[,，]", payload["stage"])
+            if sanitize_text(part, max_chars=16)
+        ]
+        for item in raw_stages:
+            if item not in _KNOWN_STAGES:
+                warnings.append(
+                    f"{label}: stage={item!r} 不是已知病程阶段"
+                    f"（{'/'.join(_KNOWN_STAGES)}），该事件可能永远不会触发"
+                )
+        stages = tuple(raw_stages)
+
     return (
         LifeEvent(
             label=label,
@@ -200,6 +241,7 @@ def parse_event_line(line: object) -> tuple[LifeEvent | None, list[str]]:
             weight=weight,
             material=material,
             ttl_hours=ttl_hours,
+            stages=stages,
         ),
         warnings,
     )
@@ -279,14 +321,18 @@ def merge_events(
 # ---------------------------------------------------------------- 抽取
 
 
-def eligible_events(events: object, activity: str) -> list[LifeEvent]:
-    """当前活动下允许发生的事件（保持输入顺序，便于确定性测试）。"""
+def eligible_events(events: object, activity: str, stage: str = "") -> list[LifeEvent]:
+    """当前活动（与病程阶段）下允许发生的事件（保持输入顺序，便于确定性测试）。
+
+    ``stage`` 缺省空串 = 不在病程里 ⇒ 带 ``stages`` 约束的事件不出现。旧调用点
+    不传这个参数时行为与加阶段之前**完全一致**（除非事件自己声明了约束）。
+    """
 
     try:
         candidates = list(events)
     except TypeError:
         return []
-    return [event for event in candidates if event.matches(activity)]
+    return [event for event in candidates if event.matches(activity, stage)]
 
 
 def pick_event(
@@ -296,17 +342,19 @@ def pick_event(
     *,
     probability: float = 0.4,
     activity_weights: dict[str, float] | None = None,
+    stage: str = "",
 ) -> LifeEvent | None:
     """按概率抽一条事件；不触发或没有候选时返回 ``None``。
 
     ``probability`` 是参考设定里的「每 10 分钟 40% 概率」。``rng`` 必须由调用方
     注入（``life_sim`` 传自己那份种子随机源），这样同种子能复现同一段时间线。
+    ``stage`` 见 ``eligible_events``。
     """
 
     if rng.random() >= _clamp(float(probability), 0.0, 1.0):
         return None
 
-    candidates = eligible_events(events, activity)
+    candidates = eligible_events(events, activity, stage)
     if not candidates:
         return None
 
@@ -384,18 +432,41 @@ BUILTIN_EVENTS: tuple[LifeEvent, ...] = (
     LifeEvent("想起白天一句话", ("before_sleep",), -0.4, 0.0, 0.60, "躺下突然想起白天有人说的一句话"),
     LifeEvent("今天过得还行", ("before_sleep",), 0.6, 0.0, 0.55, "今天好像也没什么大事，但过得还行"),
     LifeEvent("明天要早起", ("before_sleep",), -0.3, -0.2, 0.40, "明天要早起，但一点都不想睡"),
-    # ---- 养病（sick_rest）----
+    # ---- 养病（sick_rest，v1.14.0 起按病程阶段约束）----
     # v1.5.1 补三条事件：旧池只有 2 条全负价（嗓子疼/出了身汗），事件抽取是
     # 均匀分布，40%/tick 的触发率给出 −0.24/tick 的情绪冲击，大于 0.2/tick 的回归
     # 速率——感冒期间情绪被钉在地板（仿真 mean 1.89/10，病愈后 24h 余波继续 −0.6）。
-    # 补后池均价 −0.06，情绪贴着基线略低；「感冒时话少」仍由健康因子 0.3 出一次。
-    # （先试过「+0.8/+0.6 两条正价」的版本，池均价 +0.05，仿真里感冒情绪反而
-    # 漂到 5.8、p95 9.4——病中狂喜同样失真，负一票。）
-    LifeEvent("嗓子疼", ("sick_rest",), -0.8, -0.5, 0.50, "嗓子疼得厉害，咽口水都费劲"),
-    LifeEvent("出了身汗", ("sick_rest",), -0.4, 0.3, 0.30, "出了一身汗，好像退下去一点了"),
-    LifeEvent("鼻塞", ("sick_rest",), -0.5, -0.1, 0.45, "鼻子堵住了，说话瓮声瓮气的"),
-    LifeEvent("退烧了", ("sick_rest",), 0.8, 0.5, 0.65, "烧退了，感觉活过来了"),
-    LifeEvent("有人送药", ("sick_rest",), 0.6, 0.0, 0.60, "门口有送来的药和一张字条"),
+    # 「感冒时话少」仍由健康因子出一次。
+    #
+    # v1.14.0（病程系统）：**每条都挂上 ``stages``**——
+    # 「退烧了」从随机池里**移出**，升格为转入好转时那个确定性事件
+    # （``life_sim._COLD_EVENTS``），否则它在加重期也会被抽到，出现「一天退烧三次」；
+    # 「出了身汗」「有人送药」只在中后期成立，初起期抽到是穿帮。
+    LifeEvent("嗓子疼", ("sick_rest",), -0.8, -0.5, 0.50, "嗓子疼得厉害，咽口水都费劲",
+              stages=("onset", "worsening")),
+    LifeEvent("出了身汗", ("sick_rest",), -0.4, 0.3, 0.30, "出了一身汗，好像退下去一点了",
+              stages=("worsening", "recovering")),
+    LifeEvent("鼻塞", ("sick_rest",), -0.5, -0.1, 0.45, "鼻子堵住了，说话瓮声瓮气的",
+              stages=("onset", "worsening")),
+    LifeEvent("有人送药", ("sick_rest",), 0.6, 0.0, 0.60, "门口有送来的药和一张字条",
+              stages=("worsening", "recovering")),
+    LifeEvent("没胃口", ("sick_rest",), -0.3, -0.2, 0.40, "什么都不想吃，喝水都觉得费劲",
+              stages=("worsening", "recovering")),
+    LifeEvent("半夜咳醒", ("sick_rest",), -0.6, -0.4, 0.55, "半夜咳醒了好几次，睡得断断续续",
+              stages=("worsening", "recovering")),
+    # 每个阶段的子池都必须有正价事件：按阶段过滤后如果只剩负价，该阶段的情绪
+    # 就会被钉在地板（v1.5.1 的旧事故在「按阶段切池」之后会以更小的池子重现）。
+    LifeEvent("有人问候", ("sick_rest",), 0.5, 0.0, 0.60, "有人发消息问好点没，心里暖了一下",
+              stages=("onset", "worsening", "recovering")),
+    LifeEvent("睡了一整天", ("sick_rest",), 0.4, 0.6, 0.35, "昏昏沉沉睡了整整一天，醒来天都黑了",
+              stages=("worsening",)),
+    # ---- 病中吃饭（meal，v1.14.0：养病期放行三餐后才有意义）----
+    LifeEvent("喝了两口热水", ("meal",), 0.2, 0.1, 0.35, "喝了两口热水，嗓子总算舒服一点",
+              stages=("onset", "worsening")),
+    LifeEvent("白粥配咸菜", ("meal",), 0.3, 0.2, 0.45, "白粥配咸菜，居然吃出点味道来了",
+              stages=("worsening", "recovering")),
+    LifeEvent("有胃口了", ("meal",), 0.5, 0.3, 0.55, "总算有点胃口了，把一碗饭都吃完了",
+              stages=("recovering",)),
 )
 
-assert len(BUILTIN_EVENTS) == 55, f"内建事件库应为 55 条，实际 {len(BUILTIN_EVENTS)}"
+assert len(BUILTIN_EVENTS) == 61, f"内建事件库应为 61 条，实际 {len(BUILTIN_EVENTS)}"

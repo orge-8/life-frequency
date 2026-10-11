@@ -275,15 +275,29 @@ def test_enforce_allows_meeting_and_overtime_as_alternatives():
 
 
 def test_prompt_lists_exactly_the_allowed_activities():
+    """v1.17.0（PR-PRM-1）：提示词【可选活动】== 相位矩阵放行的集合。
+
+    以前事实行里给一个「适合」清单、【可选活动】却恒为全枚举——两个清单不同源，
+    模型从全枚举里挑禁项再被强制层收口。现在候选由 ``activity_choices()``
+    按同一张矩阵收窄，事实行只保留「不能做什么」的提醒。
+    """
+
     facts = facts_at(MONDAY.replace(hour=10, minute=30))
-    prompt = "\n".join(facts.prompt_lines)
-    allowed = A.schedule_allowed_activities(facts)
-    assert "现在适合的活动" in prompt, prompt
+    # 候选 = 相位矩阵放行 ∩ 非系统态（CHATTING 只有打断机制能切进去，永不是候选）
+    allowed = set(A.schedule_allowed_activities(facts)) - {A.CHATTING}
+    prompt_input = A.PromptInput(schedule=facts, schedule_lines=facts.prompt_lines)
+    prompt = A.build_prompt(prompt_input)
+    choices_line = " / ".join(
+        f"{name}={A.ACTIVITY_LABELS[name]}" for name in prompt_input.activity_choices()
+    )
+    assert choices_line and choices_line in prompt, prompt
     for activity in allowed:
-        assert A.ACTIVITY_LABELS[activity] in prompt, activity
-    for activity in set(A.ALLOWED_ACTIVITIES) - set(allowed):
-        # 被禁的活动只出现在「都不合适」那句里，不该出现在「适合」清单里
-        assert f"{activity}=" not in prompt, f"{activity} 不该出现在适合清单里"
+        assert f"{activity}=" in choices_line, (activity, choices_line)
+    for activity in set(A.ALLOWED_ACTIVITIES) - allowed:
+        # 被禁/被摘掉的活动只出现在「都不合适」那句里，不该出现在候选清单里
+        assert f"{activity}=" not in choices_line, f"{activity} 不该是候选"
+        assert A.ACTIVITY_LABELS[activity] in prompt or activity == A.CHATTING, activity
+    assert "都不合适" in prompt
 
 
 def test_allowed_activities_match_the_enforce_matrix():
@@ -295,6 +309,62 @@ def test_allowed_activities_match_the_enforce_matrix():
             assert A.activity_blocked_by_schedule(activity, facts, policy()) == "", (
                 hour, minute, activity
             )
+
+
+def test_prompt_without_schedule_keeps_the_old_candidate_list():
+    """没给班表事实时：候选 = 全枚举减 CHATTING（与 v1.16.3 逐位一致）。"""
+
+    plain = A.PromptInput()
+    assert plain.activity_choices() == tuple(
+        item for item in A.ALLOWED_ACTIVITIES if item != A.CHATTING
+    )
+    assert A.schedule_restriction_line(None) == ""
+    assert A.schedule_restriction_line(A.ScheduleFacts()) == ""
+    assert A.schedule_restriction_line(A.ScheduleFacts(enabled=True, is_workday=False)) == ""
+
+
+def test_work_phase_hides_the_banned_activities_from_the_candidates():
+    """在岗相位：睡觉/小睡/通勤/午休/下班/游戏/看番都不该出现在候选里。"""
+
+    desk = facts_at(MONDAY.replace(hour=10, minute=30))
+    choices = A.PromptInput(schedule=desk).activity_choices()
+    for activity in (A.SLEEP, A.NAP, A.COMMUTE, A.LUNCH, A.OFF_WORK, A.GAME, A.ANIME):
+        assert activity not in choices, activity
+    assert A.WORK in choices and A.MEETING in choices and A.OVERTIME in choices
+    # 强制层对同一批活动给出的答案必须是「拒」（同源）
+    for activity in (A.GAME, A.ANIME, A.SLEEP):
+        assert A.activity_blocked_by_schedule(activity, activity_facts(schedule=desk), policy())
+
+
+def test_lunch_phase_keeps_meal_nap_and_entertainment():
+    """午休相位只禁睡觉/睡前/通勤/下班——吃饭、小睡、看番都放行。"""
+
+    lunch = facts_at(MONDAY.replace(hour=12, minute=30))
+    choices = A.PromptInput(schedule=lunch).activity_choices()
+    for activity in (A.MEAL, A.NAP, A.ANIME, A.MUSIC, A.GAME):
+        assert activity in choices, activity
+    for activity in (A.SLEEP, A.BEFORE_SLEEP, A.COMMUTE, A.OFF_WORK):
+        assert activity not in choices, activity
+
+
+def test_rest_day_candidates_are_not_narrowed():
+    """休息日/未启用班表：候选不受相位矩阵影响。"""
+
+    saturday = facts_at(SATURDAY.replace(hour=10))
+    assert A.PromptInput(schedule=saturday).activity_choices() == tuple(
+        item for item in A.ALLOWED_ACTIVITIES if item != A.CHATTING
+    )
+    assert A.schedule_restriction_line(saturday) == ""
+
+
+def test_nap_still_removed_when_the_feature_is_off():
+    """小睡总开关关掉时，它仍然不在候选里（与 PR-R1 的口径叠加，不互相覆盖）。"""
+
+    desk = facts_at(MONDAY.replace(hour=10, minute=30))
+    choices = A.PromptInput(schedule=desk, allow_nap=False).activity_choices()
+    assert A.NAP not in choices
+    lunch = facts_at(MONDAY.replace(hour=12, minute=30))
+    assert A.NAP not in A.PromptInput(schedule=lunch, allow_nap=False).activity_choices()
 
 
 # ================= E. 升级迁移：老配置也要拿到新活动 =================
@@ -529,7 +599,9 @@ def test_work_scene_reaches_the_activity_prompt():
         assert decision is not None and decision.activity == A.WORK
         prompt = captured.get("prompt", "")
         assert "work=工作" in prompt, prompt
-        assert "现在适合的活动" in prompt
+        assert "都不合适" in prompt
         assert "打游戏" in prompt          # 出现在「都不合适」那句里
+        # v1.17.0（PR-PRM-1）：候选清单已经收窄，别再列一遍「适合的活动」
+        assert "现在适合的活动" not in prompt
 
     asyncio.run(run())

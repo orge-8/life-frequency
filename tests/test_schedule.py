@@ -95,6 +95,73 @@ def activity_facts(**overrides) -> A.ActivityFacts:
     return A.ActivityFacts(**base)
 
 
+# ================= A0. 病假口（v1.14.0 §3.4）=================
+
+
+def test_sick_leave_replaces_the_suitable_activity_line():
+    """加重/好转期请了病假：提示词换成病假文案，不再给「这段时间不能…」的相位提醒。
+
+    v1.17.0（PR-PRM-1）：那句提醒从 ``schedule_facts.prompt_lines`` 移到了
+    ``build_prompt`` 的【可选活动】一节（它是候选集的边界，不是班表事实），
+    所以这里从**提示词成品**上断言，而不是从事实行上。
+    """
+
+    monday_10 = MONDAY.replace(hour=10)
+    normal = A.schedule_facts(monday_10, work_config())
+    normal_prompt = A.build_prompt(
+        A.PromptInput(schedule=normal, schedule_lines=normal.prompt_lines)
+    )
+    assert "这段时间她" in normal_prompt and "都不合适" in normal_prompt
+    assert "睡觉" in normal_prompt
+
+    leave = A.schedule_facts(monday_10, work_config(), sick_leave=True)
+    text = "\n".join(leave.prompt_lines)
+    assert "请了病假" in text and "不用上班" in text
+    leave_prompt = A.build_prompt(
+        A.PromptInput(schedule=leave, schedule_lines=leave.prompt_lines)
+    )
+    assert "都不合适" not in leave_prompt
+    # 相位与分钟数照算（状态卡与强制层还要用）
+    assert leave.phase == normal.phase and leave.minutes_to_off == normal.minutes_to_off
+    assert leave.enabled is True and leave.is_workday is True
+
+    # 休息日/未启用班表时不出现「请病假」这种说法
+    rest = A.schedule_facts(SATURDAY.replace(hour=10), work_config(), sick_leave=True)
+    assert "请了病假" not in "\n".join(rest.prompt_lines)
+    off = A.schedule_facts(monday_10, A.ScheduleConfig(enabled=False), sick_leave=True)
+    assert "请了病假" not in "\n".join(off.prompt_lines)
+
+
+def test_rule_seed_says_sick_leave_when_on_leave():
+    on_leave = A.rule_based_activity(
+        now_minutes=10 * 60, sick=True, schedule=facts_at(MONDAY.replace(hour=10)),
+        sick_leave=True,
+    )
+    assert on_leave.activity == A.SICK_REST
+    assert "病假" in on_leave.note and "在家" in on_leave.scene
+
+    # 初起期不开口：文案与旧行为逐字一致
+    plain = A.rule_based_activity(
+        now_minutes=10 * 60, sick=True, schedule=facts_at(MONDAY.replace(hour=10)),
+    )
+    assert plain.note == "时段表：养病"
+
+
+def test_enforce_sends_work_proposal_home_during_sick_leave():
+    """病假 + 在岗相位：模型提议上班会被班表挡掉，而不是「先上班再被按回床上」。"""
+
+    sick = activity_facts(sick=True, cold_stage=A.COLD_WORSENING)
+    block = A.activity_blocked_by_schedule(A.WORK, sick, policy())
+    assert "病假" in block, block
+    out = A.enforce(sick, A.ActivityDecision(A.WORK, "去上班"), policy())
+    assert out.activity == A.SICK_REST, out
+
+
+def test_sick_leave_switch_off_restores_old_behaviour():
+    facts = activity_facts(sick=True, cold_stage=A.COLD_WORSENING)
+    assert A.activity_blocked_by_schedule(A.WORK, facts, policy(cold_sick_leave=False)) == ""
+
+
 # ================= A. 解析配置 =================
 
 
@@ -199,10 +266,16 @@ def test_prompt_lines_carry_weekday_phase_and_duty():
     assert "09:30-18:30" in text
     assert "在岗" in text
     assert duty_text() in text
-    assert "不能" in text or "不合适" in text, "约束要明说，别指望模型自己推"
+    # v1.17.0（PR-PRM-1）：相位约束从事实行移到了提示词的【可选活动】一节
+    # （它是候选集的边界，不是「今天是不是工作日」这类事实）
+    prompt = A.build_prompt(A.PromptInput(schedule=work, schedule_lines=work.prompt_lines))
+    assert "不能" in prompt or "不合适" in prompt, "约束要明说，别指望模型自己推"
 
     weekend = facts_at(SATURDAY.replace(hour=10))
     assert "休息日" in "\n".join(weekend.prompt_lines)
+    assert (
+        A.schedule_restriction_line(weekend) == ""
+    ), "休息日是她自己的时间，不该给相位禁令"
 
     lunch = facts_at(MONDAY.replace(hour=12, minute=30))
     assert "午休" in "\n".join(lunch.prompt_lines)
@@ -513,10 +586,13 @@ def test_schedule_is_a_top_level_section_in_the_webui_schema():
     fields = sections["schedule"]["fields"]
     assert set(fields) == {
         "enabled", "workdays", "work_window", "commute_minutes",
-        "lunch_window", "duty", "work_scene",
+        "lunch_window", "duty", "work_scene", "honor_calendar",
+        "daily_jitter_minutes", "overtime_probability", "overtime_extra_minutes",
     }, sorted(fields)
     for name, field in fields.items():
-        assert field["type"] in ("boolean", "string", "integer"), (name, field["type"])
+        # v1.17.0（PR-SCH-2）：多了 `overtime_probability`（float）——WebUI 的控件
+        # 分发里有 number 分支，不是 `object` 就没有 `[object Object]` 风险
+        assert field["type"] in ("boolean", "string", "integer", "number"), (name, field["type"])
         assert field["label"] != name, f"{name} 缺中文 label，WebUI 会显示成英文键名"
     assert "schedule" not in (sections["activity"]["fields"] or {}), "班表又被塞回 [activity] 里了"
 
@@ -559,6 +635,8 @@ def test_nested_config_objects_become_dotted_path_sections():
         "recent_events_in_prompt", "recent_near_hours", "recent_mid_hours",
         "recent_far_days", "persona_max_chars", "skip_when_forced",
         "recent_pick_mode", "recent_max_per_label", "recent_events_keep",
+        # v1.15.0（PR-S4）：睡眠中的决策间隔
+        "sleep_interval_seconds",
     }
 
     for path in ("emotion_energy.curves.frequency", "emotion_energy.curves.necessity"):

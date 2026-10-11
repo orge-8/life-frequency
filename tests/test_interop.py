@@ -623,13 +623,30 @@ def test_command_pattern_does_not_shadow_other_plugins_commands():
     import re
 
     source = (PLUGIN_DIR / "plugin.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    # v1.14.0：pattern 改成引用模块常量（LIFE_STATE_PATTERN）——命令正则被抽出来是
+    # 为了让「/生活 送药」与独立「/送药」两条正则的互斥性可以被测试钉住（宿主只认
+    # 第一个命中的组件）。所以这里要能把 Name 解析回字面量，不能只认 str。
+    constants: dict[str, Any] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                try:
+                    constants[target.id] = ast.literal_eval(node.value)
+                except ValueError:
+                    continue
     pattern_text = None
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "cmd_life_state":
             for decorator in node.decorator_list:
                 if isinstance(decorator, ast.Call):
                     for kw in decorator.keywords:
-                        if kw.arg == "pattern":
+                        if kw.arg != "pattern":
+                            continue
+                        if isinstance(kw.value, ast.Name):
+                            pattern_text = constants.get(kw.value.id)
+                        else:
                             pattern_text = ast.literal_eval(kw.value)
     assert pattern_text, "没找到 /生活 的 pattern"
     rx = re.compile(pattern_text)
@@ -1795,7 +1812,11 @@ def test_dry_run_wake_logs_window_but_writes_nothing():
 
 
 def test_wake_is_visible_in_status_card_and_prompt_digest():
-    """可观测性：卡片与注入提示词都要说清「她本来在睡、刚被 @ 吵醒」。"""
+    """可观测性：卡片与注入提示词都要说清「她本来在睡、刚刚被叫醒」。
+
+    v1.15.0（PR-W1/W3）：提示词措辞从「刚被 @ 吵醒」改成中性的「刚刚被叫醒」——
+    私聊也能唤醒之后，写死 @ 就不准了；被吵醒的语气按「睡下多久」分档。
+    """
 
     async def run():
         _module, plugin, _host = _make_plugin()
@@ -1808,13 +1829,13 @@ def test_wake_is_visible_in_status_card_and_prompt_digest():
         card = await plugin._render_frequency(now, "group-1")
         assert "被 @ 唤醒" in card, card
         digest = plugin._life_digest()
-        assert "被 @ 吵醒" in digest, digest
+        assert "刚刚被叫醒" in digest, digest
 
         # 窗口过了就都不该再提（否则提示词会让她一直以为刚被吵醒）
         plugin._state.at_wake_until = now - 1.0
         assert "被 @ 唤醒" not in plugin._render_status(now, "group-1")
         assert await plugin._render_frequency(now, "group-1")
-        assert "被 @ 吵醒" not in plugin._life_digest()
+        assert "刚刚被叫醒" not in plugin._life_digest()
 
     asyncio.run(run())
 
@@ -1928,7 +1949,10 @@ def test_activity_prompt_discloses_choice_effects_from_live_config():
         ):
             assert needle in prompt, needle
         assert "9 小时" in prompt, "提示词里的睡眠上限必须来自配置（写死就会漂）"
-        assert "12 小时" not in prompt, "旧配置值不该残留"
+        # 断言「旧上限值没残留」要看**那句话本身**：v1.16.0 的清醒疲劳曲线行里合法地
+        # 会出现「清醒 12 小时」，用裸的 "12 小时" 判会把它误当成旧配置值。
+        assert "睡满 12 小时" not in prompt, "旧配置值不该残留"
+        assert "睡满 9 小时" in prompt
         # 睡眠唤醒的事实要如实跟随开关：默认开 ⇒ 说「被 @ 会临时醒来一次」
         assert "被 @ 会临时醒来一次" in prompt
         # 经济没接上（hint 为空）时不许凭空提钱，否则会诱导「为了省钱挑活动」

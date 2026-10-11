@@ -31,11 +31,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 try:  # 包式加载（Runner 真机）
-    from .life_activity import SLEEP, in_window
+    from .life_activity import is_asleep, in_window
     from .life_events import sanitize_text
     from .life_sim import material_freshness
 except ImportError:  # 平铺兜底（脚本直跑 / 测试）
-    from life_activity import SLEEP, in_window
+    from life_activity import is_asleep, in_window  # type: ignore[no-redef]
     from life_events import sanitize_text
     from life_sim import material_freshness
 
@@ -272,7 +272,7 @@ def decide(
     if not config.enabled:
         return ProactiveDecision(False, REASON_DISABLED)
 
-    if activity == SLEEP:
+    if is_asleep(activity):
         return ProactiveDecision(False, REASON_SLEEPING)
 
     if float(energy) < float(config.minimum_energy):

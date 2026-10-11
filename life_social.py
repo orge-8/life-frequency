@@ -38,8 +38,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 try:
     from .life_events import sanitize_text
+    from .life_factors import interpolate
 except ImportError:  # 平铺兜底（脚本直跑 / 测试）
     from life_events import sanitize_text
+    from life_factors import interpolate  # type: ignore[no-redef]
 
 #: 事件正文的字符上限，与 ``life_sim._apply_event`` 保持一致（渲染时还会再截一次）
 MAX_TEXT_CHARS = 80
@@ -93,6 +95,16 @@ class SocialPolicy:
 
     max_live_events_per_day: int = 2
     """一天最多产出几条实时事件。**必须有上界**：否则攒下的信号会挤掉她自己的生活事件。"""
+
+    #: 孤独放大社交收益（v1.16.2 M3b）：孤独的人被找更开心、被爱包围的人对打扰更钝感。
+    #: ``False`` = 关（系数恒 1.0 = 旧行为）。
+    loneliness_scaling: bool = False
+    """违反「关掉 = 旧行为」的成本最高，所以默认关（插件侧默认开）。"""
+
+    #: 孤独 → 系数曲线：``≤2 → 0.8``、``7 → 1.5``，其间线性（端点外取端点值）。
+    loneliness_curve: tuple[tuple[float, float], ...] = ((2.0, 0.8), (7.0, 1.5))
+    """与 M7 的关系系数不同，这里**不追求中性锚点**：孤独是状态不是身份，
+    开箱时孤独基线 4.0 ⇒ 系数约 1.08，属于本版有意的行为变更。"""
 
 
 # ---------------------------------------------------------------- 时间
@@ -292,7 +304,7 @@ def live_signal(message: object, *, now: float) -> dict[str, Any] | None:
 
     if not isinstance(message, Mapping):
         return None
-    session_id, group_id, _user_id = session_ids(message)
+    session_id, group_id, user_id = session_ids(message)
     if not session_id:
         return None
     if _flag(message, "is_command"):
@@ -307,6 +319,10 @@ def live_signal(message: object, *, now: float) -> dict[str, Any] | None:
         "is_group": bool(group_id),
         "mentioned": bool(mentioned),
         "text_len": len(body),
+        # v1.16.3（M7）：说话的人。用来查熟悉度做社交情绪加权。
+        # ⚠ **只在内存里流转**（信号本身不进 recent_events、不落盘），所以这里带
+        # user_id 不违反「QQ 号不进提示词与状态文件」的脱敏纪律（v1.13.1 F-001）。
+        "user_id": str(user_id or ""),
     }
 
 
@@ -349,6 +365,49 @@ class IntakeContext:
     """本生活日已经花掉的社交情绪额度。"""
 
     policy: SocialPolicy
+
+    loneliness: float = 0.0
+    """当前孤独值（0–10，v1.16.2 M3b）；``policy.loneliness_scaling`` 关着时被忽略。
+
+    放在最后且有默认值：所有既有调用点（含测试夹具）不用改就能跑，且**默认路径
+    就是旧行为**（系数恒 1.0）。"""
+
+    relation_factor: float = 1.0
+    """关系系数（v1.16.3 M7）——由 plugin 按**这场 tick 的实时信号**认人后预计算。
+
+    ``1.0`` = 认不出人 / 关系层关掉 / 没开加权 = 陌生人 = 旧行为（决议 3 的中性锚点）。
+    只作用于 ``intake_live``：日记摘要只有昵称，认不出人就不加权（宁可不放大，
+    也不猜错人把熟人的收益算到路人头上）。"""
+
+    impact_factor: float = 1.0
+    """情绪冲击的边际效用系数（v1.16.3 M6，由 plugin 用 ``life_sim.impact_scale`` 预计算）。
+
+    社交通道的增量恒为正，所以取正向曲线；``1.0`` = 关闭 = 旧行为。"""
+
+
+def loneliness_factor(loneliness: float, policy: SocialPolicy) -> float:
+    """孤独 → 社交情绪收益的系数（v1.16.2 M3b）。
+
+    ``≥7 → ×1.5``（很想有人陪）、``≤2 → ×0.8``（被爱包围，对打扰钝感），其间线性。
+    坏值（NaN/非数值）**按 1.0** 处理：一个坏维度不该让社交情绪整体消失
+    （与 ``battery_gate`` 的 NaN 按满电处理同一条 fail-open 原则）。
+    """
+
+    if not policy.loneliness_scaling:
+        return 1.0
+    curve = tuple(policy.loneliness_curve or ())
+    if not curve:
+        return 1.0
+    try:
+        value = float(loneliness)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(value):
+        return 1.0
+    factor = interpolate(curve, value)
+    if not math.isfinite(factor):
+        return 1.0
+    return max(0.0, float(factor))
 
 
 @dataclass
@@ -414,6 +473,12 @@ def intake_digest(
         return result
     left = max(0.0, float(ctx.policy.daily_emotion_cap) - max(0.0, float(ctx.day_used)))
     fresh_span = FRESH_EMOTION_HOURS * 3600.0
+    # ⚠ **乘法顺序在这里定死**（v1.16.2 M3b 立下，v1.16.3 D 期补齐 M6/M7）：
+    #   最终增量 = 基础值 × 关系系数(M7) × 孤独系数(M3b) × 边际效用(M6)
+    #   全部在「日额度扣除之前」——先缩放、再让额度封顶，否则额度一用完，
+    #   系数就完全不起作用（「额度 × 1.5 却仍只发 0.2」的边界用例正是钉这件事）。
+    #   关系系数**不在这里用**：日记摘要只给昵称、认不出人（见 IntakeContext）。
+    factor = loneliness_factor(ctx.loneliness, ctx.policy) * ctx.impact_factor
     # 由远到近入库：这样「近层」在配额里排在后面时不会被远的挤掉观感
     for item in sorted(items, key=lambda entry: entry.at):
         if item.key in seen:
@@ -425,7 +490,7 @@ def intake_digest(
             result.skipped_asleep += 1
             continue
         # 只给「还新鲜」的事记情绪：更早的事早就通过情绪余波结算过了
-        want = ctx.policy.digest_emotion if (ctx.now - item.at) <= fresh_span else 0.0
+        want = ctx.policy.digest_emotion * factor if (ctx.now - item.at) <= fresh_span else 0.0
         emotion, _trimmed = _grant(want, left=left, asleep=ctx.asleep, policy=ctx.policy)
         if want > 0 and emotion <= 0:
             result.skipped_budget += 1
@@ -505,6 +570,12 @@ def intake_live(
         want = ctx.policy.group_emotion * max(1, sessions)
 
     left = max(0.0, float(ctx.policy.daily_emotion_cap) - max(0.0, float(ctx.day_used)))
+    # 与 intake_digest 同一处乘法顺序（见那边的注释）：缩放必须在额度扣除之前
+    want *= (
+        ctx.relation_factor
+        * loneliness_factor(ctx.loneliness, ctx.policy)
+        * ctx.impact_factor
+    )
     emotion, _ = _grant(want, left=left, asleep=ctx.asleep, policy=ctx.policy)
     if want > 0 and emotion <= 0:
         result.skipped_budget += 1

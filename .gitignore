@@ -4,3 +4,5 @@ data/
 *.pyc
 .pytest_cache/
 .maibot-release.json
+# collect_diagnostics.py 的输出（现场诊断报告 + 打包），不入库
+diagnostics/

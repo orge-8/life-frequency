@@ -34,9 +34,10 @@ import random
 import re
 import time
 from collections import deque
+from dataclasses import replace as _replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 from uuid import uuid4
 
 # --- 唯一允许的宿主依赖入口：maibot_sdk（禁止 import src.*）---
@@ -69,9 +70,14 @@ try:
     from .life_activity import (
         ACTIVITY_LABELS,
         ALLOWED_ACTIVITIES,
+        BATH,
         DAILY,
+        DAZE,
+        MAX_SCHEDULE_JITTER_MINUTES,
+        MEAL,
         SICK_REST,
         SLEEP,
+        SOURCE_ENFORCED,
         SOURCE_LABELS,
         ActivityDecision,
         PromptInput,
@@ -79,7 +85,9 @@ try:
         ScheduleFacts,
         build_prompt,
         in_window,
+        is_asleep,
         is_known_activity,
+        on_sick_leave,
         parse_response,
         parse_schedule_window,
         parse_window,
@@ -113,6 +121,57 @@ try:
         preview,
     )
     from .life_host_model import normalize_mode as normalize_host_mode
+    from .life_calendar import (
+        Calendar,
+        builtin_calendar,
+        load_calendar_file,
+    )
+    from .life_mood import (
+        MoodPolicy,
+        battery_gate,
+        clamp_mood,
+        evolve as mood_evolve,
+        injection_lines as mood_injection_lines,
+        note_proactive_cost,
+        prompt_lines as mood_prompt_lines,
+    )
+    from .life_relations import (
+        decay_all as relations_decay_all,
+        emotion_factor as relation_emotion_factor,
+        emotion_curve as relation_emotion_curve,
+        prompt_lines as relations_prompt_lines,
+        should_record as relation_should_record,
+        tier_of as relation_tier,
+        threshold_multiplier as relation_threshold_multiplier,
+        touch as relation_touch,
+    )
+    from .life_dream import (
+        DREAM_MIN_SLEEP_MINUTES,
+        dream_prompt,
+        material as dream_material,
+        mood_bucket as dream_mood_bucket,
+        recent_event as dream_recent_event,
+        roll_dream as dream_roll,
+        sanitize_dream as dream_sanitize,
+        template_text as dream_template,
+    )
+    from .life_motives import (
+        greeting_material,
+        key_of as motive_key_of,
+        relation_materials as motive_relation_materials,
+        share_material as motive_share_material,
+        stamp as motive_stamp,
+    )
+    from .life_interrupt import (
+        CHATTING as INTERRUPT_CHATTING,
+        apply_interrupt as interrupt_apply,
+        context_fact as interrupt_context_fact,
+        expire_interrupt as interrupt_expire,
+        expire_note as interrupt_expire_note,
+        in_interrupt_window as interrupt_in_window,
+        pointless_reason as interrupt_pointless_reason,
+        should_interrupt as interrupt_should,
+    )
     from .life_proactive import (
         NO_QUOTE_DISCIPLINE,
         REASON_INTERVAL,
@@ -124,7 +183,30 @@ try:
         record_proactive,
         record_user_message,
     )
+    from .life_routines import (
+        ROUTINE_FIRED,
+        ROUTINE_PENDING,
+        ROUTINE_SKIPPED,
+        RoutineContext,
+        active_lines,
+        decision_for as routine_decision,
+        parse_routine_lines,
+        pick_pending,
+        roll_weight,
+    )
+    from .life_physio import (
+        MealWindow,
+        active_windows as physio_active_windows,
+        eat_amount,
+        need_snack,
+        parse_meal_lines,
+        proposal_for as physio_proposal,
+        settle_satiety,
+    )
     from .life_sim import (
+        CARE_EMOTION_GAIN,
+        DEFAULT_CARE_PATTERNS,
+        MEDICINE_EMOTION_GAIN,
         LifeState,
         SimConfig,
         active_materials,
@@ -132,13 +214,21 @@ try:
         activity_minutes,
         append_social_event,
         apply_activity,
+        attribution_lines,
         awake_hours_today,
+        build_enforce_policy,
         can_switch,
+        care_hit,
+        cold_stage,
         date_context,
         date_factor,
         day_key_of,
+        enforce,
         enforce_and_apply,
-        health_label,
+        enforce_facts,
+        health_label_admin,
+        health_label_prompt,
+        impact_scale,
         is_cold,
         local_datetime,
         mark_ask_skipped,
@@ -146,13 +236,16 @@ try:
         mark_llm_success,
         material_effective_count,
         new_state,
+        parse_care_patterns,
         parse_festival_lines,
         parse_mmdd,
         pointless_ask_reason,
         recent_event_tiers,
+        register_care,
         settle,
         should_reseed,
         sleep_hours_today,
+        take_medicine,
     )
     from .life_social import (
         IntakeContext,
@@ -162,6 +255,7 @@ try:
         intake_digest,
         intake_live,
         live_signal,
+        loneliness_factor,
         parse_digest,
         prune_daily,
         prune_seen,
@@ -171,6 +265,7 @@ try:
         social_lines,
         unavailable as social_unavailable,
     )
+    from .life_store import open_store
     from .life_world import (
         LiveStatus,
         NewcomerSource,
@@ -194,9 +289,14 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_activity import (
         ACTIVITY_LABELS,
         ALLOWED_ACTIVITIES,
+        BATH,
         DAILY,
+        DAZE,
+        MAX_SCHEDULE_JITTER_MINUTES,
+        MEAL,
         SICK_REST,
         SLEEP,
+        SOURCE_ENFORCED,
         SOURCE_LABELS,
         ActivityDecision,
         PromptInput,
@@ -204,7 +304,9 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         ScheduleFacts,
         build_prompt,
         in_window,
+        is_asleep,
         is_known_activity,
+        on_sick_leave,
         parse_response,
         parse_schedule_window,
         parse_window,
@@ -247,6 +349,9 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         record_user_message,
     )
     from life_sim import (
+        CARE_EMOTION_GAIN,
+        DEFAULT_CARE_PATTERNS,
+        MEDICINE_EMOTION_GAIN,
         LifeState,
         SimConfig,
         active_materials,
@@ -254,13 +359,21 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         activity_minutes,
         append_social_event,
         apply_activity,
+        attribution_lines,
         awake_hours_today,
         can_switch,
+        care_hit,
+        cold_stage,
         date_context,
         date_factor,
         day_key_of,
+        build_enforce_policy,
+        enforce,
         enforce_and_apply,
-        health_label,
+        enforce_facts,
+        health_label_admin,
+        health_label_prompt,
+        impact_scale,
         is_cold,
         local_datetime,
         mark_ask_skipped,
@@ -268,13 +381,86 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         mark_llm_success,
         material_effective_count,
         new_state,
+        parse_care_patterns,
         parse_festival_lines,
         parse_mmdd,
         pointless_ask_reason,
         recent_event_tiers,
+        register_care,
         settle,
         should_reseed,
         sleep_hours_today,
+        take_medicine,
+    )
+    from life_physio import (
+        active_windows as physio_active_windows,
+        eat_amount,
+        need_snack,
+        parse_meal_lines,
+        proposal_for as physio_proposal,
+        settle_satiety,
+    )
+    from life_calendar import (
+        Calendar,
+        builtin_calendar,
+        load_calendar_file,
+    )
+    from life_mood import (
+        MoodPolicy,
+        battery_gate,
+        clamp_mood,
+        evolve as mood_evolve,
+        injection_lines as mood_injection_lines,
+        note_proactive_cost,
+        prompt_lines as mood_prompt_lines,
+    )
+    from life_relations import (
+        decay_all as relations_decay_all,
+        emotion_factor as relation_emotion_factor,
+        emotion_curve as relation_emotion_curve,
+        prompt_lines as relations_prompt_lines,
+        should_record as relation_should_record,
+        tier_of as relation_tier,
+        threshold_multiplier as relation_threshold_multiplier,
+        touch as relation_touch,
+    )
+    from life_dream import (
+        DREAM_MIN_SLEEP_MINUTES,
+        dream_prompt,
+        material as dream_material,
+        mood_bucket as dream_mood_bucket,
+        recent_event as dream_recent_event,
+        roll_dream as dream_roll,
+        sanitize_dream as dream_sanitize,
+        template_text as dream_template,
+    )
+    from life_motives import (
+        greeting_material,
+        key_of as motive_key_of,
+        relation_materials as motive_relation_materials,
+        share_material as motive_share_material,
+        stamp as motive_stamp,
+    )
+    from life_interrupt import (
+        CHATTING as INTERRUPT_CHATTING,
+        apply_interrupt as interrupt_apply,
+        context_fact as interrupt_context_fact,
+        expire_interrupt as interrupt_expire,
+        expire_note as interrupt_expire_note,
+        in_interrupt_window as interrupt_in_window,
+        pointless_reason as interrupt_pointless_reason,
+        should_interrupt as interrupt_should,
+    )
+    from life_routines import (
+        ROUTINE_FIRED,
+        ROUTINE_PENDING,
+        ROUTINE_SKIPPED,
+        RoutineContext,
+        active_lines,
+        decision_for as routine_decision,
+        parse_routine_lines,
+        pick_pending,
+        roll_weight,
     )
     from life_social import (
         IntakeContext,
@@ -284,6 +470,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         intake_digest,
         intake_live,
         live_signal,
+        loneliness_factor,
         parse_digest,
         prune_daily,
         prune_seen,
@@ -293,6 +480,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         social_lines,
         unavailable as social_unavailable,
     )
+    from life_store import open_store
     from life_world import (
         LiveStatus,
         NewcomerSource,
@@ -318,15 +506,49 @@ __plugin_id__ = "org.orge-8.life-frequency"
 
 logger = logging.getLogger(f"plugin.{__plugin_id__}")
 
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+#: 命令正则（v1.14.0 抽成常量：``/生活 送药`` 与独立 ``/送药`` 的**互斥性**要靠
+#: 测试钉住——宿主的命令匹配是「第一个命中的组件赢」，两条正则同时命中同一个
+#: 消息时行为就取决于注册顺序，那是最难排查的一类静默失效）。
+#:
+#: ⚠ 两条**刻意不重叠**：``LIFE_STATE_PATTERN`` 要求出现「生活」，而
+#: ``MEDICINE_COMMAND_PATTERN`` 只认不带「生活」的 ``/送药`` 形态。
+#: 「/生活 送药」由 ``cmd_life_state`` 的 sub 分支统一处理（它也有兜底）。
+LIFE_STATE_PATTERN = (
+    r"^\s*(?:@\S+\s*|\[[^\]]*\]\s*)*[/／]?生活(?:\s+(?P<sub>\S*))?\s*$"
+)
+MEDICINE_COMMAND_PATTERN = (
+    r"^\s*(?:@\S+\s*|\[[^\]]*\]\s*)*[/／]\s*(?:送药|送点药|送吃的)\s*$"
+)
+#: ``cmd_life_state`` 里走送药分支的子命令名。
+MEDICINE_SUBS: tuple[str, ...] = ("送药", "送点药", "送吃的")
+
+#: 两顿「同一餐」的最小间隔（秒，v1.17.0 PR-ROU-1）：习惯行（``physio=true``）与
+#: ``[physio] meals`` 窗口常常重叠（用户把三餐写进习惯表就是这种用法），两条路
+#: 各回一次饱 = 一顿饭回两次血。相邻真餐的间隔 ≥ 3 小时（07 早 / 12 午 / 18 晚），
+#: 所以取 180 分钟：比它更近的进餐按「同一顿」处理——活动照旧（她就是在吃），
+#: 只是不重复回饱、不重复计数。
+MEAL_INTAKE_MIN_GAP_SECONDS = 180 * 60.0
+
+SUPPORTED_CONFIG_VERSION = "1.6.0"
 """``[plugin].config_version`` 的默认值（宿主硬性要求，缺失即加载失败）。
 
-⚠ 这是**配置 schema 的版本**，不是插件版本：新增「带默认值」的字段（v1.1.x–v1.3.x
-的每次配置扩展都是这种）**不需要**动它，只有做「旧配置必须迁移」的不兼容改动才递增。
-别跟着 `_manifest.json` 的 version 走——两者含义不同（这里的注释在 v1.1.x 起就是错的）。"""
+⚠ 这是**配置 schema 的版本**，不是插件版本。v1.14.0 递增到 1.1.0（病程字段）、
+v1.16.0 到 1.2.0（`fatigue_ramp_curve`）、v1.16.1 到 1.3.0（回归/惯性/余波/节律）、
+v1.16.2 到 1.4.0（体力耦合 + 内心维度通道）、v1.16.3 到 1.5.0（冲击边际效用 +
+关系系数）、v1.17.0 到 1.6.0（`[schedule] honor_calendar` / `daily_jitter_minutes` /
+`overtime_probability`）的原因有实测依据（见 runtime-gotchas §7.0.1）：宿主只在**文件不存在**时
+才初始化 ``config.toml``；版本号相同时配置**完全不写回**。⇒ 新增字段若不 bump，
+已部署实例的 ``config.toml`` 里永远不会出现这些键（行为按 pydantic 默认值跑，但用户
+在 WebUI / 文件里看不到、也无从调整）。bump 后宿主的重建语义是「新默认值为骨架 +
+旧值覆盖」，只补新增字段、不动已存在字段的值——**所以新增字段必须带默认值，且不改
+老字段的默认值**。别跟着 `_manifest.json` 的 version 走，两者含义不同。"""
 
 DEFAULT_ACTIVITY_FACTOR_LINES = [
     "sleep=0.0",
+    # v1.15.0（PR-R1）：小睡也是睡——同样「完全静默」。真正的静默由
+    # ``compute_adjust`` 的硬闸保证（因子路径会被素材加成抬起来），这一行是
+    # 因子表可读性与 replace 模式缺键告警的依据。
+    "nap=0.0",
     "sick_rest=1.0",
     "before_sleep=1.15",
     # v1.3.0 加入的工作表活动：有固定作息的角色不再只能靠场景文字「假装」在上班
@@ -342,10 +564,57 @@ DEFAULT_ACTIVITY_FACTOR_LINES = [
     "anime=0.75",
     "daze=0.6",
     "daily=1.0",
+    # v1.9.1（physio）：吃饭时话不多、洗澡时几乎不说话
+    "meal=0.8",
+    "bath=0.5",
+    # v1.11.1（interrupt）：正在回消息，话最不该少——这是她唯一理直气壮多说几句的时刻
+    "chatting=1.1",
 ]
 DEFAULT_HEALTH_FACTOR_LINES = ["healthy=1.0", "cold=0.3", "sleep_deprived=0.9"]
+#: 病程阶段因子（v1.14.0）：初起 0.7（还能做事，话没那么少）、加重 0.15（几乎只剩养病）、
+#: 好转 0.5。与 ``DEFAULT_HEALTH_FACTOR_LINES`` 的 ``cold`` 是**替代关系**：
+#: 阶段表生效时 ``cold`` 不再参与（避免双重抑制），只有阶段表缺失时才回退它。
+DEFAULT_COLD_STAGE_FACTOR_LINES = ["onset=0.7", "worsening=0.15", "recovering=0.5"]
+DEFAULT_PHYSIO_MEAL_LINES = [
+    # 三餐时间窗（半开区间）。weight < 1.0 = 偶尔不吃那一顿——天天分秒不差吃三顿也是机器
+    "07:00-08:30|早餐|meal|weight=0.9",
+    "12:00-13:30|午餐|meal|weight=1.0",
+    "18:00-19:30|晚餐|meal|weight=1.0",
+    "22:00-23:30|洗澡|bath|weight=0.8",
+]
 DEFAULT_MOOD_CURVE_LINES = ["0=0.55", "5=0.95", "10=1.35"]
 DEFAULT_ENERGY_CURVE_LINES = ["0=0.50", "5=0.85", "10=1.25"]
+#: 清醒疲劳曲线（v1.16.0 M1）：清醒小时 → **额外**每小时体力消耗。12 小时以内不额外
+#: 掉体力（正常的一天不被惩罚），之后分段线性加重。标定依据见 README 与方案 §3 M1：
+#: 清闲日（daze/daily ≈ -0.3/h）从 8.0 出发，16 小时后 ≈ 2.6，自然触到入睡阈值 3.0。
+#: 空列表 = 关闭 = 与加这一层之前逐位一致。
+DEFAULT_FATIGUE_RAMP_LINES = ["12=0", "16=-0.15", "20=-0.4", "24=-0.7"]
+#: 日内节律曲线（v1.16.1 M4a）：**本地时刻分钟** → 基线偏移。05:00 最低落、13:00 略高、
+#: 20:00 最高、23:00 归零。幅度刻意压在 ±0.3（对情绪因子影响 ≤ ±0.06 ≈ 4%——氛围层，
+#: 不是数值层；方案决议 5 拍板「默认不放宽」，想要强体感就自己改这条曲线）。
+#: 空列表 = 关闭 = 基线不随时刻浮动（与 v1.15.0 逐位一致）。
+DEFAULT_DIURNAL_CURVE_LINES = ["300=-0.3", "780=0.15", "1200=0.3", "1380=0"]
+#: 孤独 → 社交情绪系数曲线（v1.16.2 M3b）：孤独 ≤2 → ×0.8（被爱包围、对打扰钝感），
+#: ≥7 → ×1.5（很想有人陪），其间线性。**不追求中性锚点**：孤独是状态不是身份，
+#: 开箱时孤独基线 4.0 ⇒ 系数约 1.08，属于本版有意的行为变更（关掉即回旧行为）。
+DEFAULT_LONELINESS_SOCIAL_LINES = ["2=0.8", "7=1.5"]
+#: 情绪冲击的边际效用曲线（v1.16.3 M6）：`当前情绪=系数`。低谷雪中送炭、高涨快乐麻木；
+#: 负向反过来（低谷麻木、高涨落差）。两端点外取端点值（interpolate 不平外推）。
+DEFAULT_IMPACT_POSITIVE_LINES = ["2=1.3", "5=1.0", "8=0.7"]
+DEFAULT_IMPACT_NEGATIVE_LINES = ["2=0.7", "5=1.0", "8=1.2"]
+#: 上面两条曲线的**解析形态**（SimConfig 字段是点集，不是字符串行）。配置解析失败时
+#: 回退它们，而不是回退成空曲线——空曲线会让「边际效用开着却恒等于 1.0」这种
+#: 「配置写坏了、功能静默消失」的形态又出现一次。
+DEFAULT_IMPACT_POSITIVE_CURVE = ((2.0, 1.3), (5.0, 1.0), (8.0, 0.7))
+DEFAULT_IMPACT_NEGATIVE_CURVE = ((2.0, 0.7), (5.0, 1.0), (8.0, 1.2))
+#: 社交情绪的**关系系数**曲线（v1.16.3 M7）：`熟悉度=系数`。中性锚点钉在陌生人身上
+#: （决议 3）：没有档案 → 1.0 = 与升级前逐位一致，偏离只随关系加深单向发生。
+DEFAULT_RELATION_EMOTION_LINES = ["20=1.0", "50=1.2", "80=1.5"]
+#: 关系系数上限（决议 3：单向只放大、封顶 1.5）
+RELATION_EMOTION_CAP = 1.5
+#: 内存熟悉度索引（v1.16.3 M7）的条数上限。正常远小于它（档案上限 200），
+#: 超出时按插入顺序丢最早的——索引只是加速器，丢了最多让某人这一轮按陌生人算。
+_RELATION_INDEX_LIMIT = 500
 DEFAULT_QUIET_HOURS_LINES = ["23:30-08:00"]
 DEFAULT_PROACTIVE_QUIET_LINES = ["00:00-08:00"]
 ALLOWED_FILTER_MODES = ("all", "whitelist", "blacklist")
@@ -370,6 +639,18 @@ _SOCIAL_INBOX_LIMIT = 200
 # 10^4/天 量级的无用 RPC 与宿主 warning。
 _UNBACKED_MAX_SECONDS = 24 * 3600.0
 #: 宿主对账记忆里要落盘的字段（与生活状态分开存，见 _save_state）
+#: 电量临界的阈值上浮（方案七 §7.3：2.0–4.0 → score 阈值 +0.5 档）
+_BATTERY_THRESHOLD_PENALTY = 0.5
+
+
+def _dc_replace_rules(rules: Any, *, score_threshold: float) -> Any:
+    """复制一个 ``ProactiveRules``，只改阈值（dataclass 的 ``replace``）。"""
+
+    from dataclasses import replace as _replace
+
+    return _replace(rules, score_threshold=score_threshold)
+
+
 _MEMORY_FIELDS = (
     "applied", "foreign", "observed", "unbacked", "unbacked_target", "unbacked_strikes",
 )
@@ -525,12 +806,80 @@ class SimulationConfig(PluginConfigBase):
     energy_full_wake: bool = Field(
         default=True,
         description=(
-            "睡眠中体力恢复到上限（动态值：连熬 3 晚后是 8.5）就**立刻**强制唤醒"
-            "（感冒醒到养病），不再要求睡满最短时长。睡觉的目的是恢复体力，满了继续躺只是空转；"
-            "关掉则回到「模型提议醒 / 睡满每日上限」两条路。"
-            "注意：若模型在她满体力时仍反复提议睡觉且处于睡眠窗口内，会出现睡下即被唤醒的短周期往复"
+            "睡眠中体力恢复到上限（动态值：连熬 3 晚后是 8.5）就强制唤醒（感冒醒到养病）。"
+            "睡觉的目的是恢复体力，满了继续躺只是空转；"
+            "关掉则回到「模型提议醒 / 睡满每日上限」两条路"
         ),
-        json_schema_extra={"label": "体力满立刻唤醒", "order": 10},
+        json_schema_extra={"label": "体力满唤醒", "order": 10},
+    )
+    energy_full_wake_min_hours: float = Field(
+        default=6.5,
+        description=(
+            "体力满唤醒的**最短睡眠目标**（小时，v1.15.0）：睡不满它就算体力已满也继续睡。"
+            "0 = 旧行为（体力一回满立刻醒）。默认 6.5 比熬夜阈值（默认 5 小时）高，"
+            "这样才能断开「熬夜压低体力上限 → 睡得更短 → 债更还不清」的正反馈；"
+            "睡觉不是充电，真人按钟点睡而不是按电量睡"
+        ),
+        json_schema_extra={"label": "最短睡眠目标（小时）", "order": 11, "step": 0.5},
+    )
+    rest_day_sleep_extension_minutes: int = Field(
+        default=60,
+        description=(
+            "休息日（法定节假日 / 班表休息日）在最短睡眠目标上额外顺延的分钟数；"
+            "0 = 不区分休息日。需要同时有「最短睡眠目标 > 0」才有效"
+        ),
+        json_schema_extra={"label": "休息日多睡（分钟）", "order": 12, "step": 15},
+    )
+    routine_can_wake: bool = Field(
+        default=False,
+        description=(
+            "习惯表命中时能不能把她从睡眠里叫起来（v1.15.0）。默认**关** = 睡眠优先："
+            "习惯是她清醒时的骨架，不是闹钟；打开 = 恢复 v1.14.x 的旧行为"
+            "（睡满最短睡眠时长后，07:00「起床洗漱」这类习惯会把她叫醒）"
+        ),
+        json_schema_extra={"label": "习惯表可以叫醒她", "order": 13},
+    )
+    physio_can_wake: bool = Field(
+        default=False,
+        description=(
+            "生理窗（三餐/洗澡）命中时能不能把她叫起来（v1.15.0）。"
+            "默认**关** = 睡着的她不会被「该吃早饭了」叫醒（睡过头就当错过这一顿，"
+            "醒来后窗口内仍能补上）；打开 = 恢复 v1.14.x 的旧行为"
+        ),
+        json_schema_extra={"label": "三餐窗可以叫醒她", "order": 14},
+    )
+    wake_daze_minutes: int = Field(
+        default=15,
+        description=(
+            "长睡眠（≥3 小时）醒来先「赖床」的分钟数（v1.15.0）：这段时间里她不会被硬约束"
+            "立刻送回床，也不会被最短停留期钉住。同一个窗口也被「夜间易醒」复用；"
+            "0 = 关闭（醒来直接进日常）"
+        ),
+        json_schema_extra={"label": "醒后赖床（分钟）", "order": 15, "step": 5},
+    )
+    nap_enabled: bool = Field(
+        default=True,
+        description=(
+            "启用「小睡」（v1.15.0）：白天（睡眠时段之外）精力低时眯一会儿，"
+            "最多 `小睡上限` 分钟、体力恢复比睡觉弱、不做梦；睡着时同样完全静默。"
+            "关掉后模型看不到这个选项，行为与升级前一致"
+        ),
+        json_schema_extra={"label": "启用小睡", "order": 16},
+    )
+    nap_max_minutes: int = Field(
+        default=90,
+        description="单次小睡的时长上限（分钟）；到了就叫醒她",
+        json_schema_extra={"label": "小睡上限（分钟）", "order": 17, "step": 10},
+    )
+    nap_min_minutes: int = Field(
+        default=20,
+        description="单次小睡的最短时长（分钟）；刚眯下不会被马上叫起来",
+        json_schema_extra={"label": "小睡最短（分钟）", "order": 18, "step": 5},
+    )
+    nap_energy_threshold: float = Field(
+        default=4.0,
+        description="体力低于它（或生病）才会小睡；精神好时提议小睡会被拒绝",
+        json_schema_extra={"label": "小睡体力阈值", "order": 19, "step": 0.5},
     )
     wake_on_at: bool = Field(
         default=True,
@@ -541,15 +890,50 @@ class SimulationConfig(PluginConfigBase):
             "让这条 @ 真的被看见。只在 `activity = sleep` 时生效，`[frequency] quiet_hours`"
             "（你自己设的静默时段）不受影响；关掉即回到「睡就是睡」"
         ),
-        json_schema_extra={"label": "睡眠时被 @ 唤醒", "order": 11},
+        json_schema_extra={"label": "睡眠时被 @ 唤醒", "order": 20},
     )
     wake_minutes: int = Field(
         default=10,
         description=(
-            "被 @ 唤醒后保持清醒的分钟数；窗口内再来 @ 只顺延窗口、不重复写宿主。"
+            "被 @ 唤醒后保持清醒的分钟数；窗口内再来消息只顺延窗口、不重复写宿主。"
             "窗口结束且她仍在睡就自动回到静默（不需要再写一次 0）"
         ),
-        json_schema_extra={"label": "唤醒保持（分钟）", "order": 12, "step": 5},
+        json_schema_extra={"label": "唤醒保持（分钟）", "order": 21, "step": 5},
+    )
+    wake_on_private: bool = Field(
+        default=False,
+        description=(
+            "睡眠中被**私聊**也叫醒她（v1.15.0）。默认关 = 「睡就是睡」的旧行为"
+            "（私聊没有 @ 这个概念，所以原来私聊完全叫不醒）；"
+            "打开后唤醒判据与打断机制对齐（私聊任意消息 / 群聊被 @）。"
+            "`[frequency] quiet_hours` 与暂停仍然优先"
+        ),
+        json_schema_extra={"label": "私聊也叫醒她", "order": 23},
+    )
+    wake_extend_on_message: bool = Field(
+        default=True,
+        description=(
+            "唤醒窗口内对方继续说话就顺延窗口（v1.15.0）：她回了一句、对方接着聊，"
+            "不因为「没再 @ 她」而 10 分钟后突然断线。只顺延、不重复写宿主"
+        ),
+        json_schema_extra={"label": "对话顺延唤醒窗口", "order": 24},
+    )
+    wake_max_extensions_minutes: int = Field(
+        default=30,
+        description=(
+            "一次被叫醒后最多保持清醒的分钟数（从第一次唤醒算起，v1.15.0）。"
+            "防止活跃群里每 5 分钟一句话把窗口无限顺延、她整夜不睡；"
+            "0 = 不设上限"
+        ),
+        json_schema_extra={"label": "唤醒总时长上限（分钟）", "order": 25, "step": 5},
+    )
+    wake_grumpy_note: bool = Field(
+        default=True,
+        description=(
+            "被吵醒的质感（v1.15.0）：睡下没多久（<2 小时）就被叫醒时，"
+            "给回复提示词补一句「刚睡下没多久，还有点迷糊」"
+        ),
+        json_schema_extra={"label": "被吵醒的语气", "order": 26},
     )
 
 
@@ -589,6 +973,16 @@ class ActivityLLMConfig(PluginConfigBase):
         default=600,
         description="两次活动决策之间的最小间隔（秒）；默认与推进间隔一致",
         json_schema_extra={"label": "决策最小间隔（秒）", "order": 4, "step": 60},
+    )
+    sleep_interval_seconds: int = Field(
+        default=1800,
+        description=(
+            "**睡眠中**的决策间隔（秒，v1.15.0）。睡满最短睡眠时长后到醒来之间，"
+            "模型能做的有效决定只有「要不要提前醒」，而按 10 分钟一轮问一夜等于白烧"
+            "token（每晚 18–30 次）。默认 30 分钟一轮；0 = 睡眠中完全不问模型"
+            "（醒来交给体力满 / 睡眠上限 / 最短睡眠目标这些确定性条件）"
+        ),
+        json_schema_extra={"label": "睡眠中决策间隔（秒）", "order": 20, "step": 60},
     )
     fail_streak_limit: int = Field(
         default=3,
@@ -728,6 +1122,36 @@ class ScheduleConfigModel(PluginConfigBase):
         description="冷启动 / 规则表在「在岗」相位使用的场景文本；留空用通用的「在工作」",
         json_schema_extra={"label": "在岗场景（可选）", "order": 6, "rows": 2, "x-widget": "textarea"},
     )
+    honor_calendar: bool = Field(
+        default=True,
+        description=(
+            "班表吃日历（v1.17.0）：法定节假日算休息日、调休的周末算上班日。"
+            "关掉 = 退回「只按星期判定」（国庆长假会照常算工作日）——v1.16.3 的旧行为"
+        ),
+        json_schema_extra={"label": "按日历判定工作日", "order": 7},
+    )
+    daily_jitter_minutes: int = Field(
+        default=0,
+        description=(
+            "按生活日的班表微扰（分钟，v1.17.0）：窗口整体前后平移这么多分钟，"
+            "让她的上下班钟点不至于天天分秒不差。同一天恒定（确定性派生），"
+            "0 = 关。上限 60"
+        ),
+        json_schema_extra={"label": "班表按日微扰（分钟）", "order": 8, "step": 5},
+    )
+    overtime_probability: float = Field(
+        default=0.0,
+        description=(
+            "加班日概率（0–1，v1.17.0）：命中则当天下班端顺延下面那项分钟数，"
+            "提示词写「今天要加班」。0 = 关"
+        ),
+        json_schema_extra={"label": "加班日概率", "order": 9, "step": 0.05},
+    )
+    overtime_extra_minutes: int = Field(
+        default=60,
+        description="加班日下班端顺延的分钟数（仅加班日生效；上限 480）",
+        json_schema_extra={"label": "加班顺延（分钟）", "order": 10, "step": 15},
+    )
 
 
 class ActivityConfig(PluginConfigBase):
@@ -756,6 +1180,15 @@ class ActivityConfig(PluginConfigBase):
         default=8.0,
         description="每日清醒下限（小时）；不够就拒绝入睡，防止模型一累就让她睡",
         json_schema_extra={"label": "每日清醒下限（小时）", "order": 3, "step": 0.5},
+    )
+    sleep_hard_floor: float = Field(
+        default=0.5,
+        description=(
+            "体力低到这条线以下时**无视模型提议**强制入睡（v1.15.0）。"
+            "0 = 关闭。原来只兜住了「模型没输出」那条路，模型一直提议别的事时"
+            "她可以被按在 0 体力上熬夜"
+        ),
+        json_schema_extra={"label": "体力耗尽强制入睡", "order": 8, "step": 0.1},
     )
     reseed_after_hours: float = Field(
         default=8.0,
@@ -862,26 +1295,163 @@ class EmotionEnergyConfig(PluginConfigBase):
         description="惯性期后每个推进间隔向基线回归多少分（0–10 制）",
         json_schema_extra={"label": "每次回归（分）", "order": 1, "step": 0.05},
     )
+    recover_ratio_per_tick: float = Field(
+        default=0.08,
+        description=(
+            "比例回归（v1.16.1）：每个推进间隔消除「与基线差距」的固定比例。"
+            "真人的情绪是**爆发快消、余味长**——极端情绪初期回落快、快回到基线时变慢，"
+            "固定步长做不到这一点。**设 0 = 回到「每次回归多少分」的旧线性行为**"
+            "（此时上面的 `每次回归（分）` 生效）"
+        ),
+        json_schema_extra={"label": "比例回归（每 tick 消除比例）", "order": 2, "step": 0.01},
+    )
+    recover_min_step: float = Field(
+        default=0.05,
+        description=(
+            "比例回归的每 tick 最小步长（0 = 不设下限）。没有它，「距基线 0.01」时"
+            "比例步长会小到浮点精度以下、情绪尾巴永远擦不干净"
+        ),
+        json_schema_extra={"label": "比例回归最小步长", "order": 3, "step": 0.01},
+    )
     sleep_recover_multiplier: float = Field(
         default=2.0,
         description="睡眠期间情绪恢复的倍数（参考设定：睡眠时恢复加倍）",
-        json_schema_extra={"label": "睡眠恢复倍数", "order": 2, "step": 0.5},
+        json_schema_extra={"label": "睡眠恢复倍数", "order": 4, "step": 0.5},
+    )
+    inertia_scale_enabled: bool = Field(
+        default=True,
+        description=(
+            "惯性期按冲击大小缩放（v1.16.1）：`惯性期 × |情绪增量|`，钳进下面的上下限。"
+            "「笔没水了」（-0.3）冻结 12 分钟、「生日」（+1.5）冻结 60 分钟，"
+            "而不是所有事都冻结 40 分钟。关掉 = 旧行为（一律固定惯性期）"
+        ),
+        json_schema_extra={"label": "惯性期按冲击缩放", "order": 5},
+    )
+    inertia_scale_min_minutes: int = Field(
+        default=5,
+        description="惯性期缩放的**下限**（分钟）：再小的事也让她缓一会儿",
+        json_schema_extra={"label": "惯性缩放下限（分钟）", "order": 6, "step": 1},
+    )
+    inertia_scale_max_minutes: int = Field(
+        default=90,
+        description=(
+            "惯性期缩放的**上限**（分钟）：防止一次大冲击把情绪冻住半天。"
+            "取值为「本值与惯性期上限的较大者」——把惯性期配得比它还长时不会反被缩短"
+        ),
+        json_schema_extra={"label": "惯性缩放上限（分钟）", "order": 7, "step": 5},
     )
     afterglow_span_hours: float = Field(
         default=24.0,
         description="情绪余波统计窗口（小时）",
-        json_schema_extra={"label": "余波窗口（小时）", "order": 3, "step": 1},
+        json_schema_extra={"label": "余波窗口（小时）", "order": 8, "step": 1},
     )
     afterglow_cap: float = Field(
         default=0.6,
         description="余波对基线的最大偏移（±）；防止连续坏事把她永久压哑",
-        json_schema_extra={"label": "余波上限（±分）", "order": 4, "step": 0.1},
+        json_schema_extra={"label": "余波上限（±分）", "order": 9, "step": 0.1},
+    )
+    afterglow_decay: bool = Field(
+        default=True,
+        description=(
+            "余波按年龄线性衰减（v1.16.1）：`权重 = 1 − 事件年龄/窗口`，23 小时前的事"
+            "几乎不留痕，也不再在出窗那一刻**跳变**消失（仓库里的「最佳保鲜相位」"
+            "就是这个思路）。关掉 = 旧等权（窗口内一视同仁）"
+        ),
+        json_schema_extra={"label": "余波按年龄衰减", "order": 10},
+    )
+    afterglow_gain: float = Field(
+        default=0.0,
+        description=(
+            "余波折算系数。**0 = 自动**：衰减开时 0.30、关时 0.15——等权改成衰减后"
+            "有效总量约减半，系数要翻倍才能维持同等稳态余波。显式给值则以本值为准"
+        ),
+        json_schema_extra={"label": "余波折算系数（0 = 自动）", "order": 11, "step": 0.05},
+    )
+    fatigue_ramp_curve: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_FATIGUE_RAMP_LINES),
+        description=(
+            "清醒疲劳曲线（v1.16.0）：每行 `清醒小时=额外体力/小时`（负值），分段线性。"
+            "她自己也会困——原来是「体力只由活动表决定」，清闲的一天永远掉不到入睡阈值，"
+            "于是「困意」完全由睡眠窗口驱动而不是身体驱动。12 小时以内建议给 0（不惩罚"
+            "正常的一天）。**清空 = 关闭 = 与升级前逐位一致**"
+        ),
+        json_schema_extra={"label": "清醒疲劳曲线（小时=体力/小时）", "order": 12, "rows": 4,
+                           "placeholder": "12=0\n16=-0.15\n20=-0.4\n24=-0.7"},
+    )
+    emotion_fatigue_penalty: float = Field(
+        default=0.3,
+        description=(
+            "疲劳压低情绪基线（v1.16.2）：`体力低于阈值` 时基线下移"
+            " `本值 × (阈值 − 体力)`（体力 1 → −0.6、体力 0 → −0.9）。"
+            "⚠ 这是「身体状态不直接进倍率」纪律的**唯一开口**（方案决议 1）：体力因子"
+            "说的是「没力气说话」，基线下移说的是「累到不想说话」，两者是不同机制。"
+            "**0 = 关闭（旧行为）**"
+        ),
+        json_schema_extra={"label": "疲劳压情绪的系数（0 = 关闭）", "order": 14, "step": 0.05},
+    )
+    emotion_fatigue_threshold: float = Field(
+        default=3.0,
+        description="体力低于它才开始压低情绪基线",
+        json_schema_extra={"label": "疲劳压情绪的体力阈值", "order": 15, "step": 0.5},
+    )
+    low_energy_drain_multiplier: float = Field(
+        default=1.25,
+        description=(
+            "低体力消耗放大（v1.16.2）：体力低于阈值时**负的**体力变化 ×本值"
+            "（只放大消耗，不碰恢复项）——越累越容易更累的软恶性循环，把她推向休息。"
+            "**1.0 = 关闭（旧行为）**"
+        ),
+        json_schema_extra={"label": "低体力消耗放大（1.0 = 关闭）", "order": 16, "step": 0.05},
+    )
+    low_energy_threshold: float = Field(
+        default=3.0,
+        description="体力低于它才开始放大消耗",
+        json_schema_extra={"label": "低体力放大阈值", "order": 17, "step": 0.5},
+    )
+    emotion_impact_scaling: bool = Field(
+        default=True,
+        description=(
+            "情绪冲击的边际效用（v1.16.3）：低谷时雪中送炭（正向 ×1.3）、高涨时快乐麻木"
+            "（正向 ×0.7）、从高处跌落更疼（负向 ×1.2）、麻木时再挨一下没那么疼"
+            "（负向 ×0.7）。作用在事件 / 日期 / 社交三条通道的情绪增量上。"
+            "**关掉 = 增量原样进出（旧行为）**"
+        ),
+        json_schema_extra={"label": "情绪冲击边际效用", "order": 20},
+    )
+    impact_positive_curve: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_IMPACT_POSITIVE_LINES),
+        description="正向增量曲线（每行 `当前情绪=系数`，分段线性、端点外取端点值）",
+        json_schema_extra={"label": "正向冲击曲线（情绪=系数）", "order": 21, "rows": 3,
+                           "placeholder": "2=1.3\n5=1.0\n8=0.7"},
+    )
+    impact_negative_curve: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_IMPACT_NEGATIVE_LINES),
+        description="负向增量曲线（每行 `当前情绪=系数`）",
+        json_schema_extra={"label": "负向冲击曲线（情绪=系数）", "order": 22, "rows": 3,
+                           "placeholder": "2=0.7\n5=1.0\n8=1.2"},
+    )
+
+    _norm_impact_positive = _str_list_validator("impact_positive_curve")
+    _norm_impact_negative = _str_list_validator("impact_negative_curve")
+    baseline_diurnal_curve: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_DIURNAL_CURVE_LINES),
+        description=(
+            "日内节律曲线（v1.16.1）：每行 `本地时刻分钟=基线偏移`（分段线性）。"
+            "清晨低落、傍晚松弛——她一天 24 小时的「底色」不再是一条直线。"
+            "默认幅度 ±0.3（对倍率影响约 4%，是氛围不是数值）；"
+            "**清空 = 关闭 = 与升级前逐位一致**"
+        ),
+        json_schema_extra={"label": "日内节律曲线（分钟=基线偏移）", "order": 13, "rows": 4,
+                           "placeholder": "300=-0.3\n780=0.15\n1200=0.3\n1380=0"},
     )
     curves: CurvesConfig = Field(
         default_factory=CurvesConfig,
         description="两套曲线按宿主模式自动选：frequency = 计数门，reply_necessity = 评分门",
-        json_schema_extra={"label": "情绪体力曲线（按宿主模式）", "order": 5},
+        json_schema_extra={"label": "情绪体力曲线（按宿主模式）", "order": 14},
     )
+
+    _norm_fatigue_ramp = _str_list_validator("fatigue_ramp_curve")
+    _norm_diurnal = _str_list_validator("baseline_diurnal_curve")
 
 
 class FrequencyConfig(PluginConfigBase):
@@ -968,6 +1538,15 @@ class HealthConfig(PluginConfigBase):
         description="连熬几夜后压低体力上限",
         json_schema_extra={"label": "连熬夜数", "order": 1, "step": 1},
     )
+    sleep_debt_recovery_step: int = Field(
+        default=1,
+        description=(
+            "一晚「睡够了」清掉几晚熬夜债（v1.15.0，默认 1 = 滞回：连熬三晚要三个好觉"
+            "才还清）。0 = 旧行为（一晚直接归零）。旧行为与「体力满即醒」叠加时，"
+            "她会在「熬夜 → 上限被压低 → 睡得更短」之间反复"
+        ),
+        json_schema_extra={"label": "每晚还几晚债", "order": 2, "step": 1},
+    )
     sleep_deprived_energy_cap: float = Field(
         default=8.5,
         description="连熬之后的体力上限（参考设定：降到 8.5）",
@@ -1003,8 +1582,65 @@ class HealthConfig(PluginConfigBase):
         description="每多一晚熬夜、以及体力很低时，各自增加的风险",
         json_schema_extra={"label": "熬夜/低体力风险增量", "order": 8, "step": 0.01},
     )
+    cold_stage_factors: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_COLD_STAGE_FACTOR_LINES),
+        description=(
+            "病程阶段因子，每行一组 \"阶段=因子\"（onset 初起 / worsening 加重 / "
+            "recovering 好转）。轻症与病重不再同一个压制值；留空则回退「健康因子」里的 cold"
+        ),
+        json_schema_extra={"label": "病程阶段因子（每行一组）", "order": 9, "rows": 3},
+    )
+    cold_immunity_days: int = Field(
+        default=5,
+        description="痊愈后几天内不再掷中招骰子（0 = 关掉免疫期）",
+        json_schema_extra={"label": "病后免疫期（天）", "order": 10, "step": 1},
+    )
+    cold_convalescent_hours: int = Field(
+        default=24,
+        description=(
+            "病后余韵时长（小时）：这段时间不算生病，只是提示词与状态卡里带一句"
+            "「刚好利索，体力还没回来」（0 = 关掉）"
+        ),
+        json_schema_extra={"label": "病后余韵（小时）", "order": 11, "step": 1},
+    )
+    cold_care_daily_cap: int = Field(
+        default=2,
+        description=(
+            "每日计入病程流转的关心次数上限（别人说「你吃药了吗」这类句式）。"
+            "多出来的关心仍有情绪收益，但不再加速康复——0 = 关心不影响病程"
+        ),
+        json_schema_extra={"label": "每日关心计入上限", "order": 12, "step": 1},
+    )
+    cold_sick_leave: bool = Field(
+        default=True,
+        description=(
+            "病假：加重/好转期她请病假，班表的在岗约束对她挂起（提示词与强制层都不再"
+            "让她上班）。关掉 = 只有强制养病、没有病假说法"
+        ),
+        json_schema_extra={"label": "生病自动请病假", "order": 13},
+    )
+    cold_care_patterns: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_CARE_PATTERNS),
+        description=(
+            "关心句式正则表（每行一条）。默认要求「第二人称」（你吃药了吗）或"
+            "「叮嘱/询问句式」（多喝热水、好点了吗），防「我昨天也感冒了」「他感冒一礼拜了」"
+            "被当成关心；坏正则只告警并忽略。想更宽松可自己加行，例如 ^早点睡"
+        ),
+        json_schema_extra={"label": "关心句式（每行一条正则）", "order": 14, "rows": 3},
+    )
+    cold_season_factors: list[str] = Field(
+        default_factory=list,
+        description=(
+            "季节风险系数，每行一组 \"月份=倍率\"（如 1=1.5、7=0.7），留空 = 不启用。"
+            "启用后冬天更容易感冒，生病不再是均匀白噪声"
+        ),
+        json_schema_extra={"label": "季节风险系数（每行一组）", "order": 15, "rows": 3},
+    )
 
     _norm_health_factors = _str_list_validator("health_factors")
+    _norm_cold_stage_factors = _str_list_validator("cold_stage_factors")
+    _norm_cold_care_patterns = _str_list_validator("cold_care_patterns")
+    _norm_cold_season_factors = _str_list_validator("cold_season_factors")
 
 
 class DateConfig(PluginConfigBase):
@@ -1497,6 +2133,30 @@ class SocialConfig(PluginConfigBase):
         json_schema_extra={"label": "调用超时（秒）", "order": 15, "step": 5},
     )
 
+    # ---- 社交情绪按关系加权（v1.16.3 M7）----
+    relation_emotion_scaling: bool = Field(
+        default=True,
+        description=(
+            "熟人找她更开心（v1.16.3）：社交情绪按 `[relations]` 的熟悉度加权"
+            "（陌生 1.0 / 熟 1.2 / 亲密 1.5，单向只放大、封顶 1.5）。"
+            "**中性锚点钉在陌生人身上**（决议 3）：新装插件时 relations 没有任何数据、"
+            "所有人都是陌生 ⇒ 与升级前逐位一致，偏离只随关系加深发生。"
+            "仍受每日情绪额度约束（先缩放、再封顶）。关掉 = 所有人生效相同"
+        ),
+        json_schema_extra={"label": "社交情绪按关系加权", "order": 16},
+    )
+    relation_emotion_curve: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_RELATION_EMOTION_LINES),
+        description=(
+            "熟悉度 → 社交情绪系数（v1.16.3）：每行 `熟悉度=系数`，分段线性、"
+            "端点外取端点值；系数会被钳到 [1.0, 1.5]（单向只放大）"
+        ),
+        json_schema_extra={"label": "关系系数曲线（熟悉度=系数）", "order": 17, "rows": 3,
+                           "placeholder": "20=1.0\n50=1.2\n80=1.5"},
+    )
+
+    _norm_relation_emotion_curve = _str_list_validator("relation_emotion_curve")
+
 
 class WorldConfig(PluginConfigBase):
     """``[world]``：把「外面的世界」接成她的经历。
@@ -1631,6 +2291,424 @@ class WorldConfig(PluginConfigBase):
     )
 
 
+class CalendarConfig(PluginConfigBase):
+    """``[calendar]``：中国日历（v1.10.0）——法定节假日 / 调休 / 主要农历节日。
+
+    数据是**随插件分发的离线表**（``data/calendar.toml``），不是用户配置：
+    农历日期与调休安排任何算法都算不出来，只有国务院公布的表才可信。
+    ``extra`` 允许用户追加自己的重要日子（纪念日、生日级事件）。
+    """
+
+    __ui_label__ = "中国日历"
+    __ui_icon__ = "calendar"
+    __ui_order__ = 18
+
+    enabled: bool = Field(
+        default=True,
+        description="启用日历：节假日影响班表与提示词、节日进日期行与素材",
+        json_schema_extra={"label": "启用中国日历", "order": 0},
+    )
+    extra: list[str] = Field(
+        default_factory=list,
+        description=(
+            '追加自己的日子，每行 "YYYY-MM-DD|名称|kind"（kind: holiday=放假 / '
+            "festival=节日不放假 / workday_swap=调休上班，默认 festival）"
+        ),
+        json_schema_extra={
+            "label": "追加日期（每行一组）",
+            "order": 1,
+            "rows": 2,
+            "placeholder": "2026-05-20|纪念日|festival",
+        },
+    )
+
+    _norm_calendar_lists = _str_list_validator("extra")
+
+
+class MoodConfig(PluginConfigBase):
+    """``[mood]``：内心维度（stress / loneliness / social battery，v1.10.1）。
+
+    ⚠ 三者**只进 prompt / 素材 / 主动开口硬闸，不进倍率**——仓库纪律
+    （经济维度先例 +「不要双重抑制」）：倍率已有活动×情绪×体力三层调制。
+    """
+
+    __ui_label__ = "内心状态"
+    __ui_icon__ = "heart"
+    __ui_order__ = 19
+
+    enabled: bool = Field(
+        default=True,
+        description="启用内心维度：压力/孤独/社交电量（只影响她怎么说、何时开口，不影响频率倍率）",
+        json_schema_extra={"label": "启用内心维度", "order": 0},
+    )
+    inject_notice: bool = Field(
+        default=True,
+        description=(
+            "压力/孤独/电量过载时，向会话注入一条世界内的语气提示"
+            "（每天每会话至多一条；失败只降级）"
+        ),
+        json_schema_extra={"label": "消息风格注入", "order": 1},
+    )
+
+    stress_regress_per_tick: float = Field(
+        default=0.02, description="无事件时压力每 tick（10 分钟）向基线回归的步长",
+        json_schema_extra={"label": "压力回归步长", "order": 2, "step": 0.01},
+    )
+    stress_per_work_tick: float = Field(
+        default=0.05, description="工作/会议/加班/熬夜类活动每 tick 的压力上调",
+        json_schema_extra={"label": "工作压力增速", "order": 3, "step": 0.01},
+    )
+    stress_relief_per_sleep_tick: float = Field(
+        default=0.08, description="睡眠每 tick 的压力下调",
+        json_schema_extra={"label": "睡眠解压", "order": 4, "step": 0.01},
+    )
+    battery_per_message: float = Field(
+        default=0.05, description="每条入站消息消耗的社交电量",
+        json_schema_extra={"label": "消息耗电", "order": 5, "step": 0.05},
+    )
+    battery_per_mention: float = Field(
+        default=0.15, description="被 @ 一次消耗的社交电量（比普通消息累）",
+        json_schema_extra={"label": "被 @ 耗电", "order": 6, "step": 0.05},
+    )
+    battery_per_proactive: float = Field(
+        default=0.3, description="她主动开口一次消耗的社交电量",
+        json_schema_extra={"label": "主动开口耗电", "order": 7, "step": 0.05},
+    )
+
+    # ---- 睡眠的情绪侧（v1.15.0，PR-R2）----
+    insomnia_enabled: bool = Field(
+        default=True,
+        description=(
+            "入睡困难（v1.15.0）：压力大的时候躺下也睡不着——把「入睡」收口成"
+            "「准备睡觉·翻来覆去睡不着」，并记一条经历。体力已经耗尽时仍然沾床就着"
+        ),
+        json_schema_extra={"label": "启用入睡困难", "order": 10},
+    )
+    insomnia_stress_threshold: float = Field(
+        default=7.0,
+        description="压力达到它才可能睡不着（0–10）",
+        json_schema_extra={"label": "失眠压力阈值", "order": 11, "step": 0.5},
+    )
+    insomnia_probability: float = Field(
+        default=0.5,
+        description="满足条件时「这一觉睡不着」的概率；每生活日至多一次",
+        json_schema_extra={"label": "失眠概率", "order": 12, "step": 0.05},
+    )
+    night_waking_enabled: bool = Field(
+        default=False,
+        description=(
+            "夜间易醒（v1.15.0，默认关）：长睡眠中段偶尔醒一下（切「发呆」一小段再睡回去），"
+            "并记一条「半夜醒了一下」的经历。默认关是为了先观察失眠那一半的效果"
+        ),
+        json_schema_extra={"label": "启用夜间易醒", "order": 13},
+    )
+    night_waking_probability: float = Field(
+        default=0.02,
+        description="每个推进间隔（默认 10 分钟）夜里醒过来的概率；每夜至多一次",
+        json_schema_extra={"label": "夜醒概率", "order": 14, "step": 0.01},
+    )
+
+    # ---- 内心维度 → 外显情绪（v1.16.2 M3）----
+    stress_breakdown_enabled: bool = Field(
+        default=True,
+        description=(
+            "高压崩溃（v1.16.2）：压力达到阈值并**持续**若干小时后，她真的会崩一次"
+            "（情绪 −0.8 + 一条「绷不住」的素材与经历，每生活日至多一次）。"
+            "修的是「提示词说她没耐心、数值却比平时还高」的言行不一。"
+            "事件措辞是硬编码的确定性产出（与病程事件同一套管线），只暴露开关与阈值"
+        ),
+        json_schema_extra={"label": "启用高压崩溃", "order": 20},
+    )
+    stress_breakdown_threshold: float = Field(
+        default=7.0,
+        description="压力达到它并持续够久才可能崩（0–10）",
+        json_schema_extra={"label": "崩溃压力阈值", "order": 21, "step": 0.5},
+    )
+    stress_breakdown_hours: float = Field(
+        default=2.0,
+        description="压力要**持续**这么久才算绷不住（瞬时高压不算）",
+        json_schema_extra={"label": "高压持续时长（小时）", "order": 22, "step": 0.5},
+    )
+    stress_breakdown_reset: float = Field(
+        default=5.0,
+        description="压力回落到它以下就清掉高压起点（下一次高压重新计时）",
+        json_schema_extra={"label": "高压重置阈值", "order": 23, "step": 0.5},
+    )
+    loneliness_social_scaling: bool = Field(
+        default=True,
+        description=(
+            "孤独放大社交收益（v1.16.2）：孤独的人被找更开心（孤独高 → 情绪收益最高 ×1.5）、"
+            "被爱包围的人对打扰更钝感（孤独低 → ×0.8）。**仍受每日情绪额度约束**"
+            "（先缩放、再封顶）；关掉 = 所有人生效相同（旧行为）"
+        ),
+        json_schema_extra={"label": "孤独放大社交收益", "order": 24},
+    )
+    loneliness_social_curve: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_LONELINESS_SOCIAL_LINES),
+        description=(
+            "孤独 → 社交情绪系数（v1.16.2）：每行 `孤独值=系数`，分段线性、端点外取端点值"
+        ),
+        json_schema_extra={"label": "孤独系数曲线（孤独=系数）", "order": 25, "rows": 2,
+                           "placeholder": "2=0.8\n7=1.5"},
+    )
+
+    _norm_loneliness_curve = _str_list_validator("loneliness_social_curve")
+
+
+class RelationsConfig(PluginConfigBase):
+    """``[relations]``：关系模型（v1.11.0，决策 5：**默认开启**）。
+
+    只对「明确跟她说过话」的人建档：私聊任意消息 / 群聊被 @ 或被回复。
+    档案存 SQLite（life_store.db 的 relationships 表，第二个租户）。
+    消费点全部在阈值与提示词层，**不进倍率**。
+    """
+
+    __ui_label__ = "人际关系"
+    __ui_icon__ = "users"
+    __ui_order__ = 20
+
+    enabled: bool = Field(
+        default=True,
+        description="启用关系模型：对跟她说过话的人建档、按熟悉度调整主动开口阈值与语气",
+        json_schema_extra={"label": "启用关系模型", "order": 0},
+    )
+    keep: int = Field(
+        default=200,
+        description="关系档案上限（超过按「最近互动最久远」淘汰）",
+        json_schema_extra={"label": "档案上限", "order": 1},
+    )
+    decay_days: float = Field(
+        default=7.0,
+        description="超过这么久没互动，熟悉度开始按每周 -0.5 衰减；0 = 关闭衰减",
+        json_schema_extra={"label": "衰减起点（天）", "order": 2},
+    )
+
+
+class InterruptConfig(PluginConfigBase):
+    """``[interrupt]``：打断机制（v1.11.1）。
+
+    收到**对她说的话**（私聊任意 / 群聊被 @）时，把主活动临时切到 ``chatting``
+    若干分钟，回完再回到原活动——「吃饭吃到一半放下筷子回消息」这件事。
+    只切活动与窗口，**零 RPC、零落盘**（落盘随下一次 tick），因此挂在消息主链上
+    是安全的（另有 ``error_policy=SKIP`` 兜底）。
+
+    ⚠ 全部消费点在**活动层**（``enforce`` 窗口内保住 ``chatting``、``request_is_pointless``
+    窗口内跳过）。**不进倍率**：活动因子表里的 ``chatting=1.1`` 是既有机制
+    （她正在回消息理应多说几句），不是这一层新加的乘法项。
+    """
+
+    __ui_label__ = "消息打断"
+    __ui_icon__ = "zap"
+    __ui_order__ = 21
+
+    enabled: bool = Field(
+        default=True,
+        description="启用打断机制：收到私聊或被 @ 时临时切到「聊天中」，回完接着干原活动",
+        json_schema_extra={"label": "启用打断机制", "order": 0},
+    )
+    window_minutes: int = Field(
+        default=5,
+        description=(
+            "每次打断的窗口长度（分钟）：从收到消息算起，这段时间内她保持「聊天中」；"
+            "连续发消息只顺延、不重新计时也不重复记录"
+        ),
+        json_schema_extra={"label": "打断窗口（分钟）", "order": 1},
+    )
+    inject_notice: bool = Field(
+        default=True,
+        description=(
+            "打断时向该会话注入一条世界内事实（「她刚才在吃饭，看到你说话就放下手里的事」）"
+            "；按会话去重，失败只降级"
+        ),
+        json_schema_extra={"label": "注入「放下手里的事」", "order": 2},
+    )
+    hold_over_sleep: bool = Field(
+        default=True,
+        description=(
+            "窗口内**保住**「聊天中」不被硬约束切走（含「该睡了」）；"
+            "关掉 = 回消息途中照样会被送去睡觉"
+        ),
+        json_schema_extra={"label": "窗口内保住聊天态", "order": 3},
+    )
+
+
+class DreamConfig(PluginConfigBase):
+    """``[dream]``：梦境与睡眠余波（v1.12.0，方案八）。
+
+    睡醒不一定清爽——有时候带着一个梦。梦是**廉价的真实感**：一行文本、
+    一上午的余韵。触发点是「睡够 ≥ 3 小时后醒来」的那一刻，按概率生成；
+    生成两级：短 LLM（昨日经历 + 内心状态做种子）→ 模板库兜底，**永不阻塞
+    醒来流程**。
+
+    ⚠ 梦只进**叙事层**：``recent_events``（下一轮活动决策的近层经历可见）与
+    主动开口素材（「我昨晚梦到…」，上午全额、午后触底——下午还讲梦就奇怪了）。
+    不进倍率、不进关系、不动情绪体力。
+    """
+
+    __ui_label__ = "梦境"
+    __ui_icon__ = "moon"
+    __ui_order__ = 22
+
+    enabled: bool = Field(
+        default=True,
+        description="启用梦境：睡够 3 小时以上醒来时，按概率带着一个梦醒来",
+        json_schema_extra={"label": "启用梦境", "order": 0},
+    )
+    probability: float = Field(
+        default=0.35,
+        description="每次（≥3 小时的）长睡眠醒来的做梦概率 0–1",
+        json_schema_extra={"label": "做梦概率", "order": 1, "step": 0.05},
+    )
+    use_llm: bool = Field(
+        default=True,
+        description=(
+            "用一次短模型调用生成梦的内容（预算约 50 token，失败自动落到内置模板库）；"
+            "关掉则只用模板库，省一次调用"
+        ),
+        json_schema_extra={"label": "用模型生成梦", "order": 2},
+    )
+
+
+class MotivesConfig(PluginConfigBase):
+    """``[motives]``：主动开口动机扩展（v1.13.0，方案步 9，默认开）。
+
+    人不是「有素材才说话」——早上想道早安、做了好玩的事想分享、想起好久没聊的
+    朋友想去问一句。这三类**动机素材**与节日/梦境素材走同一条管道
+    （``state.materials`` → 主动开口挑选），发不发仍由既有管线裁决
+    （阈值/间隔/静默时段/社交电量硬闸照旧）——动机不绕过任何闸，也不进倍率。
+    """
+
+    __ui_label__ = "开口动机"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 23
+
+    enabled: bool = Field(
+        default=True,
+        description="启用动机素材：问候 / 生活分享 / 关系维护三类「想说话的念头」",
+        json_schema_extra={"label": "启用动机素材", "order": 0},
+    )
+    greeting: bool = Field(
+        default=True,
+        description="问候类：早安（06:00–11:00）/ 晚安（22:00–01:00）时段各至多一条",
+        json_schema_extra={"label": "问候类动机", "order": 1},
+    )
+    share: bool = Field(
+        default=True,
+        description="生活分享类：按当前活动低概率冒出「想说说」的念头（每活动每天至多一条）",
+        json_schema_extra={"label": "分享类动机", "order": 2},
+    )
+    relation: bool = Field(
+        default=True,
+        description=(
+            "关系维护类：对熟悉（≥认识档）且超过设定天数没说话的人，"
+            "冒出「好久没聊了」的念头（需要关系模型在建档才有数据）"
+        ),
+        json_schema_extra={"label": "关系维护动机", "order": 3},
+    )
+    relation_idle_days: float = Field(
+        default=3.0,
+        description="超过这么多天没和某位熟人说话，就会想 TA（0 = 关闭关系维护）",
+        json_schema_extra={"label": "想起熟人的天数", "order": 4, "step": 0.5},
+    )
+
+
+class PhysioConfig(PluginConfigBase):
+    """``[physio]``：三餐与生理锚点（v1.9.1）。
+
+    与 ``[routines]`` 的分工：习惯表是**用户手写的作息**（想让她 07:15 洗漱就写一行）；
+    physio 是**生理本能**（到点会饿、晚上会想洗澡），只配时间窗与幅度，不配场景。
+    两层都出 proposal、都走 enforce 唯一收口；同时命中时习惯先到先得（本 tick 只出
+    一个 proposal），下一个 tick 轮到生理窗。
+    """
+
+    __ui_label__ = "三餐生理"
+    __ui_icon__ = "utensils"
+    __ui_order__ = 17
+
+    enabled: bool = Field(
+        default=True,
+        description="启用生理锚点：饱腹结算 + 三餐/洗澡时间窗",
+        json_schema_extra={"label": "启用生理锚点", "order": 0},
+    )
+    meals: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_PHYSIO_MEAL_LINES),
+        description=(
+            '生理窗，每行 "HH:MM-HH:MM|名称|类型|weight=.."；类型 meal=吃饭 / bath=洗澡 / '
+            "snack=加餐（仅饿过头时出现）。默认三餐齐备"
+        ),
+        json_schema_extra={
+            "label": "生理时间窗（每行一组）",
+            "order": 1,
+            "rows": 4,
+            "placeholder": "07:00-08:30|早餐|meal|weight=0.9",
+        },
+    )
+    satiety_decay_per_hour: float = Field(
+        default=0.8,
+        description="清醒时每小时饱腹下降（0–10）；睡着不消耗",
+        json_schema_extra={"label": "饱腹下降速率/小时", "order": 2, "step": 0.1},
+    )
+    meal_duration_minutes: int = Field(
+        default=40,
+        description="一餐的最短停留（分钟）：吃饭窗命中后，她至少吃这么久",
+        json_schema_extra={"label": "一餐最短停留（分钟）", "order": 3},
+    )
+
+    _norm_physio_lists = _str_list_validator("meals")
+
+
+class RoutinesConfig(PluginConfigBase):
+    """``[routines]``：习惯层——每天固定时间做固定的事（v1.9.0）。
+
+    ⚠ ``lines`` **默认为空**：没有配任何习惯时，这一层完全不存在（行为与加它之前
+    一模一样）。这是刻意的——习惯表会**压住模型**的决定权，默认塞几行示例等于
+    悄悄改写所有存量实例的作息。想用就在配置页填行。
+    """
+
+    __ui_label__ = "生活习惯"
+    __ui_icon__ = "clock"
+    __ui_order__ = 16
+
+    enabled: bool = Field(
+        default=True,
+        description="启用习惯层（配了 lines 才有实际作用）",
+        json_schema_extra={"label": "启用习惯层", "order": 0},
+    )
+    lines: list[str] = Field(
+        default_factory=list,
+        description=(
+            '习惯行，每行 "HH:MM-HH:MM|场景|活动|修饰符"。'
+            '修饰符：weight=0-1（当日命中概率）、jitter=分钟（窗口平移幅度）、'
+            'days=1-5（哪些星期生效，空=每天）、workday_only=true / holiday_only=true、'
+            'physio=true（标记为三餐/洗澡，v1.9.x 的 physio 消费）'
+        ),
+        json_schema_extra={
+            "label": "习惯（每行一组）",
+            "order": 1,
+            "rows": 4,
+            "placeholder": "07:00-07:30|起床洗漱|daily|weight=1.0",
+        },
+    )
+    jitter_minutes: int = Field(
+        default=15,
+        description=(
+            "默认抖动幅度（分钟）：窗口整体前后平移这么多分钟，让她的作息不至于"
+            "分秒不差。按**生活日**固定一次，不是每轮重掷"
+        ),
+        json_schema_extra={"label": "默认抖动（分钟）", "order": 2},
+    )
+    llm_gap_minutes: float = Field(
+        default=120.0,
+        description=(
+            "习惯命中后至少隔这么久才再问一次模型（省调用、也让作息更稳）。"
+            "模型的舞台是习惯之间的空隙，不是习惯窗口内"
+        ),
+        json_schema_extra={"label": "命中后的提问间隔（分钟）", "order": 3, "step": 10},
+    )
+
+    _norm_routine_lists = _str_list_validator("lines")
+
+
 class LifeFrequencyConfig(PluginConfigBase):
     """插件配置根模型。
 
@@ -1652,6 +2730,14 @@ class LifeFrequencyConfig(PluginConfigBase):
     economy: EconomyConfig = Field(default_factory=EconomyConfig)
     social: SocialConfig = Field(default_factory=SocialConfig)
     world: WorldConfig = Field(default_factory=WorldConfig)
+    routines: RoutinesConfig = Field(default_factory=RoutinesConfig)
+    physio: PhysioConfig = Field(default_factory=PhysioConfig)
+    calendar: CalendarConfig = Field(default_factory=CalendarConfig)
+    mood: MoodConfig = Field(default_factory=MoodConfig)
+    relations: RelationsConfig = Field(default_factory=RelationsConfig)
+    interrupt: InterruptConfig = Field(default_factory=InterruptConfig)
+    dream: DreamConfig = Field(default_factory=DreamConfig)
+    motives: MotivesConfig = Field(default_factory=MotivesConfig)
     # ⚠ 必须是**顶层**节：SDK 只在顶层把 "是配置模型类" 的字段展开成 section
     # （`maibot_sdk/config.py:209-227`），嵌在别的节里的配置对象会退化成
     # `type=object` 的普通字段、不带 `properties`，WebUI 只能把它渲染成
@@ -1839,6 +2925,50 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         #: 本生活日已接进经历的世界事件条数（给状态卡显示，并用于 max_events_per_day）
         self._world_today_count: int = 0
         self._world_today_day: str = ""
+        # ---- 习惯层（v1.9.0）----
+        #: 解析后的习惯行（配置变化时重建；空元组 = 这一层不存在）
+        self._routine_lines: tuple[Any, ...] = ()
+        #: SQLite 存储（习惯日态 + 关系档案）。开不出库时是内存兜底，接口一致
+        self._routine_store: Any | None = None
+        #: 习惯命中后的提问冷却截止（内存态：重启丢失只意味着多问一次模型，不值得落盘）
+        self._llm_gap_until: float = 0.0
+        #: 已做过跨日清理的生活日（每天只清一次）
+        self._routine_pruned_day: str = ""
+        # ---- 生理锚点（v1.9.1）----
+        #: 解析后的生理时间窗（配置变化时重建）
+        self._parsed_physio_windows: tuple[Any, ...] = ()
+        #: 本生活日已触发过 proposal 的生理窗键（``{day_key: {窗口键: 真}}``）：
+        #: 早餐窗 90 分钟、tick 10 分钟 ⇒ 不记账会被命中九次
+        self._physio_fired: dict[str, set[str]] = {}
+        # ---- 中国日历（v1.10.0）----
+        #: 加载后的日历表（文件缺失/解析失败时是内置表或空表，绝不阻塞加载）
+        self._calendar: Any = None
+        #: 今天的日历缓存（``(date_key, DayInfo)``）——avoid 每 tick 重复查表
+        self._calendar_today: tuple[str, str] = ("", "")
+        # ---- 内心维度（v1.10.1）----
+        #: 消息风格注入的发送节流（与去重表配合；失败只降级不告警刷屏）
+        self._mood_inject_failures: int = 0
+        # ---- 梦境（v1.12.0）----
+        #: 刚结束的 ≥3h 长睡眠 ``(醒来时刻, 分钟数)``，等本 tick 生成梦；空 = 没有。
+        #: 由 ``_enforce_and_apply`` 在检测到「睡→醒」时标记（那里是同步的，
+        #: LLM 调用必须回到 tick 的 async 流程里做），每 tick 至多消费一次。
+        self._dream_wake_pending: tuple[float, float] | None = None
+        #: 本次唤醒窗口的起点（v1.15.0 / PR-W2）：``wake_max_extensions_minutes``
+        #: 的总时长上限从它起算。纯内存态——重启后重新计时可接受（窗口本来就只有
+        #: 几分钟到半小时）。0 = 当前没有窗口。
+        self._wake_started_at: float = 0.0
+        #: 打断批次号（v1.13.1 / F-004）：每次「从非 chatting 进入 chatting」+1。
+        #: 去重键用它而不是时间戳——同一秒内的两次打断用时间戳区分不开。
+        self._interrupt_batch: int = 0
+        # ---- 关系模型（v1.11.0）----
+        #: 已做过熟悉度衰减的生活日（每天一次）
+        self._relations_decay_day: str = ""
+        #: user_id → 熟悉度（v1.16.3 M7）。**内存索引**，不落盘：每次建档/被找时顺手更新，
+        #: 另外每天随熟悉度衰减全量刷新一次。它只服务于「社交情绪按关系加权」，
+        #: 所以不追求强一致——读不到就按陌生人（1.0）处理，宁可少放大也不猜错人。
+        self._relation_familiarity: dict[str, float] = {}
+        #: bot 自身的 user_id（判「回复她」用；读不到时空串 = 判不出，宁可漏建档）
+        self._bot_user_id: str = ""
 
     def _warn_once(self, key: str, message: str, *args: Any) -> None:
         """同一类配置/状态问题只告警一次，别每轮巡检刷屏。"""
@@ -1860,6 +2990,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         self._stopping = False
         self._rebuild_from_config()
+        self._open_store()
         self._restore_state_on_start(time.time())
 
         await self._refresh_host_context()
@@ -1926,6 +3057,13 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 self.ctx.logger.exception("后台任务退出异常")
         self._tasks.clear()
 
+        if self._routine_store is not None:
+            try:
+                self._routine_store.close()
+            except Exception:  # noqa: BLE001 —— 卸载阶段不允许抛错打断主流程
+                pass
+            self._routine_store = None
+
         await self._restore_baseline()
         self._save_state()
         self.ctx.logger.info("%s 已卸载", __plugin_id__)
@@ -1934,6 +3072,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         """配置热重载。``self`` = 插件自己的 config.toml；``bot``/``model`` = 全局广播。"""
 
         if scope == CONFIG_RELOAD_SCOPE_SELF:
+            # v1.14.0：关心句式是**正则表**，缓存在实例上（消息钩子每条都要用）。
+            # 热更新后必须丢掉旧缓存，否则改完配置要重启才生效。
+            self._care_patterns_cache = None
             self._rebuild_from_config()
             self.ctx.logger.info("%s 插件配置已热更新 version=%s", __plugin_id__, version)
             if not self.config.plugin.enabled:
@@ -2024,6 +3165,25 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             self.ctx.logger.warning("节日配置告警：%s", "；".join(festival_warnings[:5]))
         self._parsed_festivals = festivals
 
+        # 习惯层：坏行必须告警——写错一个活动名或时间窗，这条习惯就永远不触发，
+        # 而且现场没有任何线索（和事件 DSL 的 activities= 是同一类静默死配置）
+        routine_lines, routine_warnings = parse_routine_lines(
+            self.config.routines.lines,
+            default_jitter=int(self.config.routines.jitter_minutes),
+        )
+        self._routine_lines = routine_lines
+        if routine_warnings:
+            self.ctx.logger.warning("习惯配置告警：%s", "；".join(routine_warnings[:5]))
+
+        # 生理窗（v1.9.1）：坏行告警，与习惯行同一类静默死配置防线
+        physio_windows, physio_warnings = parse_meal_lines(self.config.physio.meals)
+        self._parsed_physio_windows = physio_windows
+        if physio_warnings:
+            self.ctx.logger.warning("生理窗配置告警：%s", "；".join(physio_warnings[:5]))
+
+        # 中国日历（v1.10.0）：优先读随插件分发的表；缺了就用内置表
+        self._calendar = self._load_calendar()
+
         # 生日格式错了必须告警：否则 all_festival_rules 会静默少一条规则，
         # 用户以为登记了生日、实际什么都没有（v1.1.0 就是这个行为）。
         birthday_text = str(self.config.date.birthday or "").strip()
@@ -2071,6 +3231,129 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         """
 
         return Path(self.ctx.paths.data_dir) / "life_state.json"
+
+    def _store_path(self) -> Path:
+        """``life_store.db``：习惯日态与关系档案（SQLite）。
+
+        与 ``life_state.json`` 同一个 data_dir，但**分开一个文件**：它是会增长、
+        会过期的表格数据，不该被每 tick 的全量 JSON 重写带着一起写。
+        """
+
+        return Path(self.ctx.paths.data_dir) / "life_store.db"
+
+    def _open_store(self) -> None:
+        """开库；失败时降级成内存兜底并告警一次（绝不因此不加载插件）。"""
+
+        try:
+            path = self._store_path()
+        except Exception as exc:  # noqa: BLE001 —— ctx.paths 在某些宿主上可能不可用
+            self._warn_once("store_path", "取不到插件数据目录，习惯层改用内存兜底: %s", exc)
+            self._routine_store = None
+            return
+        self._routine_store = open_store(
+            str(path),
+            on_error=lambda message: self._warn_once("store_error", "%s", message),
+        )
+        if self._routine_store is None:
+            return
+        backend = getattr(self._routine_store, "backend", "?")
+        if backend == "memory":
+            self.ctx.logger.warning(
+                "%s SQLite 不可用，习惯层改用内存兜底：重启后当天的命中记忆会丢失一次",
+                __plugin_id__,
+            )
+
+    # ------------------------------------------------------------ 中国日历
+
+    def _load_calendar(self) -> Any:
+        """加载日历：随插件的 ``data/calendar.toml`` → 内置表 → 空表（逐级兜底）。
+
+        当年没被表覆盖时**告警一次**（不阻塞）：她会在春节照常上班——宁可吵一次，
+        也不静默装作今天是个普通日子。
+        """
+
+        if not self.config.calendar.enabled:
+            return None
+        table_path = Path(__file__).resolve().parent / "data" / "calendar.toml"
+        if table_path.is_file():
+            calendar, warnings = load_calendar_file(table_path)
+        else:
+            calendar, warnings = builtin_calendar(), []
+            self.ctx.logger.info("%s 未找到 data/calendar.toml，使用内置日历表", __plugin_id__)
+        if warnings:
+            self._warn_once("calendar_warnings", "日历表告警：%s", "；".join(warnings[:5]))
+
+        # 用户追加的日子：覆盖内置条目是合法操作（改 kind / 改名）
+        extra_lines = list(self.config.calendar.extra or [])
+        if extra_lines:
+            extra_entries: list[dict[str, Any]] = []
+            for line in extra_lines:
+                fields = [chunk.strip() for chunk in str(line).split("|")]
+                if len(fields) < 2 or not fields[0] or not fields[1]:
+                    self._warn_once(
+                        f"calendar_extra:{line}",
+                        "追加日历 %r 不是 'YYYY-MM-DD|名称|kind'，已忽略", line,
+                    )
+                    continue
+                extra_entries.append(
+                    {
+                        "date": fields[0],
+                        "name": fields[1],
+                        "kind": (fields[2] if len(fields) > 2 else "festival").strip().lower(),
+                    }
+                )
+            if extra_entries:
+                from life_calendar import build_calendar
+
+                extra_cal, extra_warnings = build_calendar(extra_entries, source_name="追加条目")
+                if extra_warnings:
+                    self._warn_once("calendar_extra_warnings", "追加日历告警：%s", "；".join(extra_warnings[:5]))
+                merged = dict(calendar.days)
+                merged.update(extra_cal.days)
+                from life_calendar import Calendar
+
+                calendar = Calendar(merged, calendar.years | extra_cal.years, calendar.source_name)
+
+        import datetime as _dt
+
+        year_now = _dt.date.today().year
+        if calendar.days and not calendar.covers_year(year_now):
+            self._warn_once(
+                "calendar_year_missing",
+                "日历表没有覆盖 %d 年（只到 %s）：该年的节假日与农历节日将按普通日处理。"
+                "随插件更新可获得新年份的表",
+                year_now,
+                max(calendar.years) if calendar.years else "无",
+            )
+        return calendar
+
+    def _calendar_day(self, local_dt: Any) -> Any:
+        """某一天的日历事实；未启用 / 表没这天 → 空 ``DayInfo``（falsy）。"""
+
+        calendar = self._calendar
+        if calendar is None:
+            return None
+        try:
+            return calendar.day_info(local_dt.year, local_dt.month, local_dt.day)
+        except Exception:  # noqa: BLE001 —— 查表失败按普通日处理
+            return None
+
+    def _calendar_workday(self, local_dt: Any, *, schedule_enabled: bool, schedule_workday: bool) -> bool:
+        """「今天是不是工作日」的日历版（v1.10.0）。
+
+        优先级：日历表 > 班表 > 星期。日历没覆盖的年份自动退回旧判据——
+        缺表的代价是「调休分不清」，不是「全乱」。
+        """
+
+        day = self._calendar_day(local_dt)
+        if day is None:
+            return schedule_workday if schedule_enabled else int(local_dt.isoweekday()) <= 5
+        if day.is_holiday:
+            return False
+        if day.is_workday_swap:
+            return True
+        return schedule_workday if schedule_enabled else int(local_dt.isoweekday()) <= 5
+
 
     def _memory_path(self) -> Path:
         """宿主对账记忆的落盘位置，**与生活状态分开**。
@@ -2172,6 +3455,47 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         events = self.config.events
         date = self.config.date
 
+        # v1.16.0（M1）：清醒疲劳曲线。空列表 = 关闭（与升级前逐位一致）；坏行由
+        # ``parse_curve_points`` 丢弃并在这里告警一次——绝不是「静默按 0 处理」。
+        fatigue_ramp, fatigue_warnings = parse_curve_points(emotion.fatigue_ramp_curve)
+        if fatigue_warnings:
+            self._warn_once(
+                "fatigue_ramp_curve",
+                "清醒疲劳曲线有 %d 行无法解析（已忽略，其余照常生效）：%s",
+                len(fatigue_warnings),
+                "；".join(fatigue_warnings[:3]),
+            )
+        # v1.16.1（M4a）：日内节律曲线，同一条纪律（空 = 关闭、坏行告警不抛错）
+        diurnal, diurnal_warnings = parse_curve_points(emotion.baseline_diurnal_curve)
+        if diurnal_warnings:
+            self._warn_once(
+                "baseline_diurnal_curve",
+                "日内节律曲线有 %d 行无法解析（已忽略，其余照常生效）：%s",
+                len(diurnal_warnings),
+                "；".join(diurnal_warnings[:3]),
+            )
+        # v1.16.1（M4b）：余波折算系数。0 = 自动——等权改成按年龄衰减后有效总量约减半，
+        # 系数要翻倍（0.15 → 0.30）才维持同等稳态余波；显式给值以配置为准。
+        afterglow_decay = bool(emotion.afterglow_decay)
+        configured_gain = float(emotion.afterglow_gain)
+        afterglow_gain = configured_gain if configured_gain > 0.0 else (
+            0.30 if afterglow_decay else 0.15
+        )
+        # v1.16.3（M6）：情绪冲击的边际效用曲线（正/负各一条）
+        impact_positive, impact_positive_warnings = parse_curve_points(
+            emotion.impact_positive_curve
+        )
+        impact_negative, impact_negative_warnings = parse_curve_points(
+            emotion.impact_negative_curve
+        )
+        if impact_positive_warnings or impact_negative_warnings:
+            self._warn_once(
+                "emotion_impact_curve",
+                "情绪冲击曲线有 %d 行无法解析（已回退内置曲线）：%s",
+                len(impact_positive_warnings) + len(impact_negative_warnings),
+                "；".join((impact_positive_warnings + impact_negative_warnings)[:3]),
+            )
+
         sleep_window = parse_window(simulation.sleep_window, (3 * 60, 11 * 60))
         raw_window = str(simulation.sleep_window or "").strip()
         sleep_window_text = raw_window or "03:00-11:00"
@@ -2194,6 +3518,23 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             )
             max_sleep_hours = 0.5
 
+        # v1.15.0（PR-S1）：最短睡眠目标是「体力满唤醒」的新门槛，它必须落在
+        # 睡眠上限以内——否则上限唤醒会先到，目标形同虚设（而且提示词里会印出
+        # 一个自相矛盾的数：睡够 13 小时才醒、但 12 小时就被强制叫醒）。
+        min_sleep_target = max(0.0, float(simulation.energy_full_wake_min_hours))
+        if min_sleep_target > max_sleep_hours:
+            self._warn_once(
+                "energy_full_wake_min_hours",
+                "最短睡眠目标 %g 小时大于每日睡眠上限 %g 小时（上限唤醒会先生效），"
+                "已按上限处理",
+                min_sleep_target,
+                max_sleep_hours,
+            )
+            min_sleep_target = max_sleep_hours
+        # 小睡时限：下限不得超过上限，否则「小睡」永远在同一个 tick 里被打架收口
+        nap_max_minutes = max(1, int(simulation.nap_max_minutes))
+        nap_min_minutes = max(0, min(nap_max_minutes, int(simulation.nap_min_minutes)))
+
         return SimConfig(
             tick_seconds=max(60, int(simulation.tick_seconds)),
             max_catch_up_hours=max(0.25, float(simulation.catch_up_max_hours)),
@@ -2205,23 +3546,88 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             sleep_energy_threshold=max(0.0, min(10.0, float(simulation.sleep_energy_threshold))),
             max_sleep_hours=max_sleep_hours,
             energy_full_wake=bool(simulation.energy_full_wake),
+            # ---- 睡眠改进方案（v1.15.0）----
+            energy_full_wake_min_hours=min_sleep_target,
+            rest_day_sleep_extension_minutes=max(
+                0, int(simulation.rest_day_sleep_extension_minutes)
+            ),
+            sleep_hard_floor=max(0.0, min(10.0, float(activity.sleep_hard_floor))),
+            routine_can_wake=bool(simulation.routine_can_wake),
+            physio_can_wake=bool(simulation.physio_can_wake),
+            wake_daze_minutes=max(0, int(simulation.wake_daze_minutes)),
+            nap_enabled=bool(simulation.nap_enabled),
+            nap_min_minutes=nap_min_minutes,
+            nap_max_minutes=nap_max_minutes,
+            nap_energy_threshold=max(0.0, min(10.0, float(simulation.nap_energy_threshold))),
+            insomnia_enabled=bool(self.config.mood.insomnia_enabled),
+            insomnia_stress_threshold=max(
+                0.0, min(10.0, float(self.config.mood.insomnia_stress_threshold))
+            ),
+            insomnia_probability=max(
+                0.0, min(1.0, float(self.config.mood.insomnia_probability))
+            ),
+            night_waking_enabled=bool(self.config.mood.night_waking_enabled),
+            night_waking_probability=max(
+                0.0, min(1.0, float(self.config.mood.night_waking_probability))
+            ),
             min_awake_hours_per_day=max(0.0, min(24.0, float(activity.min_awake_hours_per_day))),
             min_dwell_minutes=max(0, int(activity.min_dwell_minutes)),
             min_sleep_minutes=max(0, int(activity.min_sleep_minutes)),
             schedule=self._schedule_config(),
             inertia_minutes=max(0, int(emotion.inertia_minutes)),
             recover_per_tick=max(0.0, float(emotion.recover_per_tick)),
+            # ---- 情绪回归 / 基线（v1.16.1 M5+M4）----
+            recover_ratio_per_tick=max(0.0, min(1.0, float(emotion.recover_ratio_per_tick))),
+            recover_min_step=max(0.0, float(emotion.recover_min_step)),
+            inertia_scale_enabled=bool(emotion.inertia_scale_enabled),
+            inertia_scale_min_minutes=max(0.0, float(emotion.inertia_scale_min_minutes)),
+            inertia_scale_max_minutes=max(0.0, float(emotion.inertia_scale_max_minutes)),
             sleep_recover_multiplier=max(0.0, float(emotion.sleep_recover_multiplier)),
             afterglow_span_hours=max(0.0, float(emotion.afterglow_span_hours)),
             afterglow_cap=max(0.0, float(emotion.afterglow_cap)),
+            afterglow_gain=afterglow_gain,
+            afterglow_decay=afterglow_decay,
+            baseline_diurnal_curve=diurnal,
+            # ---- 清醒疲劳代谢（v1.16.0 M1）----
+            fatigue_ramp_curve=fatigue_ramp,
+            # ---- 体力 → 情绪 / 消耗的耦合（v1.16.2 M2）----
+            emotion_fatigue_penalty=max(0.0, float(emotion.emotion_fatigue_penalty)),
+            emotion_fatigue_threshold=max(
+                0.0, min(10.0, float(emotion.emotion_fatigue_threshold))
+            ),
+            low_energy_drain_multiplier=max(
+                1.0, min(5.0, float(emotion.low_energy_drain_multiplier))
+            ),
+            low_energy_threshold=max(0.0, min(10.0, float(emotion.low_energy_threshold))),
+            # ---- 内心维度 → 情绪（v1.16.2 M3a）----
+            stress_breakdown_enabled=bool(self.config.mood.stress_breakdown_enabled),
+            stress_breakdown_threshold=max(
+                0.0, min(10.0, float(self.config.mood.stress_breakdown_threshold))
+            ),
+            stress_breakdown_hours=max(0.0, float(self.config.mood.stress_breakdown_hours)),
+            stress_breakdown_reset=max(
+                0.0, min(10.0, float(self.config.mood.stress_breakdown_reset))
+            ),
+            # ---- 情绪冲击的边际效用（v1.16.3 M6）----
+            emotion_impact_scaling=bool(emotion.emotion_impact_scaling),
+            impact_positive_curve=impact_positive or DEFAULT_IMPACT_POSITIVE_CURVE,
+            impact_negative_curve=impact_negative or DEFAULT_IMPACT_NEGATIVE_CURVE,
             sleep_debt_threshold_minutes=max(0, int(health.sleep_debt_threshold_minutes)),
             sleep_debt_cap_nights=max(1, int(health.sleep_debt_cap_nights)),
+            sleep_debt_recovery_step=max(0, int(health.sleep_debt_recovery_step)),
             sleep_deprived_energy_cap=float(health.sleep_deprived_energy_cap),
             cold_check_hour=max(0, min(23, int(health.cold_check_hour))),
             cold_min_days=max(1, int(health.cold_min_days)),
             cold_max_days=max(max(1, int(health.cold_min_days)), int(health.cold_max_days)),
             cold_base_risk=max(0.0, min(1.0, float(health.cold_base_risk))),
             cold_sleep_debt_risk=max(0.0, min(1.0, float(health.cold_sleep_debt_risk))),
+            # ---- 病程系统（v1.14.0）----
+            cold_stage_factors=self._cold_stage_factors(),
+            cold_immunity_days=max(0, int(health.cold_immunity_days)),
+            cold_convalescent_hours=max(0, int(health.cold_convalescent_hours)),
+            cold_care_daily_cap=max(0, int(health.cold_care_daily_cap)),
+            cold_sick_leave=bool(health.cold_sick_leave),
+            cold_season_factors=self._cold_season_factors(),
             fire_probability=max(0.0, min(1.0, float(events.fire_probability))),
             material_ttl_hours=max(0.5, float(events.material_ttl_hours)),
             material_best_ratio=max(0.0, min(1.0, float(events.material_best_ratio))),
@@ -2233,6 +3639,10 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             birthday_material=str(date.birthday_material or ""),
             festivals=tuple(getattr(self, "_parsed_festivals", ())),
             date_factor_overrides=dict(getattr(self, "_date_factor_overrides", {}) or {}),
+            physio_enabled=bool(self.config.physio.enabled),
+            physio_meals=tuple(getattr(self, "_parsed_physio_windows", ())),
+            satiety_decay_per_hour=max(0.0, min(5.0, float(self.config.physio.satiety_decay_per_hour))),
+            meal_duration_minutes=max(0, int(self.config.physio.meal_duration_minutes)),
         )
 
     def _fill_missing_activity_factors(
@@ -2260,6 +3670,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         defaults = _default_activity_factors()
 
         if mode == "replace":
+            self._activity_factor_absent = ()
             if not factors:
                 self._warn_once(
                     "activity_factor_replace_empty",
@@ -2269,6 +3680,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 )
                 return {}
             absent = [key for key in defaults if key not in factors]
+            # 记到实例上供 `/生活 频率` 显示（1.0 的因子在拆解里被过滤，卡片看不见）
+            self._activity_factor_absent = tuple(absent)
             if absent:
                 hard = "sleep" in absent
                 self._warn_once(
@@ -2298,6 +3711,56 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             "、".join(f"{key}={defaults[key]}" for key in missing),
         )
         return filled
+
+    def _cold_stage_factors(self) -> dict[str, float]:
+        """``[health] cold_stage_factors`` → 阶段因子表（坏行告警，空表回退 ``cold``）。
+
+        ``known_keys`` 用阶段名：写错阶段（如 ``worseningg``）会告警而不是静默
+        永不生效——那类问题在真机上只会表现为「她病重了还是话很多」。
+        """
+
+        factors, warnings = parse_factor_lines(
+            self.config.health.cold_stage_factors,
+            known_keys=("onset", "worsening", "recovering"),
+            label="病程阶段",
+        )
+        for item in warnings:
+            self._warn_once(f"cold_stage_factor:{item}", "病程阶段因子告警：%s", item)
+        return factors
+
+    def _cold_season_factors(self) -> dict[str, float]:
+        """``[health] cold_season_factors`` → 月份 → 风险倍率（空 = 不启用）。"""
+
+        factors, warnings = parse_factor_lines(
+            self.config.health.cold_season_factors,
+            known_keys=tuple(str(month) for month in range(1, 13)),
+            label="季节风险",
+        )
+        for item in warnings:
+            self._warn_once(f"cold_season:{item}", "季节风险系数告警：%s", item)
+        return factors
+
+    def _care_patterns(self) -> tuple[Any, ...]:
+        """``[health] cold_care_patterns`` → 编译好的正则表（坏行告警并忽略）。
+
+        结果缓存到实例上：消息钩子每次都调它，重新编译正则没有必要；
+        配置热更新时 ``on_config_update`` 会清缓存（见那里的注释）。
+        """
+
+        cached = getattr(self, "_care_patterns_cache", None)
+        if cached is not None:
+            return cached
+        patterns, warnings = parse_care_patterns(self.config.health.cold_care_patterns)
+        for item in warnings:
+            self._warn_once(f"care_pattern:{item}", "关心句式告警：%s", item)
+        if not patterns:
+            self._warn_once(
+                "care_pattern_empty",
+                "关心句式表为空或全部无法编译：生病时的「被关心」不再加速康复"
+                "（其它机制不受影响）",
+            )
+        self._care_patterns_cache = patterns
+        return patterns
 
     def _factor_config(self) -> FactorConfig:
         """配置 → ``FactorConfig``（含两套曲线与静默时段）。"""
@@ -2336,6 +3799,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         return FactorConfig(
             activity_factors=factor_table,
             health_factors=health_factors or _default_health_factors(),
+            cold_stage_factors=self._cold_stage_factors(),
             curves_frequency=self._curve_set(curves.frequency),
             curves_necessity=self._curve_set(curves.necessity),
             curves_dynamic=self._curve_set(curves.dynamic),
@@ -2528,9 +3992,22 @@ class LifeFrequencyPlugin(MaiBotPlugin):
     # ------------------------------------------------------------ 社交经历
 
     def _social_policy(self) -> SocialPolicy:
-        """``[social]`` → 纯策略（与 ``life_social`` 一致，坏值一律往下夹）。"""
+        """``[social]`` → 纯策略（与 ``life_social`` 一致，坏值一律往下夹）。
+
+        v1.16.2（M3b）：孤独系数挂 ``[mood]``（它是内心维度的消费点），但实现落在
+        ``life_social`` 的 grant 之前，所以在这里一并装配。
+        """
 
         social = self.config.social
+        mood = self.config.mood
+        curve, curve_warnings = parse_curve_points(mood.loneliness_social_curve)
+        if curve_warnings:
+            self._warn_once(
+                "loneliness_social_curve",
+                "孤独系数曲线有 %d 行无法解析（已忽略，其余照常生效）：%s",
+                len(curve_warnings),
+                "；".join(curve_warnings[:3]),
+            )
         return SocialPolicy(
             digest_emotion=max(0.0, float(social.digest_emotion)),
             mention_emotion=max(0.0, float(social.mention_emotion)),
@@ -2541,6 +4018,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             include_quote=bool(social.include_quote),
             max_digest_events_per_day=max(0, int(social.max_digest_events_per_day)),
             max_live_events_per_day=max(0, int(social.max_live_events_per_day)),
+            # 曲线为空（用户清空）或开关关掉时，系数恒 1.0 = 旧行为
+            loneliness_scaling=bool(mood.enabled and mood.loneliness_social_scaling),
+            loneliness_curve=curve if curve else SocialPolicy().loneliness_curve,
         )
 
     def _social_interval_seconds(self) -> float:
@@ -2690,7 +4170,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             self._social_today_day = day_key
             self._social_today_count = 0
         policy = self._social_policy()
-        asleep = state.activity == SLEEP
+        asleep = is_asleep(state.activity)
+        # v1.16.3（M7 / M6）：两个系数都在**这里**算好再交给纯模块——纯模块不认识
+        # 关系档案，也不该去读宿主状态（状态归 plugin 管）。顺序见 life_social 的注释。
+        signals_fresh = prune_signals(self._social_inbox, now=now)
+        relation_factor = self._relation_factor_for_signals(signals_fresh)
+        impact_factor = impact_scale(float(state.emotion), 1.0, sim_config)
         context = IntakeContext(
             now=now,
             day_key=day_key,
@@ -2698,9 +4183,13 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             asleep=asleep,
             day_used=float(state.social_daily.get(day_key, 0.0) or 0.0),
             policy=policy,
+            # v1.16.2（M3b）：孤独系数在 grant 之前乘进 want（见 life_social 的注释）
+            loneliness=float(state.loneliness),
+            relation_factor=relation_factor,
+            impact_factor=impact_factor,
         )
         digest = intake_digest(self._social_items, context, state.social_seen)
-        signals = prune_signals(self._social_inbox, now=now)
+        signals = signals_fresh
         self._social_inbox.clear()
         live = intake_live(signals, context, state.social_seen)
         events = digest.events + live.events
@@ -2714,14 +4203,25 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         prune_daily(state.social_daily)
         self._social_today_count += len(events)
         self._state_dirty = True
+        factor = loneliness_factor(float(state.loneliness), policy)
         self.ctx.logger.info(
-            "%s 社交经历：接进 %d 条（情绪 %+.2f，本生活日已用 %.2f/%g）%s",
+            "%s 社交经历：接进 %d 条（情绪 %+.2f，本生活日已用 %.2f/%g）%s%s%s",
             __plugin_id__,
             len(events),
             used,
             state.social_daily.get(day_key, 0.0),
             policy.daily_emotion_cap,
             "；睡眠中只记事、不加情绪" if asleep and not policy.emotion_while_asleep else "",
+            # v1.16.2（M3b）：把系数打进日志，否则「今天情绪怎么多/少了一点」无从解释
+            f"；孤独系数 ×{factor:.2f}（孤独 {float(state.loneliness):.1f}）"
+            if policy.loneliness_scaling
+            else "",
+            # v1.16.3（M7/M6）：同理——系数改了数额就必须能解释
+            (
+                f"；关系系数 ×{relation_factor:.2f}"
+                if relation_factor != 1.0 else ""
+            )
+            + (f"；边际效用 ×{impact_factor:.2f}" if impact_factor != 1.0 else ""),
         )
 
     def _social_card_lines(self, now: float) -> list[str]:
@@ -2921,7 +4421,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             self._world_today_count = 0
 
         policy = self._world_policy()
-        asleep = state.activity == SLEEP
+        asleep = is_asleep(state.activity)
         context = WorldContext(
             now=now,
             activity=state.activity,
@@ -3010,15 +4510,113 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             lunch_window=lunch_window,
             duty=str(model.duty or "").strip(),
             work_scene=str(model.work_scene or "").strip(),
+            # v1.17.0（PR-SCH-2）：按日微扰 + 加班日。钳在合法区间内——
+            # 配成 900 分钟不是「自由」，是把上下班钟点整体搬到另一个时段。
+            daily_jitter_minutes=max(
+                0, min(MAX_SCHEDULE_JITTER_MINUTES, int(model.daily_jitter_minutes or 0))
+            ),
+            overtime_probability=max(
+                0.0, min(1.0, float(model.overtime_probability or 0.0))
+            ),
+            overtime_extra_minutes=max(
+                0, min(480, int(model.overtime_extra_minutes or 0))
+            ),
         )
+
+    def _schedule_calendar_override(self, local_dt: Any) -> tuple[bool | None, str]:
+        """日历对「今天算不算工作日」的覆盖（v1.17.0，PR-CAL-1）。
+
+        返回 ``(override, 节日名)``：
+
+        * ``None`` = 日历不表态（未启用日历 / 关掉了 ``honor_calendar`` / 表没覆盖
+          今天 / 今天只是不放假传统节日）⇒ 班表退回「星期 ∈ workdays」；
+        * ``False`` = 法定节假日 ⇒ 今天真的是休息日；
+        * ``True`` = 调休上班的周末 ⇒ 今天真的要上班。
+
+        ⚠ **这是班表日历判定的唯一入口**：提示词（``_schedule_facts_now``）、强制层
+        （``_enforce_and_apply``）、白问判定（``pointless_ask_reason``）、重新取种子
+        （``_reseed_activity_if_stale``）四处都从这里取。少接一处就是 v1.16.3 的
+        P0 缺陷重演——同一轮提示词里「国庆节」与「现在：在岗」并存（改进方案 §2 P0-1）。
+        """
+
+        if not bool(getattr(self.config.schedule, "honor_calendar", True)):
+            return None, ""
+        day = self._calendar_day(local_dt)
+        if day is None or not day.name:
+            return None, ""
+        if day.is_holiday:
+            return False, day.name
+        if day.is_workday_swap:
+            return True, day.name
+        # 传统节日（festival，不放假）：不翻转班表判定，节日名已经进日期行，
+        # 这里再给一次反而重复
+        return None, ""
 
     def _schedule_facts_now(self, now: float) -> ScheduleFacts:
-        """当前时刻的班表事实（提示词、状态卡、强制层共用同一份判定）。"""
+        """当前时刻的班表事实（提示词、状态卡、强制层共用同一份判定）。
 
+        v1.14.0 §3.4：加重/好转期她请了病假 ⇒ 提示词行换成病假文案。判据与
+        ``enforce`` 的 ``activity_blocked_by_schedule`` 同源（``on_sick_leave`` +
+        ``cold_sick_leave``），保证「模型看到的」与「强制层挡的」是同一回事。
+
+        v1.17.0（PR-CAL-1）：把日历覆盖一起喂进去——法定节假日算休息日、
+        调休的周末算上班日（``honor_calendar`` 可关）。
+        """
+
+        local_dt = local_datetime(now, self._sim_config().tz_offset_minutes)
+        override, day_name = self._schedule_calendar_override(local_dt)
         return schedule_facts(
-            local_datetime(now, self._sim_config().tz_offset_minutes),
+            local_dt,
             self._schedule_config(),
+            sick_leave=on_sick_leave(
+                cold_stage(self._state, now),
+                enabled=bool(self.config.health.cold_sick_leave),
+            ),
+            workday_override=override,
+            day_name=day_name,
+            # v1.17.0（PR-SCH-2）：按日微扰/加班日按**生活日**派生，四个计算点同一份
+            day_key=self._schedule_day_key(local_dt),
         )
+
+    def _schedule_day_key(self, local_dt: Any) -> str:
+        """生活日标识（v1.17.0，PR-SCH-2）——班表微扰与加班日的确定性种子。
+
+        与习惯/生理/失眠用的是同一个 ``day_key_of`` 口径（生活日边界默认 12:00），
+        所以「同一天」在四处指的是同一段时间。
+        """
+
+        try:
+            return day_key_of(
+                local_dt, int(self._sim_config().day_boundary_hour)
+            )
+        except Exception:  # noqa: BLE001 —— 取不到就当「不微扰」，绝不炸决策链
+            return ""
+
+    def _schedule_lines_now(self, now: float, sim_config: Any = None) -> tuple[str, ...]:
+        """活动提示词里的作息事实行 = 班表事实 + 休息日多睡（v1.15.0 PR-R4）。
+
+        休息日只在「最短睡眠目标 > 0 且休息日顺延 > 0」时才说——否则那是一句
+        没有机制支撑的空话（模型会以为周末可以睡到自然醒，而强制层照样按
+        体力满唤醒）。
+
+        v1.17.0（PR-CAL-1）：班表已经说过「今天放假/休息日」时，这里只补**机制**
+        那一半（多睡多久），不重复第二句「不用上班」——同一段话里说两遍不仅啰嗦，
+        还会让模型以为这是两件不同的事。
+        """
+
+        config = sim_config if sim_config is not None else self._sim_config()
+        facts = self._schedule_facts_now(now)
+        lines = list(facts.prompt_lines)
+        extension = max(0.0, float(getattr(config, "rest_day_sleep_extension_minutes", 0.0)))
+        min_hours = max(0.0, float(getattr(config, "energy_full_wake_min_hours", 0.0)))
+        if extension > 0 and min_hours > 0 and self._rest_day(now):
+            if facts.enabled and not facts.is_workday:
+                lines.append(f"今天不用上班，可以比平时多睡 {extension / 60.0:g} 小时。")
+            else:
+                lines.append(
+                    f"今天是休息日，不用上班/上学——可以比平时多睡 {extension / 60.0:g} 小时。"
+                )
+        return tuple(lines)
 
     def _schedule_lines(self, now: float) -> list[str]:
         """状态卡上的班表一行；未启用班表时返回空列表。"""
@@ -3573,10 +5171,47 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             float(self._state.at_wake_until), sim_config.tz_offset_minutes
         ).strftime("%H:%M")
 
+    def _wake_cap(self, now: float) -> float:
+        """这次唤醒最晚保持到什么时候（v1.15.0 PR-W2）。
+
+        从「第一次被叫醒」起算 ``wake_max_extensions_minutes`` 分钟；0 = 不设上限。
+        活跃群里每 5 分钟一句「在吗」本来能把窗口无限顺延，她会整夜停在清醒值上
+        （倍率不为 0、睡眠记账虽然照常，但宿主侧一直在跑 Planner）。
+        上限用 ``_wake_started_at``（实例内内存态）计：它只影响本次窗口，
+        重启后重新计时是可以接受的。
+        """
+
+        limit = max(0, int(self.config.simulation.wake_max_extensions_minutes))
+        if limit <= 0:
+            return float("inf")
+        return float(self._wake_started_at) + limit * 60.0
+
+    def _extend_wake_window(self, now: float) -> None:
+        """窗口内收到**对话**消息：只顺延截止时间，不重写宿主（v1.15.0 PR-W2）。
+
+        与「窗口内再来 @」同款纪律：宿主上那个值已经是清醒值，重写一遍白花一次
+        读 + 一次写。顺延受 ``_wake_cap`` 封顶。
+        """
+
+        if not bool(self.config.simulation.wake_extend_on_message):
+            return
+        window_minutes = int(self.config.simulation.wake_minutes)
+        if window_minutes <= 0:
+            return
+        target = min(float(now) + window_minutes * 60.0, self._wake_cap(now))
+        if target > float(self._state.at_wake_until):
+            self._state.at_wake_until = target
+            self._state_dirty = True
+
     async def _at_wake_from_hook(
-        self, session_id: str, info: dict[str, Any], now: float
+        self,
+        session_id: str,
+        info: dict[str, Any],
+        now: float,
+        *,
+        mentioned: bool = False,
     ) -> None:
-        """睡眠中被 `@`：开一个临时清醒窗口，并**立刻**把这个会话的倍率抬到清醒值。
+        """睡眠中被 `@`（或私聊）：开临时清醒窗口，并**立刻**把该会话倍率抬到清醒值。
 
         为什么必须在这里写：宿主对这条消息的处理顺序是
         ``bot.py:812``（本钩子）→ ``bot.py:841``（入队）→ ``heartflow_message_processor.py:62``
@@ -3586,9 +5221,11 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         等下一轮巡检（``[apply] interval_seconds`` ≥ 15 秒）再写就已经晚了：那条消息
         早被静默轮吃掉（`reasoning_engine.py:1197` 还会清掉强制轮标记）。
 
-        只在**窗口第一次打开**时写；窗口内的后续 `@` 只顺延截止时间（宿主上那个值已经是
+        只在**窗口第一次打开**时写；窗口内的后续消息只顺延截止时间（宿主上那个值已经是
         清醒值，重写一遍白花一次读 + 一次写）。``activity != sleep`` 不写，``quiet_hours``
         与暂停不写 —— 那两个是你自己设的硬闸（见 ``_wake_active``）。
+        v1.15.0（PR-W1）：判据从「被 @」扩到「被 @ 或私聊」——私聊本来就没有 @ 这个概念，
+        而打断机制的触发判据早就是「私聊任意消息 / 群聊被 @」，唤醒链路与它对上。
         """
 
         if not bool(self.config.simulation.wake_on_at):
@@ -3597,10 +5234,20 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             return
         if self._state.activity != SLEEP:
             return
+        # PR-W1：私聊（没有 @）是否算「叫她」由配置决定，默认关 = 旧行为。
+        # ⚠ ``mentioned`` 必须由调用方从**消息载荷**取（``flag_value(target, "is_at")``）：
+        # ``info`` 是 ``_seen_sessions`` 里的会话记录，里面没有 is_at 这个字段
+        # （在这里读它恒为 False，等于把「被 @ 唤醒」整条功能静默关掉）。
+        private_chat = not bool(info.get("is_group_session"))
+        if not mentioned and not (
+            bool(self.config.simulation.wake_on_private) and private_chat
+        ):
+            return
         if self._in_quiet_hours(now):
             # 你自己设的静默时段优先于一句 `@`：不开窗口、不写宿主，只留一条 debug
             self.ctx.logger.debug(
-                "睡眠中被 @，但此刻在 [frequency] quiet_hours 内：保持静默（session=%s）",
+                "睡眠中被 %s，但此刻在 [frequency] quiet_hours 内：保持静默（session=%s）",
+                "私聊" if private_chat else "@",
                 session_id,
             )
             return
@@ -3614,7 +5261,11 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         window = float(window_minutes) * 60.0
         was_awake = float(self._state.at_wake_until) > now
-        self._state.at_wake_until = max(float(self._state.at_wake_until), now + window)
+        if not was_awake:
+            self._wake_started_at = float(now)
+        # 顺延受总时长上限约束（PR-W2）：`_wake_cap` 从第一次被叫醒起算
+        target = min(max(float(self._state.at_wake_until), float(now) + window), self._wake_cap(now))
+        self._state.at_wake_until = target
         self._state_dirty = True
 
         sim_config = self._sim_config()
@@ -3624,7 +5275,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         if was_awake:
             self.ctx.logger.info(
-                "睡眠中被 @：清醒窗口顺延到 %s（session=%s，不再重复写宿主）",
+                "睡眠中被叫醒：清醒窗口顺延到 %s（session=%s，不再重复写宿主）",
                 until_text, session_id,
             )
             return
@@ -3632,26 +5283,26 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         # 窗口已经写进 state，所以这次拆解用的就是清醒活动（``_effective_activity``）
         breakdown = self._compute_breakdown(now)
         outcome = await self._apply_one_session(
-            session_id, breakdown.adjust, now, reason="被 @ 唤醒"
+            session_id, breakdown.adjust, now, reason="被叫醒"
         )
         if outcome == "wrote":
             self.ctx.logger.info(
-                "睡眠中被 @ 唤醒：session=%s 倍率 → %.3f，清醒到 %s（%d 分钟后自动回睡）",
+                "睡眠中被叫醒：session=%s 倍率 → %.3f，清醒到 %s（%d 分钟后自动回睡）",
                 session_id, breakdown.adjust, until_text, window_minutes,
             )
         elif outcome == "failed":
             self.ctx.logger.warning(
-                "睡眠中被 @ 唤醒：session=%s 写入失败，这条 @ 大概率仍被静默消费", session_id
+                "睡眠中被叫醒：session=%s 写入失败，这条消息大概率仍被静默消费", session_id
             )
         elif outcome == "read_failure":
             self.ctx.logger.warning(
-                "睡眠中被 @ 唤醒：session=%s 读不到宿主现值，本次不写（避免盲写覆盖别人的倍率）",
+                "睡眠中被叫醒：session=%s 读不到宿主现值，本次不写（避免盲写覆盖别人的倍率）",
                 session_id,
             )
         else:
             # dry_run / same / skipped / backoff：都不算故障，各留一条可排查的线索
             self.ctx.logger.info(
-                "睡眠中被 @ 唤醒：session=%s 未下发（%s，目标倍率 %.3f）",
+                "睡眠中被叫醒：session=%s 未下发（%s，目标倍率 %.3f）",
                 session_id, outcome, breakdown.adjust,
             )
 
@@ -3668,6 +5319,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             emotion=self._state.emotion,
             energy=self._state.energy,
             sick=is_cold(self._state, now),
+            # v1.14.0：阶段因子（初起 0.7 / 加重 0.15 / 好转 0.5）取代旧的单一
+            # cold=0.3；旧状态没有阶段字段时那边回退 health_factors["cold"]。
+            cold_stage=cold_stage(self._state, now),
             sleep_debt_nights=self._state.sleep_debt_nights,
             date_factor=date_factor(self._state, now, sim_config),
             material_count=material_effective_count(
@@ -3884,14 +5538,104 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
     # ------------------------------------------------------------ 活动决策
 
+    def _llm_stat_day_key(self, now: float) -> str:
+        """统计用的生活日键（v1.17.0，PR-OBS-1）；取不到返回空串（只是不计数）。"""
+
+        try:
+            sim_config = self._sim_config()
+            return day_key_of(
+                local_datetime(now, sim_config.tz_offset_minutes),
+                sim_config.day_boundary_hour,
+            )
+        except Exception:  # noqa: BLE001 —— 统计是观测，不是正确性
+            return ""
+
+    def _note_llm_stat(self, bucket: str, now: float) -> None:
+        """记一次模型调用的去向（v1.17.0，PR-OBS-1）。
+
+        桶：``asked`` / ``failed`` / ``skip_routine`` / ``skip_physio`` /
+        ``skip_pointless`` / ``skip_interrupt`` / ``skip_window``。
+        键 = ``"生活日|桶"``（与 ``care_today`` 同一套按生活日惰性清理的模式）。
+        """
+
+        name = str(bucket or "").strip()
+        if not name:
+            return
+        day_key = self._llm_stat_day_key(now)
+        key = f"{day_key}|{name}"
+        stats = self._state.llm_ask_stats
+        stats[key] = float(stats.get(key, 0.0) or 0.0) + 1.0
+        # 兜底清理：正常路径由 ``life_sim.prune_daily`` 按生活日清；这里只防
+        # 「时钟异常导致 day_key 恒变」时表无限长大（阈值 64 ≈ 9 天 × 7 桶）
+        if len(stats) > 64 and day_key:
+            self._state.llm_ask_stats = {
+                str(item_key): value
+                for item_key, value in stats.items()
+                if str(item_key).split("|", 1)[0] == day_key
+            }
+
+    def _llm_stats_today(self, now: float) -> dict[str, int]:
+        """今天的模型调用分解（v1.17.0，PR-OBS-1）。空表 = 今天还没有任何记录。"""
+
+        day_key = self._llm_stat_day_key(now)
+        result: dict[str, int] = {}
+        for key, value in (self._state.llm_ask_stats or {}).items():
+            head, _, bucket = str(key).partition("|")
+            if not bucket or head != day_key:
+                continue
+            try:
+                count = int(float(value or 0.0))
+            except (TypeError, ValueError):
+                continue
+            result[bucket] = result.get(bucket, 0) + max(0, count)
+        return result
+
+    def _llm_stats_line(self, now: float) -> str:
+        """状态卡上的一行：今天问了模型几次、跳过几次、各是什么原因。"""
+
+        stats = self._llm_stats_today(now)
+        if not stats:
+            return ""
+        asked = stats.get("asked", 0)
+        failed = stats.get("failed", 0)
+        skipped = sum(
+            count for bucket, count in stats.items() if bucket.startswith("skip_")
+        )
+        head = f"今日模型：问 {asked} 次"
+        if failed:
+            head += f"（失败 {failed}）"
+        head += f"　跳过 {skipped} 次"
+        detail = (
+            ("习惯窗口", stats.get("skip_routine", 0)),
+            ("生理窗口", stats.get("skip_physio", 0)),
+            ("习惯/生理间隔", stats.get("skip_window", 0)),
+            ("注定白问", stats.get("skip_pointless", 0)),
+            ("打断中", stats.get("skip_interrupt", 0)),
+        )
+        shown = [f"{label} {count}" for label, count in detail if count]
+        if shown:
+            head += "（" + " · ".join(shown) + "）"
+        return head
+
     def _llm_ready(self, now: float) -> bool:
-        """是否该向模型提问：不在冷却里，且距上次提问够了最小间隔。"""
+        """是否该向模型提问：不在冷却里，且距上次提问够了最小间隔。
+
+        v1.15.0（PR-S4）：**睡眠中用另一个间隔**（``sleep_interval_seconds``，
+        默认 1800）。睡满最短时长后到醒来之间，模型能做的有效决定只剩「要不要提前醒」，
+        按 10 分钟一轮问一夜等于白烧 token（每晚 18–30 次调用）。``0`` = 睡眠中
+        完全不问——醒来交给「体力满 + 最短睡眠目标 / 睡眠上限」这些确定性条件。
+        """
 
         if self._activity_mode() != "llm":
             return False
         if now < float(self._state.llm_cooldown_until):
             return False
         interval = max(0, int(self.config.activity.llm.min_interval_seconds))
+        if is_asleep(self._state.activity):
+            sleep_interval = int(self.config.activity.llm.sleep_interval_seconds)
+            if sleep_interval <= 0:
+                return False  # 0 = 睡眠中不问模型（确定性条件照样会叫醒她）
+            interval = max(interval, sleep_interval)
         return (now - self._last_llm_attempt_at) >= interval
 
     async def _ask_activity(self, now: float) -> ActivityDecision | None:
@@ -3903,6 +5647,17 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         state = self._state
         context = date_context(state, now, sim_config)
         allowed, block_reason = can_switch(state, now, sim_config)
+        # v1.10.0：日期行带上日历节日名（法定/农历都行）——「春节没反应」的直接修法。
+        # 自定义节日（[date].festivals）已有通道（context['festival']），两者并集。
+        calendar_names = ""
+        try:
+            day = self._calendar_day(
+                local_datetime(now, sim_config.tz_offset_minutes)
+            )
+            if day is not None and day.name:
+                calendar_names = day.name
+        except Exception:  # noqa: BLE001 —— 查表失败不挡决策
+            calendar_names = ""
 
         # 人设上限是配置项（默认 600 字）：超出部分**静默丢弃**，所以人设长了要调大它。
         # 0 = 不带人设（省 token）。
@@ -3915,7 +5670,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             now_label=context["now_label"],
             date_label=f"{context['date_label']} 周{context['weekday']}",
             season=context["season"],
-            festival=context["festival"],
+            festival="、".join(
+                part for part in (calendar_names, context["festival"]) if part
+            ),
             activity=state.activity,
             minutes_in_activity=activity_minutes(state, now),
             can_switch=allowed,
@@ -3923,10 +5680,20 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             emotion=state.emotion,
             energy=state.energy,
             energy_cap=state.energy_cap,
-            health_label=health_label(state, now, sim_config),
+            # v1.14.0 §7 双口径：进模型的是**模糊病程**描述（不报「还剩几小时」），
+            # 精确口径只给状态卡（见 _render_status / health_label_admin）。
+            health_label=health_label_prompt(state, now, sim_config),
             sleep_debt_nights=state.sleep_debt_nights,
             sleep_minutes_today=state.sleep_minutes_today,
             awake_minutes_today=state.awake_minutes_today,
+            # v1.17.0（PR-PRM-2）：饱腹与进餐事实——没开生理锚点时不提（satiety=-1）
+            satiety=float(state.satiety) if bool(self.config.physio.enabled) else -1.0,
+            meal_count_today=int(state.meal_count_today or 0),
+            last_meal_hours_ago=(
+                max(0.0, (float(now) - float(state.last_meal_at)) / 3600.0)
+                if float(state.last_meal_at or 0.0) > 0.0
+                else None
+            ),
             sleep_window_text=sim_config.sleep_window_text,
             recent_event_tiers=recent_event_tiers(
                 state,
@@ -3940,7 +5707,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 max_per_label=int(llm_config.recent_max_per_label),
             ),
             economy_hint=economy_hint,
-            schedule_lines=self._schedule_facts_now(now).prompt_lines,
+            schedule_lines=self._schedule_lines_now(now, sim_config),
+            # v1.17.0（PR-PRM-1）：结构化班表事实也一并给提示词——候选活动按同一张
+            # 相位矩阵收窄（只给文字行的话，模型仍会从全枚举里挑禁项）
+            schedule=self._schedule_facts_now(now),
+            # 小睡（v1.15.0 PR-R1）：关掉时它不在候选里（与 enforce 同一口径）
+            allow_nap=bool(sim_config.nap_enabled),
             # 「选这个活动会影响什么」：数字全部来自 sim_config / 活动因子表（同一份真值），
             # 改配置提示词就跟着变。只告诉她结论与机制，不列活动→倍率的数值清单
             # （那会诱导她「为了少说话而挑活动」）。
@@ -3953,6 +5725,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         )
         prompt = build_prompt(prompt_input)
         self._last_llm_attempt_at = now
+        # v1.17.0（PR-OBS-1）：这一轮真的问了模型（失败在 `_note_llm_failure` 里另计）
+        self._note_llm_stat("asked", now)
 
         kwargs: dict[str, Any] = {}
         if str(llm_config.task_name or "").strip():
@@ -4014,6 +5788,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         """记一次失败；达到上限就进冷却，避免每 10 分钟锤一个坏模型。"""
 
         llm_config = self.config.activity.llm
+        # v1.17.0（PR-OBS-1）：失败单独计一类，状态卡才能区分「没问」与「问了挂了」
+        self._note_llm_stat("failed", now)
         mark_llm_failure(self._state, now=now, raw=raw, config_limit=int(llm_config.fail_streak_limit))
         if self._is_timeout_failure(raw):
             # 超时最容易被误诊成「模型坏了」，单独给一次可操作的提示。
@@ -4032,6 +5808,1018 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 "%s 活动决策连续失败 %d 次，进入 %d 分钟冷却（期间保持当前活动）",
                 __plugin_id__, self._state.llm_fail_streak, int(llm_config.cooldown_minutes),
             )
+
+    # ------------------------------------------------------------ 习惯层
+
+    def _routine_day_flags(self, local_dt: Any) -> tuple[bool, bool]:
+        """今天（是不是工作日, 是不是节假日）。
+
+        v1.10.0 起两个判据来自**日历表**（法定节假日 / 调休上班），不再互补：
+        调休上班的周六 = 工作日且非节日。表没覆盖时退回班表/星期的旧判据
+        （此时两者重新互补——这是降级，不是常态）。
+        """
+
+        facts = schedule_facts(local_dt, self._sim_config().schedule)
+        schedule_enabled = bool(facts.enabled)
+        try:
+            schedule_workday = bool(facts.is_workday) if schedule_enabled else (
+                int(local_dt.isoweekday()) <= 5
+            )
+        except Exception:  # noqa: BLE001 —— 拿不到星期就当普通工作日（宁可少限制）
+            schedule_workday = True
+        is_workday = self._calendar_workday(
+            local_dt, schedule_enabled=schedule_enabled, schedule_workday=schedule_workday
+        )
+        # 「节假日」= 日历上的法定节假日；降级时退回「不上班」
+        day = self._calendar_day(local_dt)
+        if day is not None and day.name:
+            return is_workday, day.is_holiday
+        return is_workday, not is_workday
+
+    async def _run_routine(self, now: float, sim_config: SimConfig) -> tuple[bool, str]:
+        """跑一次习惯层：命中就把 proposal 交给强制层。
+
+        返回 ``(是否命中, 不问模型的理由)``；理由为空串 = 这一轮与习惯无关。
+
+        ⚠ 命中**不是**直接改状态：proposal 仍过 ``enforce_and_apply``，所以习惯
+        不能让她在睡眠窗口里爬起来、也不能压过班表与感冒。她真要在 07:00 起床，
+        靠的是「睡眠上限 / 体力回满」这些既有硬约束在这里正好放行，不是绕过它们。
+
+        ⚠ 三条不问模型的理由互不等价，别合并：
+        ``命中``（习惯定了活动）/ ``窗口内``（还在习惯这段时间里）/
+        ``间隔内``（刚被习惯定过，先让模型歇一会儿）。
+        """
+
+        lines = self._routine_lines
+        if not lines or not self.config.routines.enabled or self._routine_store is None:
+            return False, ""
+        store = self._routine_store
+        local_now = local_datetime(now, sim_config.tz_offset_minutes)
+        day_key = day_key_of(local_now, sim_config.day_boundary_hour)
+
+        if self._routine_pruned_day != day_key:
+            # 跨日清理：昨天以前的日态永远不再被读（每天一次，不是每 tick 一次）
+            await asyncio.to_thread(store.prune_before, day_key)
+            self._routine_pruned_day = day_key
+
+        rows = await asyncio.to_thread(store.load_day, day_key)
+        jitter_map = {line_id: jitter for line_id, (jitter, _) in rows.items()}
+        status_map = {line_id: status for line_id, (_, status) in rows.items()}
+
+        # 抖动按天固定一次：缺哪行补哪行，补完写回。重启后仍是同一天的同一个窗口
+        # ——每 tick 重掷会让窗口在边界上反复进出，同一顿早饭被命中好几次。
+        missing: dict[str, tuple[int, int]] = {}
+        for line in lines:
+            if line.line_id in jitter_map:
+                continue
+            spread = max(0, int(line.jitter))
+            jitter_map[line.line_id] = self._rng.randint(-spread, spread) if spread else 0
+            missing[line.line_id] = (jitter_map[line.line_id], ROUTINE_PENDING)
+        if missing:
+            await asyncio.to_thread(store.save_day, day_key, missing)
+
+        is_workday, is_holiday = self._routine_day_flags(local_now)
+        context = RoutineContext.from_local_dt(
+            local_now, is_workday=is_workday, is_holiday=is_holiday
+        )
+        active = active_lines(lines, context=context, jitter_map=jitter_map)
+        if not active:
+            if now < self._llm_gap_until:
+                return False, "习惯命中后的提问间隔内"
+            return False, ""
+
+        pending = pick_pending(active, status_map)
+        if pending is None:
+            return False, f"习惯窗口内（{active[0].scene}）"
+
+        jitter = jitter_map.get(pending.line_id, 0)
+        if not roll_weight(pending, self._rng):
+            # 今天这条不来。必须记下来（不是重掷）：窗口内反复掷一个 0.8 的权重，
+            # 40 分钟里迟早会中，权重就形同虚设了。
+            await asyncio.to_thread(
+                store.save_day, day_key, {pending.line_id: (jitter, ROUTINE_SKIPPED)}
+            )
+            return False, f"习惯窗口内（{pending.scene} 今天没发生）"
+
+        await asyncio.to_thread(
+            store.save_day, day_key, {pending.line_id: (jitter, ROUTINE_FIRED)}
+        )
+        decision = routine_decision(
+            pending,
+            # v1.17.0（PR-ROU-2）：多候选场景按生活日 + 小时桶确定性轮换
+            day_key=day_key,
+            now_minutes=local_now.hour * 60 + local_now.minute,
+        )
+        self._enforce_and_apply(now, decision)
+        self._llm_gap_until = now + max(0.0, float(self.config.routines.llm_gap_minutes)) * 60.0
+        adopted = self._state.activity == pending.activity
+        # v1.17.0（PR-ROU-1）：``physio=true`` 的习惯行**真的进账**。
+        # 配置描述一直写着「标记为三餐/洗澡，physio 消费」，实际全库零消费点——
+        # 用户把三餐从 [physio] meals 挪进习惯表（想顺便配场景文本的自然做法）后，
+        # 她「吃了早饭」却不回饱、不计「今日已吃」，饱腹一路见底。
+        # 判据与生理窗完全一致：**只有被强制层采纳**才入账（睡着时不会被习惯叫醒，
+        # 也就不该凭空吃上这顿饭）；同一顿的回饱去重由共用函数负责。
+        if adopted and pending.physio and pending.activity in (MEAL, BATH):
+            self._settle_physio_intake(decision, now)
+        if adopted:
+            self.ctx.logger.info(
+                "%s 习惯命中：%s（%s）", __plugin_id__, decision.scene,
+                self._activity_label(pending.activity),
+            )
+        else:
+            # 被硬约束挡下来了：必须留痕，否则「配了习惯却不生效」在现场无从排查
+            self.ctx.logger.info(
+                "%s 习惯命中但被硬约束收口：%s（%s）→ 当前 %s（%s）",
+                __plugin_id__, pending.scene, self._activity_label(pending.activity),
+                self._activity_label(self._state.activity), self._state.activity_note,
+            )
+        return True, f"习惯命中：{decision.scene}"
+
+    # ------------------------------------------------------------ 内心维度
+
+    def _mood_policy(self) -> MoodPolicy:
+        """配置 → ``MoodPolicy``（每 tick 现算，配置热重载即时生效）。"""
+
+        cfg = self.config.mood
+        return MoodPolicy(
+            enabled=bool(cfg.enabled),
+            stress_regress_per_tick=max(0.0, float(cfg.stress_regress_per_tick)),
+            stress_per_work_tick=max(0.0, float(cfg.stress_per_work_tick)),
+            stress_relief_per_sleep_tick=max(0.0, float(cfg.stress_relief_per_sleep_tick)),
+            battery_per_message=max(0.0, float(cfg.battery_per_message)),
+            battery_per_mention=max(0.0, float(cfg.battery_per_mention)),
+            battery_per_proactive=max(0.0, float(cfg.battery_per_proactive)),
+            # v1.16.2（M3a）：高压计时用「达到阈值」与「回落重置」两个数
+            stress_breakdown_threshold=max(0.0, min(10.0, float(cfg.stress_breakdown_threshold))),
+            stress_breakdown_reset=max(0.0, min(10.0, float(cfg.stress_breakdown_reset))),
+        )
+
+    def _mood_signal_in_hook(self, signal: Any) -> None:
+        """入站钩子里喂一条信号给内心维度（纯内存，零 RPC）。
+
+        ``signal`` 是 ``life_social.live_signal`` 的产物（或 None）。
+        """
+        if signal is None or not self.config.mood.enabled:
+            return
+        policy = self._mood_policy()
+        if signal.get("mentioned"):
+            self._state.social_battery = max(0.0, self._state.social_battery - policy.battery_per_mention)
+        else:
+            self._state.social_battery = max(0.0, self._state.social_battery - policy.battery_per_message)
+        self._state.last_contact_at = float(signal.get("at") or 0.0) or self._state.last_contact_at
+        self._state.loneliness = max(
+            0.0, self._state.loneliness - self._mood_policy().loneliness_relief_per_contact
+        )
+
+    async def _maybe_inject_mood(self, session_id: str, now: float) -> None:
+        """该会话用户发消息时，若内心过载则注入一条风格提示（每天每会话至多一条）。
+
+        通道是 ``ctx.maisaka.context.append``（世界内措辞）；失败只降级并计数，
+        连续失败 3 次就停手（宿主可能没这个能力，别每条消息都白打一次 RPC）。
+        """
+
+        if not self.config.mood.enabled or not self.config.mood.inject_notice:
+            return
+        if self._mood_inject_failures >= 3:
+            return
+        sim_config = self._sim_config()
+        day_key = day_key_of(
+            local_datetime(now, sim_config.tz_offset_minutes), sim_config.day_boundary_hour
+        )
+        dedup_key = f"{session_id}:{day_key}"
+        if dedup_key in self._state.mood_injected:
+            return
+        lines = mood_injection_lines(self._state)
+        if not lines:
+            return
+        try:
+            await self.ctx.maisaka.context.append(
+                session_id,
+                [{"type": "text", "text": " ".join(lines)}],
+                visible_text=" ".join(lines),
+                source_kind="life_mood",
+            )
+        except Exception as exc:  # noqa: BLE001 —— 注入失败只降级
+            self._mood_inject_failures += 1
+            self.ctx.logger.debug("%s 内心状态注入失败（%d/3）：%s", __plugin_id__,
+                                  self._mood_inject_failures, exc)
+            return
+        # 标记放在**成功之后**：失败的下一次还有机会（连续失败 3 次后停手）
+        self._state.mood_injected[dedup_key] = float(now)
+
+    # ------------------------------------------------------------ 关系模型
+
+    def _is_reply_to_bot(self, message: Any) -> bool:
+        """这条群聊消息是不是对她消息的回复（建档判据 3）。
+
+        载荷可能带 ``reply``/``reply_to``/``source_messages``：只要其中任一条的
+        发送者是她自己（user_info.user_id 与 bot 的 person id 一致，或明确标记
+        ``is_bot``/``is_mai``）就算。认不出来按 False 处理（宁可漏建档）。
+        """
+
+        for key in ("reply", "reply_to", "reply_message"):
+            candidate = message.get(key) if isinstance(message, dict) else None
+            if isinstance(candidate, Mapping):
+                candidate = [candidate]
+            if not isinstance(candidate, list):
+                continue
+            for item in candidate:
+                if not isinstance(item, Mapping):
+                    continue
+                if (item.get("is_bot") is True or item.get("is_mai") is True):
+                    return True
+                sender = item.get("user_info") or {}
+                if isinstance(sender, Mapping) and (
+                    str(sender.get("user_id") or "") == str(getattr(self, "_bot_user_id", "") or "")
+                    and str(getattr(self, "_bot_user_id", "") or "")
+                ):
+                    return True
+        # 载荷平铺的 reply 标记（部分版本）
+        if isinstance(message, dict) and (message.get("is_reply_to_bot") is True):
+            return True
+        return False
+
+    async def _record_relation(self, message: Any, *, session_id: str, group_id: str,
+                         user_id: str, now: float) -> None:
+        """关系建档（v1.11.0）：判据见 life_relations.should_record。
+
+        群聊只对被 @/被回复的人建档；私聊任何消息都记。全部纯内存 + SQLite 读写，
+        不发其余 RPC。
+
+        ⚠ v1.13.1（F-002，安全审计）：SQLite 读写**必须**走 ``asyncio.to_thread``
+        ——这是消息主链钩子（BLOCKING+EARLY），同步磁盘 I/O 会卡住整个事件循环
+        （``life_store`` 模块说明里写好的纪律，v1.11.0 接线时漏了这一层）。
+        """
+
+        if not self.config.relations.enabled or self._routine_store is None:
+            return
+        if not user_id:
+            return
+        private_chat = not bool(group_id)
+        # v1.13.1（R2，代码审查）：与睡眠唤醒路径统一用 ``flag_value`` 严格真值——
+        # ``bool("false")`` 是 True，宿主把 flag 序列化成字符串时会「没被 @」判成「被 @」
+        mentioned = (
+            flag_value(message, "is_mentioned") or flag_value(message, "is_at")
+        ) if isinstance(message, dict) else False
+        reply_to_bot = self._is_reply_to_bot(message)
+        if not relation_should_record(
+            private_chat=private_chat,
+            mentioned=mentioned,
+            is_reply_to_bot=reply_to_bot,
+            user_id=user_id,
+        ):
+            return
+        store = self._routine_store
+        record = await asyncio.to_thread(
+            relation_touch,
+            store, user_id=user_id, now=now,
+            mentioned=mentioned,
+            keep=int(self.config.relations.keep),
+        )
+        # v1.16.3（M7）：顺手把熟悉度记进内存索引——「社交情绪按关系加权」要用它，
+        # 但那条链路在 tick 里，不能为此每 tick 读一次库（详见 _relation_familiarity）。
+        if isinstance(record, dict):
+            self._remember_familiarity(user_id, record.get("familiarity"))
+
+    def _remember_familiarity(self, user_id: str, familiarity: Any) -> None:
+        """把一条熟悉度记进内存索引（带容量上限，防止长期运行无限增长）。"""
+
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        try:
+            value = float(familiarity)
+        except (TypeError, ValueError):
+            return
+        if value != value:
+            return
+        if len(self._relation_familiarity) >= _RELATION_INDEX_LIMIT and uid not in self._relation_familiarity:
+            # 简单淘汰：丢掉最早插入的一条（dict 保序）。索引只是加速器，
+            # 丢条目最多让某个会话这一轮按陌生人算，不会影响档案本身。
+            self._relation_familiarity.pop(next(iter(self._relation_familiarity)), None)
+        self._relation_familiarity[uid] = max(0.0, value)
+
+    async def _refresh_relation_index(self) -> None:
+        """全量刷新熟悉度索引（每天一次，与熟悉度衰减同处调用）。
+
+        v1.16.3（M7）：只读一次 ``top_relationships``，比每 tick 读库便宜得多；
+        漏掉的人按陌生人处理（系数 1.0），而他们有互动时会被 ``_record_relation`` 补上。
+        """
+
+        if not self.config.relations.enabled or self._routine_store is None:
+            self._relation_familiarity = {}
+            return
+        try:
+            records = await asyncio.to_thread(
+                self._routine_store.top_relationships, int(self.config.relations.keep)
+            )
+        except Exception as exc:  # noqa: BLE001 —— 索引刷新失败只降级（按陌生人算）
+            self.ctx.logger.debug("%s 关系索引刷新失败：%s", __plugin_id__, exc)
+            return
+        index: dict[str, float] = {}
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            uid = str(record.get("user_id") or "").strip()
+            if not uid:
+                continue
+            try:
+                index[uid] = max(0.0, float(record.get("familiarity") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        self._relation_familiarity = index
+
+    def _relation_factor_for_signals(self, signals: Any) -> float:
+        """这场 tick 的实时信号里**最熟的那个人**的社交情绪系数（v1.16.3 M7）。
+
+        取最大值而不是平均：事件文本是「有人找我」聚合出来的，只要其中有一个熟人，
+        这件事对她的分量就更重。认不出人（索引里没有）按陌生人算 ⇒ 系数 1.0。
+        关系层关掉或索引为空时恒 1.0 —— 这正是决议 3 要的「开箱即用 = 旧行为」。
+        """
+
+        if not self.config.relations.enabled or not self.config.social.relation_emotion_scaling:
+            return 1.0
+        best = 0.0
+        for signal in signals if isinstance(signals, (list, tuple)) else []:
+            if not isinstance(signal, dict):
+                continue
+            uid = str(signal.get("user_id") or "").strip()
+            if uid:
+                best = max(best, float(self._relation_familiarity.get(uid, 0.0)))
+        return relation_emotion_factor(best, curve=self._relation_emotion_curve())
+
+    def _relation_emotion_curve(self) -> tuple[tuple[float, float], ...]:
+        """``[social] relation_emotion_curve`` → 点集（坏行告警一次后忽略）。"""
+
+        points, warnings = parse_curve_points(self.config.social.relation_emotion_curve)
+        if warnings:
+            self._warn_once(
+                "relation_emotion_curve",
+                "关系系数曲线有 %d 行无法解析（已忽略，其余照常生效）：%s",
+                len(warnings),
+                "；".join(warnings[:3]),
+            )
+        return points or relation_emotion_curve()
+
+    async def _relation_multiplier(self, session_id: str) -> float:
+        """该会话对方的主动开口阈值系数（关系档位；判不出人 = 1.0）。
+
+        ⚠ v1.13.1（F-002）：SQLite 读走 ``asyncio.to_thread``，别在事件循环上碰盘。
+        """
+
+        if not self.config.relations.enabled or self._routine_store is None:
+            return 1.0
+        info = self._seen_sessions.get(session_id)
+        user_id = str(_as_text(info.get("user_id"), "")) if isinstance(info, dict) else ""
+        if not user_id:
+            return 1.0
+        record = await asyncio.to_thread(self._routine_store.get_relationship, user_id)
+        if not record:
+            return 1.0
+        return float(relation_threshold_multiplier(record.get("familiarity") or 0.0))
+
+    # ------------------------------------------------------------ 打断机制
+
+    def _interrupt_policy(self) -> Any:
+        """配置 → 覆盖了 ``interrupt_hold`` 的 ``EnforcePolicy``。
+
+        单独抽出来是因为「窗口内要不要保住聊天态」是**插件配置**而不是
+        ``SimConfig`` 字段，而 ``enforce_and_apply`` 只吃 ``SimConfig``。
+        所有收口都必须走 ``_enforce_and_apply``（下面那个包装），否则漏了这一步
+        就会静默退回默认 True——用户关掉它却发现没效果。
+        """
+
+        policy = build_enforce_policy(self._sim_config())
+        # v1.13.1（R8，代码审查）：打断总开关关闭时连「保住聊天态」也一起失效——
+        # 「关掉就该立刻回到硬约束语义」，否则残留窗口还会继续压住入睡与 routine
+        return _replace(
+            policy,
+            interrupt_hold=bool(
+                self.config.interrupt.enabled and self.config.interrupt.hold_over_sleep
+            ),
+        )
+
+    def _rest_day(self, now: float) -> bool:
+        """今天是不是「休息日」（v1.15.0 PR-R4）：法定节假日 / 班表休息日 / 周末。
+
+        走与习惯层 ``later`` 判据同源的 ``_routine_day_flags``（班表 + 中国日历），
+        日历表缺当年数据时它自己降级成「周末 = 休息」。**日历与班表都不归纯模块管**，
+        所以这个事实由 plugin 侧算好塞进 ``ActivityFacts.rest_day``。
+        """
+
+        try:
+            is_workday, _is_holiday = self._routine_day_flags(
+                local_datetime(now, self._sim_config().tz_offset_minutes)
+            )
+        except Exception:  # noqa: BLE001 —— 取不到就当工作日（宁可少睡懒觉）
+            return False
+        return not bool(is_workday)
+
+    def _insomnia_roll(self, now: float) -> bool:
+        """本轮「入睡困难」的掷骰（v1.15.0 PR-R2）——**注入 rng、每生活日至多一次**。
+
+        只负责算事实（压力阈值 + 概率 + 去重），裁定与场景在 ``life_activity.enforce``：
+        纯函数那边不碰 rng，调用方把结果当事实传进去。命中后写 ``motive_seen``
+        （与动机/病程事件同一张去重表，重启不重掷）。
+        """
+
+        if not bool(self.config.mood.insomnia_enabled):
+            return False
+        threshold = max(0.0, float(self.config.mood.insomnia_stress_threshold))
+        if float(self._state.stress) < threshold:
+            return False
+        sim_config = self._sim_config()
+        day_key = self._state.day_key or day_key_of(
+            local_datetime(now, sim_config.tz_offset_minutes), sim_config.day_boundary_hour
+        )
+        dedup = f"insomnia:{day_key}"
+        if dedup in self._state.motive_seen:
+            return False
+        probability = max(0.0, min(1.0, float(self.config.mood.insomnia_probability)))
+        if probability <= 0.0 or self._rng.random() >= probability:
+            return False  # 没中：本轮照常睡（去重键不写，下一轮还能再掷）
+        self._state.motive_seen[dedup] = float(now)
+        self._state_dirty = True
+        return True
+
+    def _enforce_and_apply(self, now: float, decision: Any) -> None:
+        """全插件**唯一**的活动收口入口（强制层 + 打断态策略）。
+
+        刻意包一层而不是让各处直接调 ``life_sim.enforce_and_apply``：
+        打断窗口的 ``in_interrupt`` 事实与 ``interrupt_hold`` 策略都从这里进，
+        漏掉任何一处都会让「窗口内保住聊天态」在不同调用点上表现不一致。
+        v1.15.0 又多了三件只有 plugin 侧才知道的事实：休息日（要查日历）、
+        失眠掷骰（要 rng 与每夜去重）、赖床宽限窗（要在醒来时开）。
+        """
+
+        sim_config = self._sim_config()
+        # v1.17.0（PR-CAL-1）：日历覆盖与提示词侧**同一份**（`_schedule_calendar_override`），
+        # 否则节假日会出现「提示词说放假、强制层还在岗」
+        local_dt = local_datetime(now, sim_config.tz_offset_minutes)
+        override, day_name = self._schedule_calendar_override(local_dt)
+        facts = enforce_facts(
+            self._state,
+            now=now,
+            config=sim_config,
+            rest_day=self._rest_day(now),
+            workday_override=override,
+            day_name=day_name,
+            # v1.17.0（PR-SCH-2）：与提示词侧同一个生活日 ⇒ 同一份微扰/加班事实
+            day_key=self._schedule_day_key(local_dt),
+        )
+        # 只有「她想睡」时才掷失眠（其余轮次不该消耗随机性，否则同一条时间线
+        # 会因为她什么时候提议睡觉而整体漂移）
+        if (
+            decision is not None
+            and str(getattr(decision, "activity", "")) == SLEEP
+            and not is_cold(self._state, now)
+        ):
+            facts = _replace(facts, insomnia_roll=self._insomnia_roll(now))
+        # 梦境检测（v1.12.0）：apply 前记住「她是否在睡、几点睡下的」——apply 内部
+        # 会清掉 sleep_started_at，醒来后就量不出来了
+        was_sleeping = is_asleep(self._state.activity)
+        sleep_started = float(self._state.sleep_started_at or 0.0)
+        resolved = enforce(facts, decision, self._interrupt_policy())
+        self._state = apply_activity(self._state, resolved, now=now, config=sim_config)
+        if was_sleeping and not is_asleep(self._state.activity) and sleep_started > 0.0:
+            minutes = max(0.0, (float(now) - sleep_started) / 60.0)
+            if minutes >= DREAM_MIN_SLEEP_MINUTES:
+                # 只标记不生成：LLM 调用回到 tick 的 async 流程（_maybe_dream），
+                # 绝不在收口路径上发 RPC。小憩（<3h）不标记——小憩不做梦。
+                self._dream_wake_pending = (float(now), minutes)
+        # 赖床宽限（v1.15.0 PR-R3）：强制层把她唤醒到 daze 时开一个窗口，
+        # 否则下一个 tick 的 enforce 见她在睡眠时段内、又够格入睡，会立刻把她
+        # 送回床（README 里那条「睡下 → 唤醒 → 再睡」的短周期往复）。
+        if resolved.activity == DAZE and resolved.source == SOURCE_ENFORCED:
+            grace_minutes = max(0, int(self.config.simulation.wake_daze_minutes))
+            if grace_minutes > 0:
+                self._state.wake_grace_until = max(
+                    float(self._state.wake_grace_until or 0.0),
+                    float(now) + grace_minutes * 60.0,
+                )
+                self._state_dirty = True
+        elif float(self._state.wake_grace_until or 0.0) <= float(now):
+            # 窗口过期顺手清零：状态卡与判据都读它，留一个旧时间戳只会让
+            # 「她为什么还醒着」变成疑案
+            self._state.wake_grace_until = 0.0
+
+    def _maybe_care(
+        self, message: Any, *, session_id: str, group_id: str, now: float
+    ) -> bool:
+        """生病期间收到一条「关心」（v1.14.0 §5.1）——**纯内存旁路**。
+
+        判据（全部满足才算）：她正生病 + 私聊或被 @ + 消息命中**严格句式** +
+        该会话今天还没记过。效果：``care_today`` +1（供病程流转加分）与一次
+        情绪 ``+0.3``（走 ``append_social_event``，不动情绪回归）。
+
+        **刻意不做的事**：不发 RPC、不切活动、不抬高倍率。她在养病，回不回话由
+        频率因子与宿主决定——「关心 = 病中随叫随回」既破坏拟真，也和「生病话少」
+        的设定直接冲突。命中与否都只在 debug 留痕（正常轮次必须安静）。
+        """
+
+        if int(self.config.health.cold_care_daily_cap) <= 0:
+            return False  # 用户明确关掉了「关心影响病程」，连计数都不必做
+        if not is_cold(self._state, now):
+            return False
+        if not isinstance(message, Mapping):
+            return False
+        private_chat = not bool(group_id)
+        if not (
+            private_chat
+            or flag_value(message, "is_at")
+            or flag_value(message, "is_mentioned")
+        ):
+            return False
+        text = str(
+            message.get("processed_plain_text") or message.get("plain_text") or ""
+        ).strip()
+        if not text:
+            return False
+        patterns = self._care_patterns()
+        if not patterns or not care_hit(text, patterns):
+            return False
+
+        sim_config = self._sim_config()
+        if not register_care(
+            self._state, now=now, session_id=session_id, config=sim_config
+        ):
+            return False  # 这个会话今天已经记过一次（去重表命中）
+        self._state = append_social_event(
+            self._state,
+            {
+                "at": float(now),
+                "label": "有人关心",
+                "activity": self._state.activity,
+                "text": sanitize_text(text, max_chars=60),
+                "emotion": float(CARE_EMOTION_GAIN),
+                "energy": 0.0,
+            },
+            config=sim_config,
+        )
+        self._state_dirty = True
+        day_key = day_key_of(
+            local_datetime(now, sim_config.tz_offset_minutes),
+            sim_config.day_boundary_hour,
+        )
+        self.ctx.logger.debug(
+            "%s 病程：session=%s 的一条关心已记账（今日 %d 次）",
+            __plugin_id__,
+            session_id,
+            int(float(self._state.care_today.get(day_key, 0.0) or 0.0)),
+        )
+        return True
+
+    async def _maybe_interrupt(
+        self,
+        message: Any,
+        *,
+        session_id: str,
+        group_id: str,
+        now: float,
+    ) -> str:
+        """消息旁路里的打断触发（v1.11.1）。返回理由（空串 = 没打断）。
+
+        判据全部在 ``life_interrupt``（纯模块）；这里只做**宿主相关**的三件事：
+        取 flag（``is_at`` / ``is_command``）、调 ``context.append`` 注入、留日志。
+
+        ⚠ 整个方法不抛异常给调用方（``note_session`` 侧还有一层 try）——它挂在
+        消息主链上，任何失败都不该影响别人回消息。
+        """
+
+        if not self.config.interrupt.enabled:
+            return ""
+        if not isinstance(message, Mapping):
+            return ""
+        private_chat = not bool(group_id)
+        # v1.13.1（R2，代码审查）：统一 ``flag_value`` 严格真值——``bool("false")``
+        # 是 True，宿主把 flag 序列化成字符串时宽松读法会把「没被 @」判成「被 @」，
+        # 每条群消息都触发打断（同钩子的睡眠唤醒路径从一开始就用严格口径）。
+        mentioned = flag_value(message, "is_at") or flag_value(message, "is_mentioned")
+        # 命令不进打断：``/生活`` 是查状态的，不是找她说话
+        is_command = flag_value(message, "is_command") or flag_value(
+            message, "is_explicit_command"
+        )
+        # 她自己发的消息不打断自己：显式标记，或发送者 user_id 与 bot 的 person id 一致
+        sender_info = message.get("user_info")
+        sender_id = str(sender_info.get("user_id") or "") if isinstance(sender_info, Mapping) else ""
+        is_bot_message = (
+            flag_value(message, "is_bot")
+            or flag_value(message, "is_mai")
+            or (bool(self._bot_user_id) and sender_id == str(self._bot_user_id))
+        )
+        battery = float(self._state.social_battery) if self.config.mood.enabled else None
+        reason = interrupt_should(
+            enabled=True,
+            activity=self._state.activity,
+            is_command=is_command,
+            is_bot_message=is_bot_message,
+            private_chat=private_chat,
+            mentioned=mentioned,
+            battery=battery,
+        )
+        if not reason:
+            return ""
+        was_chatting = self._state.activity == INTERRUPT_CHATTING
+        previous = self._state.activity
+        interrupt_apply(
+            self._state,
+            now=now,
+            window_minutes=int(self.config.interrupt.window_minutes),
+        )
+        self._state_dirty = True
+        if not was_chatting:
+            # v1.13.1（F-004）：新的一次打断 ⇒ 批次号 +1，注入去重键随批次变化
+            self._interrupt_batch += 1
+            self.ctx.logger.info(
+                "%s 被消息打断：%s → 聊天中（回完回原活动）",
+                __plugin_id__,
+                self._activity_label(previous),
+            )
+        if self.config.interrupt.inject_notice and not was_chatting:
+            await self._append_interrupt_fact(session_id, previous, now)
+        return reason
+
+    async def _append_interrupt_fact(self, session_id: str, previous: str, now: float) -> None:
+        """向该会话注入「她放下手里的事」。
+
+        去重按 ``(session_id, 打断批次)``：批次 = ``interrupted_from`` 变化。
+        连续聊天顺延**不**重复注入（一次打断只说一次「她放下筷子」，
+        说三遍就成了系统广播）。失败只降级，不影响消息主链。
+
+        ⚠ v1.13.1（F-004，安全审计）：去重键必须含**批次**（``_interrupt_batch``，
+        每次「从非 chatting 进入 chatting」+1）——只按 ``(session, 原活动)`` 的话，
+        同活动第二次打断永远不会注入，语义从「一次打断说一次」被反转成
+        「同活动一辈子说一次」。
+        """
+
+        dedup_key = f"{session_id}:{previous}:batch{self._interrupt_batch}"
+        if dedup_key in self._state.interrupt_injected:
+            return
+        text = interrupt_context_fact(previous, self._activity_label)
+        try:
+            await asyncio.wait_for(
+                self.ctx.maisaka.context.append(
+                    session_id,
+                    [{"type": "text", "text": text}],
+                    visible_text=text,
+                    source_kind="life_interrupt",
+                ),
+                timeout=1.2,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 注入失败只降级
+            self.ctx.logger.debug("%s 打断事实注入失败：%s", __plugin_id__, exc)
+            return
+        # 标记放在成功之后（同 _maybe_inject_mood）
+        self._state.interrupt_injected[dedup_key] = float(now)
+
+    def _prune_injection_tables(self, now: float) -> None:
+        """注入去重表的统一清理点（v1.13.1，F-003/R7）。
+
+        ``mood_injected``（键含生活日，每天每会话一条）与 ``interrupt_injected``
+        （键含打断批次）都没有既有上界——跑一年能把状态文件拖到几 MB、
+        每 tick 全量重写一遍。两张表的值都是**时刻**，按 14 天 TTL 淘汰即可
+        （去重语义从不需要超过一天）；打断结束的批次键顺手清（表小，成本可忽略）。
+        """
+
+        cutoff = now - 14 * 86400.0
+        for table in (self._state.mood_injected, self._state.interrupt_injected):
+            if len(table) > 64:
+                stale = [key for key, value in table.items() if value < cutoff]
+                for key in stale:
+                    table.pop(key, None)
+
+    def _expire_interrupt(self, now: float) -> bool:
+        """tick 开头调用：窗口结束 → 回到原活动。返回是否真的回退了。
+
+        回退**仍过** ``enforce``：她回完消息不一定接着干原活动，而班表照常管着
+        她（在岗时回完消息就回岗位）。唯一豁免的是最短停留期——「回到吃饭」是
+        **续上**原来的事，不是一次新切换；不豁免她会被 ``min_dwell``（60 分钟）
+        永远卡在「聊天中」（``CHATTING`` 的停留计时只有几分钟）。豁免通过
+        ``ActivityFacts.interrupt_return_to`` 传入，只在这一次 enforce 生效。
+
+        回退事件同时落一条 ``recent_events``，让「她刚才去回了会儿消息」出现在
+        下一轮提示词的近层里。
+        """
+
+        previous = str(getattr(self._state, "interrupted_from", "") or "")
+        decision = interrupt_expire(self._state, now=now)
+        if decision is None:
+            return False
+        sim_config = self._sim_config()
+        facts = enforce_facts(self._state, now=now, config=sim_config)
+        facts = _replace(facts, interrupt_return_to=decision.activity)
+        resolved = enforce(facts, decision, self._interrupt_policy())
+        self._state = apply_activity(self._state, resolved, now=now, config=sim_config)
+        if previous:
+            note = interrupt_expire_note(previous, self._activity_label)
+            self._state.recent_events.append(
+                {
+                    "at": float(now),
+                    "label": "打断回退",
+                    "activity": self._state.activity,
+                    "text": note,
+                    "emotion": 0.0,
+                    "energy": 0.0,
+                }
+            )
+            self.ctx.logger.info("%s 打断结束：%s", __plugin_id__, note)
+        self._state_dirty = True
+        return True
+
+    # ------------------------------------------------------------ 梦境
+
+    async def _maybe_dream(self, now: float) -> None:
+        """本 tick 刚醒来的长睡眠 → 按概率生成一条梦（v1.12.0）。
+
+        生成两级：``[dream].use_llm`` 开着先试一次短模型调用（昨日经历摘要 +
+        当前压力/孤独做种子，预算约 50 token），失败/超时/关闭一律落到内置
+        模板库（按情绪基调分桶抽取）——**永不阻塞醒来流程**，最坏情况就是
+        「今天没做梦」或「梦是模板句」。
+
+        落库两处：``recent_events``（label=梦境，进下一轮提示词近层）与主动开口
+        素材（权重 0.6，``expires_at`` = 本地今天 12:00——下午醒来的那觉不产
+        素材，上午已经过了，下午还讲梦就奇怪了）。
+        """
+
+        pending = self._dream_wake_pending
+        self._dream_wake_pending = None
+        if pending is None or not self.config.dream.enabled:
+            return
+        wake_at, sleep_minutes = pending
+        # v1.13.1（R9，代码审查）：pending 滞留（停用期间的 tick / 进程重启前的
+        # 旧标记）时，旧 wake_at 会把「几天前的梦」写进近层经历。超过 2 小时的
+        # 标记直接丢弃——那一觉的梦已经没有叙事价值了。
+        if float(now) - wake_at > 2 * 3600.0:
+            return
+        if not dream_roll(
+            enabled=True,
+            probability=float(self.config.dream.probability),
+            sleep_minutes=sleep_minutes,
+            rng=self._rng,
+        ):
+            return
+
+        # 种子：最近的几条经历摘要（排除上一次的梦），+ 当前内心状态
+        seed_lines: list[str] = []
+        for item in reversed(self._state.recent_events):
+            if not isinstance(item, dict):
+                continue
+            if item.get("kind") == "dream":
+                continue
+            text = sanitize_text(item.get("text") or "", max_chars=40)
+            if text:
+                seed_lines.append(text)
+            if len(seed_lines) >= 5:
+                break
+
+        text = ""
+        if self.config.dream.use_llm:
+            text = await self._dream_via_llm(wake_at, seed_lines)
+        if not text:
+            bucket = dream_mood_bucket(self._state.stress, self._state.loneliness)
+            text = dream_template(bucket, self._rng)
+            self.ctx.logger.info(
+                "%s 梦境（模板兜底，基调 %s）：%s", __plugin_id__, bucket, text
+            )
+        else:
+            self.ctx.logger.info("%s 梦境（模型生成）：%s", __plugin_id__, text)
+
+        self._state.recent_events.append(
+            dream_recent_event(text, now=wake_at, activity=self._state.activity)
+        )
+        self._state_dirty = True
+        expires_at = self._noon_epoch(now)
+        if expires_at > now:
+            self._state.materials.append(
+                dream_material(text, now=now, expires_at=expires_at)
+            )
+
+    async def _dream_via_llm(self, now: float, seed_lines: list[str]) -> str:
+        """一次短模型调用生成梦（预算 ~50 token / 10s 超时）。失败返回空串。"""
+
+        prompt = dream_prompt(
+            bot_name=self._persona_label(),
+            stress=float(self._state.stress),
+            loneliness=float(self._state.loneliness),
+            seed_lines=tuple(seed_lines),
+        )
+        kwargs: dict[str, Any] = {}
+        task_name = str(self.config.activity.llm.task_name or "").strip()
+        if task_name:
+            kwargs["task_name"] = task_name
+        try:
+            result = await self.ctx.llm.generate(
+                prompt=prompt,
+                temperature=0.9,
+                max_tokens=60,
+                timeout_ms=10_000,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 模型不可用就落到模板
+            self.ctx.logger.debug("%s 梦境模型调用失败：%s", __plugin_id__, exc)
+            return ""
+        raw = ""
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                return ""
+            raw = str(result.get("response") or result.get("content") or "")
+        elif isinstance(result, str):
+            raw = result
+        return dream_sanitize(raw)
+
+    def _noon_epoch(self, now: float) -> float:
+        """本地「今天 12:00」的 epoch 秒（梦素材的触底时刻）。
+
+        按真实墙钟日（不是生活日）算：方案八 §8.2 的「上午衰减到 0」说的就是
+        日历意义上的上午。``now`` 已过今天 12:00 时返回值 <= now，调用方据此
+        跳过素材（下午醒来不产梦素材）。
+
+        ⚠ v1.13.1（R1，代码审查）：``local_datetime`` 返回的是**已经加过偏移**的
+        tz-aware datetime，它的 ``.timestamp()`` 比真实 epoch 大 ``offset*60``——
+        必须减回来。同文件节日素材（``_calendar_festival_material``）与
+        ``life_social`` 的同类转换都是这么写的；漏减会把触底时刻整体平移
+        （真机默认 UTC+8 下偏 8 小时：她会在傍晚讲梦）。
+        """
+
+        sim_config = self._sim_config()
+        local = local_datetime(now, sim_config.tz_offset_minutes)
+        noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
+        return noon.timestamp() - sim_config.tz_offset_minutes * 60
+
+    def _persona_label(self) -> str:
+        """人设名（梦的提示词主语）；读不到就退回「她」。"""
+
+        return sanitize_text(getattr(self, "_bot_name", "") or "", max_chars=20) or "她"
+
+    def _interrupt_skip_reason(self, now: float) -> str:
+        """窗口内不问模型的理由（状态卡与沉默台账统一措辞）。"""
+
+        if not self.config.interrupt.enabled:
+            return ""
+        return interrupt_pointless_reason(self._state, now=now)
+
+    # ------------------------------------------------------------ 生理锚点
+
+    def _physio_window_key(self, window: Any) -> str:
+        """一个生理窗的当日去重键（窗口 + 名称共同决定：改配置立刻生效）。"""
+
+        return f"{window.start}-{window.end}:{window.label}"
+
+    def _settle_physio_intake(self, decision: Any, now: float) -> bool:
+        """一次「真的吃成 / 洗成」的入账（v1.17.0，PR-PHY-1 / PR-ROU-1）。
+
+        **习惯表（``physio=true``）与生理窗共用这一份**：回饱、记时刻、计数。
+        分两份写的代价这个仓库已经付过两次——v1.14.1 的「提案被拒也记账」让她
+        整天吃不上饭（README 1.14.1 条），P1-2 的「习惯行写了吃早饭却从不回饱」
+        让她吃了早饭还饿着。**新的 proposal 源必须走这里**，不许再抄一遍
+        ``state.satiety + 4.5``。
+
+        返回 ``True`` = 这次真的入账；``False`` = 距上次进餐太近（同一顿）——
+        活动照旧（她就是在吃），但不重复回饱、不重复计数。
+        """
+
+        activity = str(getattr(decision, "activity", "") or "")
+        if activity == MEAL:
+            last = float(getattr(self._state, "last_meal_at", 0.0) or 0.0)
+            if last > 0.0 and (float(now) - last) < MEAL_INTAKE_MIN_GAP_SECONDS:
+                self.ctx.logger.info(
+                    "%s 进餐入账跳过：距上一餐仅 %.0f 分钟（< %.0f 分钟），"
+                    "同一顿不重复回饱",
+                    __plugin_id__,
+                    (float(now) - last) / 60.0,
+                    MEAL_INTAKE_MIN_GAP_SECONDS / 60.0,
+                )
+                return False
+            self._state.last_meal_at = float(now)
+            # v1.17.0（PR-PHY-1）：回饱走 ``life_physio.eat_amount``——它的
+            # floor/rescue 语义（「饿透了至少回 6.5 成」）以前是**死代码**，
+            # 实现在这里平加 4.5。rescue 取 4.5 让饱腹 ≥ 2.0 的区间与 v1.16.3
+            # **逐位一致**，只有饿透（< 2.0）时被 floor 托起：那不是行为漂移，
+            # 正是模块 docstring 承诺的「线性只加一点的话她永远在挨饿，那不是人」。
+            self._state.satiety = min(
+                10.0, float(eat_amount(self._state.satiety, floor=0.65, rescue=4.5))
+            )
+            self._state.meal_count_today = int(self._state.meal_count_today) + 1
+            return True
+        if activity == BATH:
+            self._state.last_bath_at = float(now)
+            return True
+        return True
+
+    async def _run_physio(self, now: float, sim_config: SimConfig) -> tuple[bool, str]:
+        """跑一次生理锚点：命中且当日未触发过就把 proposal 交给强制层。
+
+        返回 ``(是否命中, 不问模型的理由)``。三条不问模型的理由与习惯层一样互不等价
+        （命中 / 窗口内 / 与生理无关），别合并。
+
+        ⚠ 命中**仍过** ``enforce``：睡着的她不会被「该吃早饭了」叫醒——半夜 tick
+        睡眠中的她在早饭窗里，proposal 会被睡眠分支收口成「继续睡」，什么都不会发生。
+        加餐（``snack``）只在饱腹掉到阈值以下时才出现。
+        """
+
+        if not self.config.physio.enabled:
+            return False, ""
+        windows = self._parsed_physio_windows
+        if not windows:
+            # ⚠ 这条以前是**完全静默**的 return：配置里 `[physio] meals` 被清空/写坏时，
+            # 饱腹照常下降、但永远不会触发任何一餐 —— 真机上只表现为状态卡上
+            # 「今日已吃 0 顿、饱腹一路见底」，日志里一个字都没有（2026-10-09 真机排查）。
+            self._warn_once(
+                "physio_windows_empty",
+                "生理锚点已启用但没有任何可用时间窗（[physio] meals 为空或全部解析失败）："
+                "她不会自己吃饭，饱腹会一路下降。请检查 [physio] meals 配置",
+            )
+            return False, ""
+        local_now = local_datetime(now, sim_config.tz_offset_minutes)
+        now_minutes = local_now.hour * 60 + local_now.minute
+        day_key = day_key_of(local_now, sim_config.day_boundary_hour)
+        is_workday, is_holiday = self._routine_day_flags(local_now)
+
+        # 跨日清理：生活日变了就丢掉昨天的触发记录
+        if self._physio_fired and day_key not in self._physio_fired:
+            self._physio_fired.clear()
+        fired_today = self._physio_fired.setdefault(day_key, set())
+
+        active = physio_active_windows(
+            windows,
+            now_minutes,
+            # v1.17.0（PR-PHY-3）：生理窗的日期修饰符（days / workday_only /
+            # holiday_only）。日标志与习惯层同一份来源（日历优先），
+            # 「上班日 12:00 午餐、周末 13:30 午餐」这样才写得出来。
+            weekday=int(local_now.isoweekday()),
+            is_workday=is_workday,
+            is_holiday=is_holiday,
+        )
+        in_window_labels: list[str] = []
+        for window in active:
+            key = self._physio_window_key(window)
+            in_window_labels.append(window.label)
+            if key in fired_today:
+                continue
+            # 加餐不是「时间窗」而是「饿过头」：窗口只是它允许出现的时段
+            if window.kind == "snack" and not need_snack(self._state.satiety):
+                self.ctx.logger.info(
+                    "%s 生理窗跳过：%s（加餐窗，但饱腹 %.1f 还没饿到阈值）",
+                    __plugin_id__, window.label, float(self._state.satiety),
+                )
+                continue
+            # v1.14.0：**病中不掷「这顿不吃」**——她本来就需要进食，病中一顿不吃会
+            # 直接变成「一场感冒三天不吃」（真机 2026-10-09 状态卡「今日已吃 0 顿」）。
+            sick_now = cold_stage(self._state, now)
+            if (
+                not sick_now
+                and window.weight < 1.0
+                and self._rng.random() >= max(0.0, float(window.weight))
+            ):
+                # 今天这顿不吃。也必须记账：否则窗口内每个 tick 都重掷一次 0.9 的骰子。
+                # ⚠ 这条以前也是静默的：真机上「今天没吃」与「窗口没命中」在日志里长得
+                # 一模一样（都什么都没有），排查「她怎么不吃饭」时完全没有线索。
+                fired_today.add(key)
+                self.ctx.logger.info(
+                    "%s 生理窗：%s 今天这顿不吃（weight=%.2f 掷骰未过），本生活日不再重掷",
+                    __plugin_id__, window.label, float(window.weight),
+                )
+                return False, f"生理窗内（{window.label} 今天没吃）"
+            # v1.14.0 §3.1：病中放行三餐后，饭的场景跟着病程走（加重「喝点粥」、
+            # 好转「有胃口了」）——否则卡片上会出现「感冒加重 / 在吃大餐」的错位。
+            decision = physio_proposal(window, now=now, sick_stage=sick_now)
+            before_activity = self._state.activity
+            self._enforce_and_apply(now, decision)
+            # 进账只在**强制层真的采纳**时：睡着的她被睡眠分支收口 ⇒ 这顿饭没吃成，
+            # 不能回饱、不能计数（否则「睡过头」的每个 tick 都在凭空吃早饭）
+            adopted = self._state.activity == decision.activity
+            if adopted:
+                # ⚠ **只有真的吃成才记账**（v1.14.1 修）。以前在提案前就
+                # ``fired_today.add(key)``，于是「第一次提案被硬约束收口」= 这个窗口
+                # 当天的机会就此作废：真机 2026-10-09 状态卡「今日已吃 0 顿、饱腹 3.4」
+                # —— 她的午餐/晚餐窗都只有一次尝试，被睡眠或最短停留期挡掉就整天不吃。
+                # 现在收口不记账，窗口内的下一个 tick 会再试（窗口 90 分钟 ≈ 9 次机会），
+                # 她睡醒/停留期满后立刻就能吃上。
+                fired_today.add(key)
+                # v1.17.0（PR-PHY-1）：入账走习惯表共用的那份 ``_settle_physio_intake``
+                if self._settle_physio_intake(decision, now):
+                    self.ctx.logger.info(
+                        "%s 生理锚点：%s（%s）", __plugin_id__,
+                        window.label, self._activity_label(decision.activity),
+                    )
+            else:
+                # 不记账 ⇒ 本窗口当天还有机会。窗口内本来也不问模型（理由走
+                # 「生理窗内」），所以「多试几次」不会让模型调用变多。
+                self.ctx.logger.info(
+                    "%s 生理锚点被硬约束收口：%s → 保持 %s（%s）；"
+                    "本窗口不记账，窗口内下一个推进周期再试",
+                    __plugin_id__, window.label,
+                    self._activity_label(before_activity), self._state.activity_note,
+                )
+            return True, f"生理锚点：{window.label}"
+
+        if in_window_labels:
+            # 还有没触发过的窗（加餐不饿）→ 算「生理窗内」；全部触发过则落空，
+            # 但窗口还没过 ⇒ 仍算「生理窗内」（这一轮问模型大概率只会保持现状）
+            return False, f"生理窗内（{'、'.join(in_window_labels)}）"
+        if now < self._llm_gap_until:
+            return False, "习惯命中后的提问间隔内"
+        return False, ""
 
     # ------------------------------------------------------------ 主动开口
 
@@ -4135,6 +6923,89 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 error,
             )
 
+    # ------------------------------------------------------------ 开口动机
+
+    async def _refresh_motives(self, now: float, sim_config: SimConfig) -> None:
+        """三类动机素材的生成点（v1.13.0），每 tick 一次、全部自兜异常。
+
+        与节日素材同款模式：生成后直接 ``materials.append``，发不发由既有
+        主动开口管线裁决——动机只是「想说的念头」，不绕过任何闸、不进倍率。
+        去重表 ``motive_seen`` 落盘（重启不重发）；标记一律写在 append 之后
+        （失败还有机会）。
+        """
+
+        if not self.config.motives.enabled:
+            return
+        try:
+            local_now = local_datetime(now, sim_config.tz_offset_minutes)
+            day_key = day_key_of(local_now, sim_config.day_boundary_hour)
+            seen = self._state.motive_seen
+            fresh: list[dict[str, Any]] = []
+
+            # ① 问候类
+            if self.config.motives.greeting:
+                material = greeting_material(
+                    now_minutes=local_now.hour * 60 + local_now.minute,
+                    day_key=day_key,
+                    seen=seen,
+                )
+                if material:
+                    fresh.append(material)
+
+            # ② 生活分享类（v1.13.1 / R10：独占型活动不冒「想说话」的念头——
+            # 睡着的人不分享、正在回消息的人没空分享；这些活动的兜底模板句
+            # 会在凌晨凭空出现）
+            if self.config.motives.share and self._state.activity in (
+                "anime", "game", "music", "meal", "daze", "daily",
+                "night_study", "off_work", "commute",
+            ):
+                material = motive_share_material(
+                    activity=self._state.activity,
+                    rng=self._rng,
+                    day_key=day_key,
+                    seen=seen,
+                )
+                if material:
+                    fresh.append(material)
+
+            # ③ 关系维护类（SQLite 读在线程池；无库/未建档安静跳过）
+            idle_days = float(self.config.motives.relation_idle_days)
+            if self.config.motives.relation and idle_days > 0 and self._routine_store:
+                try:
+                    records = await asyncio.to_thread(
+                        self._routine_store.top_relationships, 10
+                    )
+                except Exception:  # noqa: BLE001 —— 读失败按「没有档案」
+                    records = []
+                fresh.extend(
+                    motive_relation_materials(
+                        records,
+                        now=now,
+                        day_key=day_key,
+                        seen=seen,
+                        idle_days=idle_days,
+                    )
+                )
+
+            if not fresh:
+                return
+            for material in fresh:
+                key = motive_key_of(material)
+                self._state.materials.append(motive_stamp(material, now=now))
+                if key:
+                    seen[key] = float(now)
+                self.ctx.logger.info(
+                    "%s 动机素材（%s）：%s", __plugin_id__,
+                    material.get("label", ""), material.get("text", ""),
+                )
+            # 去重表防无限增长（键含生活日，留 400 条足够回看几天）
+            if len(seen) > 400:
+                for old_key in sorted(seen, key=lambda k: seen[k])[: len(seen) - 400]:
+                    seen.pop(old_key, None)
+            self._state_dirty = True
+        except Exception as exc:  # noqa: BLE001 —— 动机是锦上添花，绝不拖垮 tick
+            self.ctx.logger.debug("%s 动机素材生成失败：%s", __plugin_id__, exc)
+
     async def _maybe_proactive(self, now: float) -> None:
         """跑一次主动开口判定：每轮全局最多挑 1 个会话，并记录沉默原因。"""
 
@@ -4146,6 +7017,41 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         state = self._state
         local_now = local_datetime(now, sim_config.tz_offset_minutes)
         day_key = state.day_key or day_key_of(local_now, sim_config.day_boundary_hour)
+
+        # 内心维度（v1.10.1）：电量闸全局判一次（电量是她的属性，不是会话的）。
+        # 放在会话列表**之前**：低电量不开口与「没有会话」一样是全局事实，
+        # 放在后面会在列表为空时静默返回、台账里一条线索都没有。
+        # 两档语义：<2 直接不开口；2–4 阈值上浮 0.5（还在挑话题，但明显不积极）。
+        mood_policy = self._mood_policy()
+        battery_state = battery_gate(state) if mood_policy.enabled else ""
+        if battery_state == "low_battery":
+            bump_skip_ledger(state.skip_ledger, battery_state)
+            return
+        if battery_state == "battery_threshold":
+            from dataclasses import replace as _dc_replace
+
+            rules = _dc_replace(
+                rules, score_threshold=float(rules.score_threshold) + _BATTERY_THRESHOLD_PENALTY
+            )
+
+        # 关系模型（v1.11.0）：按天限频的熟悉度衰减（无变化时是纯 SELECT，开销可忽略）
+        if self.config.relations.enabled and self._routine_store is not None:
+            decay_days = max(0.0, float(self.config.relations.decay_days))
+            if decay_days > 0:
+                day_key_now = day_key
+                if self._relations_decay_day != day_key_now:
+                    changed = await asyncio.to_thread(
+                        relations_decay_all,
+                        self._routine_store, now=now,
+                        keep=int(self.config.relations.keep),
+                    )
+                    if changed:
+                        self.ctx.logger.info(
+                            "%s 关系熟悉度衰减：%d 条档案被时间冲淡了一点", __plugin_id__, changed,
+                        )
+                    # v1.16.3（M7）：与衰减同处每天全量刷新一次熟悉度索引
+                    await self._refresh_relation_index()
+                    self._relations_decay_day = day_key_now
 
         sessions = await self._list_sessions()
         if not sessions:
@@ -4166,8 +7072,16 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             )
             if probed:
                 probes_left = max(0, probes_left - 1)
+            # 关系档位（v1.11.0）：对越熟的人，开口阈值越低（0.5×）；对陌生人翻倍（2×）
+            relation_factor = await self._relation_multiplier(session_id)
+            if relation_factor != 1.0 and isinstance(record, dict):
+                session_rules = _dc_replace_rules(
+                    rules, score_threshold=float(rules.score_threshold) * relation_factor
+                )
+            else:
+                session_rules = rules
             decision = decide_proactive(
-                config=rules,
+                config=session_rules,
                 now=now,
                 now_minutes=local_now.hour * 60 + local_now.minute,
                 activity=state.activity,
@@ -4202,6 +7116,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         if await self._trigger_proactive(session_id, decision, day_key, now):
             record_proactive(state.sessions, stream_id=session_id, now=now, day_key=day_key)
             bump_skip_ledger(state.skip_ledger, "sent")
+            # 主动开口也耗电（v1.10.1）
+            note_proactive_cost(state, policy=mood_policy)
             self._state_dirty = True
 
     async def _trigger_proactive(
@@ -4353,6 +7269,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             await self._fetch_identity()
 
         sim_config = self._sim_config()
+        # ⚠ 内心维度的时长锚点必须在 settle **之前**取下来：settle 的每一个出口都会把
+        # ``last_tick_at`` 推进到 ``now``（正常步进见 life_sim.settle 末，停机间隙见
+        # ``_skip_offline_gap``），事后再读它差分恒为 0。v1.17.1 修：旧写法就踩了这个坑，
+        # 三个内心维度永远冻在初值（真机实测：睡 199 分钟社交电量仍是 0.0）。
+        prev_tick_at = float(getattr(self._state, "last_tick_at", 0.0) or 0.0)
+        self._gap_skipped = False
         self._state = settle(
             self._state,
             now=now,
@@ -4363,11 +7285,14 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             on_clock_rollback=self._on_clock_rollback,
         )
 
+        # 打断窗口回退（v1.11.1）：必须在下面这次收口**之前**——她回完消息要先回到原活动，
+        # 否则这一次 enforce(None) 看到的是 CHATTING，会把「窗口已过」当成「还在回消息」。
+        self._expire_interrupt(now)
+        self._prune_injection_tables(now)
+
         # 先让硬约束收口一次，保证喂给模型的状态本身是合法的
         # （decision=None：模型没输出时它也可能**主动送她入睡**，见 life_activity.enforce）
-        self._state = enforce_and_apply(
-            self._state, now=now, config=sim_config, decision=None
-        )
+        self._enforce_and_apply(now, None)
 
         # 经济维度要在「请模型决定活动」之前取，否则这一轮的提示词拿不到「手头紧」
         await self._refresh_economy(now)
@@ -4378,15 +7303,106 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         await self._refresh_world(now)
         self._intake_world(now, sim_config)
 
+        # 节日素材（v1.10.0）：当天产出一条「今天是 XX」，挂进既有素材管道
+        festival_material = self._calendar_festival_material(now, sim_config)
+        if festival_material is not None:
+            self._state.materials.append(festival_material)
+            self.ctx.logger.info(
+                "%s 节日素材：%s", __plugin_id__,
+                festival_material.get("text", ""),
+            )
+
+        # 内心维度演化（v1.10.1）：本 tick 是否有互动从社交信号缓冲推断
+        mood_policy = self._mood_policy()
+        had_contact = bool(self._social_inbox) or self._state.last_contact_at > (
+            now - max(60, int(sim_config.tick_seconds))
+        )
+        had_mention = any(signal.get("mentioned") for signal in self._social_inbox)
+        # 停机间隙同样不结算内心维度，与 ``_skip_offline_gap``「那段时间状态无从判断」
+        # 是同一条口径（补算会凭空造出满格孤独）。
+        mood_minutes = 0.0
+        if prev_tick_at > 0.0 and not getattr(self, "_gap_skipped", False):
+            mood_minutes = max(0.0, (now - prev_tick_at) / 60.0)
+        mood_evolve(
+            self._state,
+            activity=self._state.activity,
+            minutes=mood_minutes,
+            had_contact=had_contact,
+            had_mention=had_mention,
+            policy=mood_policy,
+            last_contact_at=self._state.last_contact_at,
+            now=now,
+        )
+        clamp_mood(self._state)
+
+        # 习惯层（v1.9.0）：命中就把 proposal 交给强制层，本轮不再问模型。
+        # 排在模型之前，是因为习惯是**用户明确写下的作息**，比模型这一轮的即兴发挥更可信。
+        # ⚠ 打断窗口内**不跑**（v1.11.1）：她正在回消息，习惯命中会把她从对话里拽走。
+        #   顺延不记账——命中的判据与记账都留在下一次窗口外的 tick。
+        routine_fired, routine_reason = (False, "")
+        physio_fired = False
+        physio_reason = ""
+        # v1.13.1（R8）：总开关关闭时残留窗口立刻失效，routine/physio 照常跑
+        if not self.config.interrupt.enabled or not interrupt_in_window(
+            self._state, now=now
+        ):
+            routine_fired, routine_reason = await self._run_routine(now, sim_config)
+            # 生理锚点（v1.9.1）：与习惯层互斥（一个 tick 只出一个 proposal）——
+            # 习惯先判，没命中才轮到生理窗。两者撞车时（比如习惯表也有 12:00 吃饭），
+            # 用户手写的那行赢，生理窗下一个 tick 记账为「已触发」不再重试。
+            if not routine_fired:
+                physio_fired, physio_reason = await self._run_physio(now, sim_config)
+
         if self._llm_ready(now):
             skip_reason = ""
-            if self.config.activity.llm.skip_when_forced:
-                skip_reason = pointless_ask_reason(self._state, now=now, config=sim_config)
+            # v1.17.0（PR-OBS-1）：同时记下「这一轮省下的是哪一类」——只有一个
+            # 总数时，用户分不清「习惯窗口省下的」与「注定白问省下的」
+            skip_bucket = ""
+            # 打断窗口（v1.11.1）优先级最高：她在回消息，此刻问什么都会被强制层
+            # 收口回「聊天中」（见 life_activity.enforce 的 2a-0 分支），问了纯浪费。
+            # 放在 routine/physio 之前是刻意的：习惯表命中也不该把她从对话里拽走。
+            interrupt_reason = self._interrupt_skip_reason(now)
+            if interrupt_reason:
+                skip_reason = interrupt_reason
+                skip_bucket = "skip_interrupt"
+            elif routine_fired:
+                skip_reason = routine_reason
+                skip_bucket = "skip_routine"
+            elif physio_fired:
+                skip_reason = physio_reason
+                skip_bucket = "skip_physio"
+            elif self.config.activity.llm.skip_when_forced:
+                # v1.17.0（PR-CAL-1 / PR-SCH-2）：日历覆盖、微扰与加班日必须与
+                # enforce 侧**同一份**（漏传会让「跳过判定」与「实际裁定」分叉）
+                skip_dt = local_datetime(now, sim_config.tz_offset_minutes)
+                skip_override, skip_day_name = self._schedule_calendar_override(skip_dt)
+                skip_reason = pointless_ask_reason(
+                    self._state,
+                    now=now,
+                    config=sim_config,
+                    rest_day=self._rest_day(now),
+                    workday_override=skip_override,
+                    day_name=skip_day_name,
+                    day_key=self._schedule_day_key(skip_dt),
+                )
+                if skip_reason:
+                    skip_bucket = "skip_pointless"
+            if not skip_reason and not routine_fired and not physio_fired:
+                # 习惯/生理的窗口内或命中后的提问间隔内（习惯的理由优先展示）
+                skip_reason = routine_reason or physio_reason
+                if skip_reason:
+                    skip_bucket = "skip_window"
             if skip_reason:
                 # 这一轮无论模型答什么都只会保持当前活动 ⇒ 不问，省一次调用。
                 # 来源单独标一类（mark_ask_skipped），别让状态卡看起来像模型故障。
-                mark_ask_skipped(self._state, reason=skip_reason)
+                # ⚠ 习惯/生理**命中**时不覆写来源：状态卡要显示「习惯表命中」/
+                # 「生理时间到了」，而「本轮未问模型」描述的是另一件事。
+                #    打断窗口内**例外**：状态卡正需要显示「被消息打断」，
+                #    被 mark_ask_skipped 覆写成「本轮未问模型」就丢了这条线索。
+                if not routine_fired and not physio_fired and not interrupt_reason:
+                    mark_ask_skipped(self._state, reason=skip_reason)
                 self._skipped_llm_calls += 1
+                self._note_llm_stat(skip_bucket or "skip_window", now)
                 self._state_dirty = True
                 if now - self._last_skip_log_at >= 3600.0:
                     self._last_skip_log_at = now
@@ -4399,13 +7415,19 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             else:
                 decision = await self._ask_activity(now)
                 if decision is not None:
-                    self._state = enforce_and_apply(
-                        self._state, now=now, config=sim_config, decision=decision
-                    )
+                    self._enforce_and_apply(now, decision)
+
+        # 梦境（v1.12.0）：本 tick 内任何一次「睡→醒」的 ≥3h 长睡眠都在这里消费
+        #（放在所有 enforce 之后，两个醒来点都不漏；梦进 recent_events，
+        # 从下一轮活动决策的近层经历起可见）
+        await self._maybe_dream(now)
 
         self._reseed_activity_if_stale(now, sim_config)
         await self._refresh_host_context()
         await self._apply_sweep(now)
+        # 动机素材（v1.13.0）：问候/分享/关系维护三类「想说的念头」，排在主动
+        # 开口挑选之前——本 tick 冒出的念头本轮就有机会被选中
+        await self._refresh_motives(now, sim_config)
         await self._maybe_proactive(now)
 
         self._state_dirty = True
@@ -4416,8 +7438,11 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         真机教训：10.6 小时的停机被静默补算成清醒时长，事后只能靠
         `life_state.json` 里的数字反推，现场什么都没留下。
+
+        这里顺手记一个标记：``_sim_tick`` 用它决定本轮**不结算**内心维度（同一口径）。
         """
 
+        self._gap_skipped = True
         self.ctx.logger.warning(
             "%s 距上次推进已过 %d 分钟（约 %.1f 小时），判定为停机间隙："
             "这段时间不计清醒/睡眠、不扣体力、不抽事件%s",
@@ -4457,13 +7482,27 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         if not should_reseed(self._state, now=now, hours=hours):
             return
         local_now = local_datetime(now, sim_config.tz_offset_minutes)
+        # v1.17.0（PR-CAL-1）：种子也要吃日历——否则国庆节取到的种子是「在岗位上做事」
+        override, day_name = self._schedule_calendar_override(local_now)
         seed = rule_based_activity(
             now_minutes=local_now.hour * 60 + local_now.minute,
             energy=self._state.energy,
             sick=is_cold(self._state, now),
             sleep_energy_threshold=sim_config.sleep_energy_threshold,
-            schedule=schedule_facts(local_now, sim_config.schedule),
+            schedule=schedule_facts(
+                local_now,
+                sim_config.schedule,
+                workday_override=override,
+                day_name=day_name,
+                day_key=self._schedule_day_key(local_now),
+            ),
             work_scene=sim_config.schedule.work_scene,
+            # v1.14.0 §3.4：病假期的种子文案要说「请了病假，在家躺着」，
+            # 而不是让她以「生病躺着」的姿态出现在本该通勤的时刻。
+            sick_leave=on_sick_leave(
+                cold_stage(self._state, now),
+                enabled=bool(self.config.health.cold_sick_leave),
+            ),
         )
         self._state = apply_activity(self._state, seed, now=now, config=sim_config)
         self._state.llm_last_success_at = now  # 重新计时，避免每个 tick 都取种子
@@ -4491,18 +7530,64 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             f"活动：{self._activity_label(state.activity)}"
             + (f"（{sanitize_text(state.scene, max_chars=40)}）" if state.scene else ""),
             f"情绪 {state.emotion:.1f}/10；体力 {state.energy:.1f}/10；"
-            f"{health_label(state, now, sim_config)}",
+            # 注入回复请求，属于**模型口径**：她只知道「病第二天，嗓子还疼」，
+            # 不会报出「约剩 X 小时」（v1.14.0 §7 双口径）。
+            f"{health_label_prompt(state, now, sim_config)}",
         ]
+        # 内心状态（v1.10.1）：事实风格三行（压力/孤独/电量），不进倍率
+        if self.config.mood.enabled:
+            for line in mood_prompt_lines(state):
+                lines.append(line)
         materials = active_materials(state, now, floor=sim_config.material_decay_floor)
         if materials:
             lines.append(f"最近想说的：{sanitize_text(materials[0].get('text', ''), max_chars=60)}")
         wake_note = self._wake_note(now)
         if wake_note:
+            # PR-W3：刚睡下就被吵醒 vs 睡够了被叫醒，语气该不一样。
+            # 只改措辞，不动情绪数值（叫醒一次就扣情绪，惩罚感太重）。
+            groggy = ""
+            if bool(self.config.simulation.wake_grumpy_note):
+                started = float(self._state.sleep_started_at or 0.0)
+                asleep_minutes = (float(now) - started) / 60.0 if started > 0.0 else 0.0
+                if 0.0 < asleep_minutes < 120.0:
+                    groggy = "她刚睡下没多久（不到两小时）就被吵醒，还有点迷糊、有点不情愿；"
             lines.append(
-                f"（她本来在睡，刚刚被 @ 吵醒，清醒窗口到 {wake_note}；"
+                f"（她本来在睡，刚刚被叫醒，清醒窗口到 {wake_note}；{groggy}"
                 "语气可以短一点、带刚醒的迷糊，但别把自己说成一直醒着）"
             )
         return "\n".join(lines)
+
+    def _calendar_festival_material(self, now: float, sim_config: SimConfig) -> dict[str, Any] | None:
+        """节日素材：法定/农历节日的**当天**产出一条「今天是 XX」素材（当日衰减）。
+
+        权重分两档：法定大节（春节/除夕/元旦/国庆/劳动节）1.2、其余 0.8；
+        ``best_until`` = 当天 18:00（上午最想讲、到晚上就不讲了——下午还讲节日
+        就像早上发的新年快乐中午才发出去）。
+        """
+
+        if not self.config.calendar.enabled or self._calendar is None:
+            return None
+        local_now = local_datetime(now, sim_config.tz_offset_minutes)
+        day = self._calendar_day(local_now)
+        if day is None or not day.name or day.kind == "workday_swap":
+            return None
+        key = f"calendar:{local_now:%Y-%m-%d}:{day.name}"
+        if key in self._state.social_seen:
+            return None  # 复用既有去重表（当天只产出一次，跨重启仍然有效）
+        self._state.social_seen[key] = float(now)
+        major = day.name in ("春节", "除夕", "元旦", "国庆节", "劳动节", "中秋节")
+        # best_until = 当天 18:00（本地）
+        best_dt = local_now.replace(hour=18, minute=0, second=0, microsecond=0)
+        best = best_dt.timestamp() - sim_config.tz_offset_minutes * 60
+        expires = best + 12 * 3600.0  # 最多留到次日凌晨（过期清掉）
+        return {
+            "label": f"节日:{day.name}",
+            "text": f"今天是{day.name}" + ("，放假！" if day.is_holiday else ""),
+            "weight": 1.2 if major else 0.8,
+            "created_at": float(now),
+            "best_until": max(float(now), best),
+            "expires_at": max(float(now) + 3600.0, expires),
+        }
 
     def _material_line(self, now: float, sim_config: SimConfig) -> str:
         """状态卡的素材行：条数 + 有效期；有素材进入保鲜衰减期时附有效条数。"""
@@ -4516,7 +7601,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             line += f"，保鲜衰减后约 {effective:.1f} 条"
         return line
 
-    def _render_status(self, now: float, stream_id: str = "") -> str:
+    def _render_status(self, now: float, stream_id: str = "",
+                       top_relations: list[dict[str, Any]] | None = None) -> str:
         state = self._state
         sim_config = self._sim_config()
         breakdown = self._last_breakdown or self._compute_breakdown(now)
@@ -4529,6 +7615,16 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             f"　来源：{self._source_label(state.activity_source)}"
             f" · 已持续 {activity_minutes(state, now)} 分钟",
         ]
+        # 日期行（v1.10.0）：带节日名（「2026-02-17 周二 春节」）
+        try:
+            local_now = local_datetime(now, sim_config.tz_offset_minutes)
+            day = self._calendar_day(local_now)
+            date_line = f"　{local_now:%Y-%m-%d} 周{'一二三四五六日'[local_now.weekday()]}"
+            if day is not None and day.name:
+                date_line += f" {day.name}"
+            lines.append(date_line)
+        except Exception:  # noqa: BLE001 —— 日期行渲染失败不挡状态卡
+            pass
         wake_note = self._wake_note(now)
         if wake_note:
             # 她本人仍在睡（睡眠记账照常），只是这 10 分钟里宿主看得见她；
@@ -4540,13 +7636,39 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         lines.extend([
             f"情绪 {state.emotion:.1f}/10　体力 {state.energy:.1f}/10"
             f"（上限 {state.energy_cap:.1f}）",
-            f"身体：{health_label(state, now, sim_config)}",
+            # 状态卡是**管理员口径**：阶段 + 第几天 + 剩余小时 + 病假 + 今日关心次数
+            # 都印出来（提示词那边只有模糊描述，见 health_label_prompt）。
+            f"身体：{health_label_admin(state, now, sim_config)}",
             # ⚠「今日」= 本生活日**已记账**的分钟数，不等于真实时长：停机间隙不记账，
             # 跨天重启会按新的一天重置。真机上这两个数曾经和直觉对着干（清醒 3.6 小时
             # 而活动已持续 850 分钟），所以把口径标出来。
             f"今日已睡 {sleep_hours_today(state):.1f} 小时 / 清醒 {awake_hours_today(state):.1f} 小时"
             f"（本生活日已记账）",
+            (
+                f"饱腹 {state.satiety:.1f}/10　今日已吃 {int(state.meal_count_today)} 顿"
+                + self._physio_window_note(sim_config)
+                if sim_config.physio_enabled
+                else ""
+            ),
         ])
+        if self.config.mood.enabled:
+            lines.append(
+                f"内心：压力 {state.stress:.1f}/10　孤独 {state.loneliness:.1f}/10　"
+                f"社交电量 {state.social_battery:.1f}/10"
+            )
+        # 最熟的人（v1.11.0）：近层 top3；昵称不明时显示脱敏 QQ 号。
+        # v1.13.1（F-002）：记录由 cmd_life_state 经 to_thread 读好传进来，这里只渲染
+        if top_relations:
+            try:
+                relation_lines = relations_prompt_lines(top_relations, max_lines=3)
+                if relation_lines:
+                    lines.append(relation_lines[0])
+                    if len(relation_lines) > 1:
+                        lines.append(f"　（共 {len(top_relations)} 位熟人）")
+                else:
+                    lines.append("最熟的人：还没攒够熟悉度")
+            except Exception:  # noqa: BLE001 —— 展示失败不挡状态卡
+                pass
         failure_streak = int(state.llm_fail_streak)
         cooldown_left = max(0.0, float(state.llm_cooldown_until) - now) / 60.0
         if failure_streak or cooldown_left > 0:
@@ -4637,6 +7759,68 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             return float(factor), None
         return float(base) * float(factor), float(base)
 
+    def _render_attribution(self, now: float) -> str:
+        """``/生活 归因``：情绪 / 体力为什么是这个数（v1.16.0 M8）。
+
+        纯展示：把 ``life_sim.attribution_lines`` 拼成一张卡。渲染失败降级成一句
+        说明——这是排查工具，恰恰在状态怪的时候最需要它可读，绝不能反过来抛错。
+        """
+
+        lines = ["🔍 情绪体力归因"]
+        try:
+            lines.extend(attribution_lines(self._state, now, self._sim_config()))
+        except Exception as exc:  # noqa: BLE001 —— 展示失败不该让命令报错
+            self.ctx.logger.warning("%s 归因输出失败：%s", __plugin_id__, exc)
+            return "情绪体力归因：渲染失败（详见日志）"
+        lines.append("口径：只读最近经历与活动锚点，不改任何结算；活动切换不回溯。")
+        return "\n".join(lines)
+
+    def _render_relations(self, records: list[dict[str, Any]]) -> str:
+        """``/生活 关系``：关系档案的熟悉度分布（与 M8 同批落地）。
+
+        决议 3 撤销了它的 go/no-go 职责（M7 的中性锚点钉在陌生人、不再依赖真机
+        分布），所以它现在的定位是 **D 期曲线标定的参考输入 + 运营观察工具**。
+        """
+
+        lines = ["🔗 关系档案"]
+        if not self.config.relations.enabled:
+            lines.append("关系层已关闭（[relations] enabled = false）：所有人按陌生人处理")
+            return "\n".join(lines)
+        if self._routine_store is None:
+            lines.append("私有库不可用：关系档案读不到（生活状态照常推进）")
+            return "\n".join(lines)
+        if not records:
+            lines.append("还没有档案：私聊、被 @、回复她才会建档（群里其余人当背景板）")
+            return "\n".join(lines)
+
+        counts: dict[str, int] = {"亲密": 0, "熟络": 0, "认识": 0, "陌生": 0}
+        values: list[float] = []
+        for record in records:
+            try:
+                familiarity = float(record.get("familiarity") or 0.0)
+            except (TypeError, ValueError):
+                familiarity = 0.0
+            counts[relation_tier(familiarity)] += 1
+            values.append(familiarity)
+        values.sort()
+        median = values[len(values) // 2]
+        lines.append(f"共 {len(records)} 人")
+        for tier, low, high in (("亲密", 80, None), ("熟络", 50, 79), ("认识", 20, 49), ("陌生", 0, 19)):
+            span = f"{low}–{high}" if high is not None else f"≥{low}"
+            lines.append(f"　{tier}（{span}）：{counts[tier]} 人")
+        lines.append(
+            f"熟悉度：平均 {sum(values) / len(values):.1f}　中位 {median:.1f}"
+            f"　最高 {values[-1]:.1f}/100"
+        )
+        try:
+            top_lines = relations_prompt_lines(records, max_lines=3)
+        except Exception:  # noqa: BLE001 —— 展示失败不挡分布
+            top_lines = ()
+        if top_lines:
+            lines.append("最熟的几位：")
+            lines.extend(f"　{line}" for line in top_lines)
+        return "\n".join(lines)
+
     async def _render_frequency(self, now: float, stream_id: str = "") -> str:
         """倍率拆解 + 在宿主当前模式下换算成真实后果。
 
@@ -4689,6 +7873,16 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         lines.append(f"曲线组：{breakdown.curve_set}")
         lines.extend(breakdown.as_lines())
+        # 因子表 replace 模式漏键的可见性（v1.14.1）：漏掉的键按 1.0 处理，而 1.0 的因子
+        # 在拆解里是**被过滤掉**的——于是「配了 replace 但漏了 meal/bath」在卡片上
+        # 完全看不见（真机 2026-10-09 配置实拍：漏了 night_study/meal/bath/chatting）。
+        absent = tuple(getattr(self, "_activity_factor_absent", ()) or ())
+        if absent:
+            lines.append(
+                "⚠ 因子表 replace 模式缺内置键："
+                + "、".join(absent)
+                + "（这些活动按 1.0 处理，拆解里不显示）"
+            )
         wake_note = self._wake_note(now)
         if wake_note:
             lines.append(
@@ -4902,6 +8096,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             f"当前：{self._activity_label(state.activity)}"
             + (f"（{sanitize_text(state.scene, max_chars=40)}）" if state.scene else ""),
             f"来源：{self._source_label(state.activity_source)}",
+            (
+                "背景："
+                + "、".join(self._activity_label(item) for item in state.side_activities)
+                if state.side_activities
+                else "背景：（无）"
+            ),
             f"硬约束备注：{sanitize_text(state.activity_note, max_chars=60) or '（无）'}",
             f"已持续：{activity_minutes(state, now)} 分钟"
             + ("（已过停留期，可切换）" if allowed else f"（暂停切换：{reason}）"),
@@ -4911,8 +8111,71 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             "最近一次模型输出："
             + (sanitize_text(state.llm_last_raw, max_chars=200) or "（还没有）"),
         ]
+        # 打断信息行（v1.11.1）：窗口内显示还剩多久回原活动；窗口刚过也要把
+        # 「被什么打断过」说清楚，否则「来源：被消息打断」在窗口结束后就没了下文
+        if interrupt_in_window(state, now=now):
+            remaining = max(0.0, float(state.interrupt_until) - now) / 60.0
+            lines.append(
+                f"⏸ 打断窗口：还剩 {remaining:.1f} 分钟（被从"
+                f"「{self._activity_label(state.interrupted_from or state.activity)}」打断）"
+            )
+        elif state.activity_source == "interrupt":
+            lines.append("⏸ 打断窗口：已结束（回退决策在下一 tick 生效）")
+        cold_line = self._cold_trace_line(now)
+        if cold_line:
+            lines.append(cold_line)
+        # v1.17.0（PR-OBS-1）：今天问了模型几次、各通道省下几次——只有一个总数时
+        # 分不清「习惯窗口省下的」与「注定白问省下的」
+        stats_line = self._llm_stats_line(now)
+        if stats_line:
+            lines.append(stats_line)
         lines.extend(self._schedule_lines(now))
         return "\n".join(lines)
+
+    def _physio_window_note(self, sim_config: SimConfig) -> str:
+        """状态卡上的「生理窗」片段（v1.14.0）。
+
+        真机 2026-10-09 的排查教训：`[physio] meals` 为空时**饱腹照常下降、但一餐都不会
+        触发**，而卡片上只有「今日已吃 0 顿」——看不出是「今天没吃」还是「根本没配窗口」。
+        这一行把窗口数量与名称直接印出来（没配就明确说没配，并指向配置键）。
+        """
+
+        windows = tuple(getattr(sim_config, "physio_meals", ()) or ())
+        if not windows:
+            return "　生理窗：（未配置——她不会自己吃饭）"
+        labels = "、".join(
+            str(getattr(window, "label", "") or getattr(window, "kind", "")) for window in windows
+        )
+        return f"　生理窗：{len(windows)} 个（{sanitize_text(labels, max_chars=40)}）"
+
+    def _cold_trace_line(self, now: float) -> str:
+        """病程一行（v1.14.0）：阶段 + 第几天 + 最近几条病程经历。
+
+        §2.3 的纪律是「流转必须留痕」——不然卡片上「她怎么突然好转/加重了」
+        查不到任何原因（改这一版之前，状态卡完全不提病程）。经历本来也进
+        ``recent_events``、会出现在活动提示词的「最近经历」里，这里只是把它
+        搬到排查入口。
+        """
+
+        state = self._state
+        if not cold_stage(state, now):
+            return ""
+        sim_config = self._sim_config()
+        head = f"病程：{health_label_admin(state, now, sim_config)}"
+        keywords = ("感冒", "退烧", "病假", "好了", "没胃口", "咳醒")
+        traces: list[str] = []
+        for item in state.recent_events[-40:]:
+            if not isinstance(item, Mapping):
+                continue
+            label = str(item.get("label") or "")
+            if not any(word in label for word in keywords):
+                continue
+            text = sanitize_text(label, max_chars=18)
+            if text and text not in traces:
+                traces.append(text)
+        if not traces:
+            return head
+        return head + "　最近：" + "、".join(traces[-3:])
 
     def _render_why(self) -> str:
         lines = ["🔇 沉默台账（她为什么不说话）"]
@@ -4962,6 +8225,55 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001 — 发不出去也不能让命令抛错
             self.ctx.logger.warning("发送命令回复失败 session=%s：%s", stream_id, exc)
 
+    async def _run_medicine_command(self, stream_id: str) -> tuple[bool, str]:
+        """``/生活 送药`` 与 ``/送药`` 的**同一份**执行体（v1.14.0 §5.2）。
+
+        两个入口共用它是刻意的：宿主的命令匹配是「第一个命中的组件赢」，
+        ``/生活 送药`` 会**同时**命中 ``life_state``（sub=送药）与独立的送药命令
+        ——把逻辑写成一份、让两条路径行为完全一致，就不必依赖注册顺序。
+
+        规则、冷却、封顶全在 ``life_sim.take_medicine``（纯模块，可脱机单测）；
+        这里只负责：取会话 → 落一条情绪经历 → 回话 → 留日志。
+        """
+
+        now = time.time()
+        if not self.config.plugin.enabled:
+            return False, "生活频率插件已停用（可在插件配置里重新启用）"
+
+        sim_config = self._sim_config()
+        ok, reason, text = take_medicine(
+            self._state, now=now, session_id=stream_id, config=sim_config
+        )
+        if ok:
+            # 情绪收益走 append_social_event（与「被关心」同一条收敛路径），
+            # 不碰 inertia_until——送药不该冻结她的情绪回归。
+            self._state = append_social_event(
+                self._state,
+                {
+                    "at": float(now),
+                    "label": "有人送药",
+                    "activity": self._state.activity,
+                    "text": "有人给她送了药",
+                    "emotion": float(MEDICINE_EMOTION_GAIN),
+                    "energy": 0.0,
+                },
+                config=sim_config,
+            )
+            self._state_dirty = True
+            self._save_state()
+            self.ctx.logger.info(
+                "%s 送药生效：session=%s 剩余 %.1f 小时（本场第 %d 次）",
+                __plugin_id__,
+                stream_id,
+                max(0.0, float(self._state.cold_until) - now) / 3600.0,
+                int(self._state.cold_medicine_count),
+            )
+        else:
+            self.ctx.logger.info(
+                "%s 送药未生效：session=%s 原因=%s", __plugin_id__, stream_id, reason
+            )
+        return ok, text
+
     @Command(
         "life_state",
         description="查看/管理麦麦的生活状态与发言频率",
@@ -4971,7 +8283,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         # —— ``/点歌 生活``、``/卡片 生活``、``/身份 生活`` 都会被本插件截胡，
         # 对方那条命令永远不会执行。
         # 子命令还要求**用空白分隔**：否则「生活得好累」这种正常聊天会被当成命令。
-        pattern=r"^\s*(?:@\S+\s*|\[[^\]]*\]\s*)*[/／]?生活(?:\s+(?P<sub>\S*))?\s*$",
+        pattern=LIFE_STATE_PATTERN,
     )
     async def cmd_life_state(
         self, matched_groups: dict | None = None, **kwargs: Any
@@ -4994,13 +8306,45 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         if sub in ("", "状态", "status"):
             await self._target_sessions()   # 刷新「本轮命中几个会话」，写错 filter_mode 时唯一的线索
-            text = self._render_status(now, stream_id)
+            # v1.13.1（F-002）：SQLite 读走线程池，别在事件循环上碰盘
+            top_relations = None
+            if self.config.relations.enabled and self._routine_store is not None:
+                try:
+                    top_relations = await asyncio.to_thread(
+                        self._routine_store.top_relationships, 3
+                    )
+                except Exception:  # noqa: BLE001 —— 展示失败不挡状态卡
+                    top_relations = None
+            text = self._render_status(now, stream_id, top_relations=top_relations)
         elif sub in ("频率", "frequency", "倍率"):
             text = await self._render_frequency(now, stream_id)
         elif sub in ("活动", "activity"):
             text = self._render_activity(now)
+        elif sub in ("归因", "attribution", "构成"):
+            text = self._render_attribution(now)
+        elif sub in ("关系", "relations", "人际"):
+            records: list[dict[str, Any]] = []
+            if self.config.relations.enabled and self._routine_store is not None:
+                try:
+                    # 走线程池：SQLite 读不上事件循环（v1.13.1 F-002 的同一条纪律）
+                    records = await asyncio.to_thread(
+                        self._routine_store.top_relationships, 500
+                    )
+                except Exception:  # noqa: BLE001 —— 展示失败不挡命令
+                    records = []
+            text = self._render_relations(records)
         elif sub in ("为什么", "why", "沉默"):
             text = self._render_why()
+        elif sub in MEDICINE_SUBS:
+            # 送药（v1.14.0 §5.2）：`/生活 送药` 会同时命中本命令与独立的送药命令
+            # （`MEDICINE_COMMAND_PATTERN`），所以必须在这里就能处理——否则「第一个
+            # 命中的组件赢」会让它取决于注册顺序。两条路径共用同一份执行体。
+            if not self._is_explicit_command(kwargs):
+                # 裸写「生活 送药」当普通聊天（宽松匹配不该把聊天变成状态变更）
+                return False, "", 0
+            ok, text = await self._run_medicine_command(stream_id)
+            await self._send(stream_id, text)
+            return ok, text, 1
         elif sub in ("暂停", "pause", "停止"):
             if not self._is_admin(kwargs):
                 text = "没有权限：只有管理员或本机操作者能暂停生活频率"
@@ -5055,13 +8399,41 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 "/生活　　　　　查看状态卡\n"
                 "/生活 频率　　倍率逐项拆解 + 在当前宿主模式下的真实后果\n"
                 "/生活 活动　　作息活动的来源、停留时间与模型状态\n"
+                "/生活 归因　　情绪/体力为什么是这个数（基线构成、余波来源、体力流水）\n"
+                "/生活 关系　　关系档案的熟悉度分布（D 期曲线标定的参考）\n"
                 "/生活 为什么　沉默台账（她为什么没开口）\n"
+                "/生活 送药　　她生病时送一份药（缩短病程，有冷却与上限）\n"
                 "/生活 暂停|恢复|重置　（需要管理员）\n"
                 "/生活 重锚　　丢弃认到的外部倍率基数（需要管理员）"
             )
 
         await self._send(stream_id, text)
         return True, text, 1
+
+    @Command(
+        "life_send_medicine",
+        description="她生病时给她送一份药（缩短病程）",
+        # 与 /生活 同一条「锚在开头」的纪律，但**刻意不认 /生活 前缀**：
+        # 那条形态由 ``cmd_life_state`` 的 sub 分支处理，两条正则互斥才不会出现
+        # 「同一句话被两个组件同时命中、谁赢看注册顺序」（见 LIFE_STATE_PATTERN 注释）。
+        # ``[/／]`` 是**必需**的：「送药」这种动作用户命令不该被裸词触发，
+        # 否则聊天里的「我给你送药」会被误当成命令。
+        pattern=MEDICINE_COMMAND_PATTERN,
+    )
+    async def cmd_life_send_medicine(
+        self, matched_groups: dict | None = None, **kwargs: Any
+    ) -> tuple[bool, str, int]:
+        """``/送药``（v1.14.0 §5.2）：本插件**首个改变她身体状态的用户命令**。
+
+        规则、冷却、封顶全部在 ``life_sim.take_medicine``（纯模块，可脱机单测），
+        这里只取会话、调用共用执行体、回话。
+        """
+
+        del matched_groups
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or "")
+        ok, text = await self._run_medicine_command(stream_id)
+        await self._send(stream_id, text)
+        return bool(ok), text, 1
 
     @Tool(
         "get_life_state",
@@ -5086,7 +8458,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 f"当前活动：{self._activity_label(state.activity)}"
                 + (f"（{sanitize_text(state.scene, max_chars=40)}）" if state.scene else ""),
                 f"情绪：{state.emotion:.1f}/10　体力：{state.energy:.1f}/10",
-                f"身体：{health_label(state, now, sim_config)}",
+                # 工具返回给**模型**读 ⇒ 走模糊病程口径（同 _ask_activity 与 reply 注入）
+                f"身体：{health_label_prompt(state, now, sim_config)}",
                 f"今日已睡 {sleep_hours_today(state):.1f} 小时",
                 (
                     "最近想说的：" + sanitize_text(materials[0].get("text", ""), max_chars=60)
@@ -5108,16 +8481,21 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         # BLOCKING + EARLY 才能保证先于别人被调用；返回 continue，从不 abort。
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
+        # v1.13.1（R3，代码审查）：BLOCKING 钩子必须给超时。``error_policy=SKIP``
+        # 只在**抛异常**时生效，对「永久挂起」无效——钩子挂住 = 整条消息链卡住 =
+        # 所有人回不了消息。本钩子内的旁路（睡眠唤醒写频率 / 打断注入 context.append /
+        # 关系建档 SQLite）都可能在慢盘或宿主写锁上慢，1.5s 是「宁可丢一次旁路，
+        # 不可卡一条消息」的取舍。与 inject_no_quote_hint 的 timeout_ms=3000 同款机制。
+        timeout_ms=1500,
         error_policy=ErrorPolicy.SKIP,
     )
     async def note_session(self, message: dict | None = None, **kwargs: Any) -> dict[str, Any]:
-        """记录会话与对方发言时间；**正常轮次不发 RPC**（唯一例外是睡眠中被 `@`）。
+        """记录会话与对方发言时间；**默认不发 RPC**。
 
-        刻意不在这里写宿主频率：``adjust_talk_frequency`` 内部会重新调度消息轮
-        （``runtime.py:559-562``），从消息链路里调用有一定重入代价，还会给这条消息加
-        RPC 延迟。所以**只在「她正睡着 + 这条是 `@`」时**才写（每条消息平均不到一次，
-        并且一整个唤醒窗口只写一次）：那是唯一能让她看见这条 `@` 的时机 —— 宿主先判
-        静默、再判 `@` 强制触发，等下一轮巡检（≥15 秒）再写就已经晚了。
+        两个例外（都是「晚一步就没意义」的关键路径）：
+        ① 睡眠中被 ``@`` 时写清醒倍率——宿主先判静默再判 `@` 强制触发，等下一轮
+        巡检那条消息已被静默轮吃掉；② 打断批次的「放下手里的事」注入（v1.11.1）。
+        其余轮次纯内存 + 线程池 SQLite，钩子级 ``timeout_ms=1500`` 兜底一切慢路径。
         """
 
         target = message if isinstance(message, dict) else {}
@@ -5149,14 +8527,25 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 "is_group_session": bool(group_id),
             }
             self._seen_sessions[session_id] = info
-        # 睡眠中被 `@` ⇒ 开一个临时清醒窗口，并立刻把倍率抬起来（见方法说明）。
-        # 放在社交信号之前：唤醒是「这条消息能不能被看见」的关键路径，不能被后面的
-        # 旁路逻辑挡在前面。整段自己兜异常，绝不让消息主链受插件影响。
-        if flag_value(target, "is_at"):
+        # 睡眠中被 `@`（或私聊，PR-W1）⇒ 开一个临时清醒窗口，并立刻把倍率抬起来
+        # （见方法说明）。放在社交信号之前：唤醒是「这条消息能不能被看见」的关键路径，
+        # 不能被后面的旁路逻辑挡在前面。整段自己兜异常，绝不让消息主链受插件影响。
+        if flag_value(target, "is_at") or (
+            bool(self.config.simulation.wake_on_private) and not group_id
+        ):
             try:
-                await self._at_wake_from_hook(session_id, info, now)
+                await self._at_wake_from_hook(
+                    session_id, info, now, mentioned=flag_value(target, "is_at")
+                )
             except Exception as exc:  # noqa: BLE001
                 self.ctx.logger.warning("%s 睡眠唤醒失败：%s", __plugin_id__, exc)
+        # 唤醒窗口内的**对话顺延**（v1.15.0 PR-W2）：她回了一句、对方接着聊，
+        # 不该因为「没再 @ 她」而 10 分钟后突然断线。只顺延、不写宿主。
+        elif self._wake_active(now) and not flag_value(target, "is_at"):
+            try:
+                self._extend_wake_window(now)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.debug("%s 唤醒窗口顺延失败：%s", __plugin_id__, exc)
         # 社交信号：只做一次 append（**无 RPC、无落盘、无 O(n) 扫描**）。
         # 这个钩子挂在消息主链上，任何异常都可能影响别人的回复：除了装饰器上的
         # error_policy=SKIP，这里自己再兜一层，并且只在 debug 级留痕
@@ -5166,8 +8555,35 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 signal = live_signal(message, now=now)
                 if signal is not None:
                     self._social_inbox.append(signal)
+                    # 内心维度（v1.10.1）：入站信号喂社交电量与孤独（纯内存）
+                    self._mood_signal_in_hook(signal)
+                    # 消息风格注入（每天每会话一条；内部自兜异常）
+                    await self._maybe_inject_mood(session_id, now)
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.debug("%s 社交信号记录失败：%s", __plugin_id__, exc)
+        # 关系建档（v1.11.0）：判据内收（私聊 / 被 @ / 回复她），其余人当背景板
+        try:
+            await self._record_relation(
+                target, session_id=session_id, group_id=group_id, user_id=user_id, now=now
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("%s 关系建档失败：%s", __plugin_id__, exc)
+        # 打断机制（v1.11.1）：收到对她说的话 → 放下手里的事回你。判据与建档同源
+        # （私聊 / 被 @），窗口 5 分钟；内部只切活动 + 一次 context 注入（可关）。
+        try:
+            await self._maybe_interrupt(
+                target, session_id=session_id, group_id=group_id, now=now
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("%s 打断触发失败：%s", __plugin_id__, exc)
+        # 病程关心（v1.14.0 §5.1）：生病期间的一句「你吃药了吗」能让她好得快一点。
+        # 放在打断之后、纯内存无 RPC；异常只在 debug 留痕（消息主链不受影响）。
+        try:
+            self._maybe_care(
+                target, session_id=session_id, group_id=group_id, now=now
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("%s 病程关心记录失败：%s", __plugin_id__, exc)
         self._state_dirty = True
         return {"action": "continue"}
 

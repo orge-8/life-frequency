@@ -211,7 +211,15 @@ def test_live_signal_reads_group_identity_and_mention():
         now=1000.0,
     )
     assert signal == {"at": 1000.0, "session_id": "g1", "is_group": True,
-                      "mentioned": True, "text_len": 4}
+                      "mentioned": True, "text_len": 4, "user_id": ""}
+    # v1.16.3（M7）：说话的人要在信号里——社交情绪按关系加权要靠它认人。
+    # ⚠ 它只在内存里流转（不落盘、不进提示词），所以带 user_id 不违反脱敏纪律。
+    identified = SOS.live_signal(
+        {"session_id": "p1", "processed_plain_text": "在吗",
+         "message_info": {"user_info": {"user_id": "10001"}}},
+        now=2.0,
+    )
+    assert identified and identified["user_id"] == "10001"
     top_level = SOS.live_signal({"stream_id": "p1", "group_id": "", "processed_plain_text": "hi"},
                                 now=1.0)
     assert top_level and top_level["is_group"] is False
@@ -584,7 +592,12 @@ def test_refresh_social_cancellation_propagates():
 
 def test_intake_social_appends_events_and_spends_the_daily_budget():
     async def run():
-        module, plugin, host = _make_plugin(social={"enabled": True})
+        # 本用例钉的是**额度记账**本身，所以显式关掉 v1.16.2 的孤独系数
+        # （插件默认开；不关的话 0.4+0.4 会被孤独基线 4.0 放大成 0.86，
+        #  测出来的就不再是基础额度了）。系数自己有专项用例。
+        module, plugin, host = _make_plugin(
+            social={"enabled": True}, mood={"loneliness_social_scaling": False}
+        )
         host.api_returns[TARGET] = digest_payload()
         # 夹具的 generated_at 固定在 2026-10-01 23:40：now 必须与它对齐在 24h
         # 新鲜度窗口内，否则真实时钟漂出窗口后情绪额度恒为 0（2026-10-03 踩到的
@@ -748,7 +761,10 @@ def test_social_state_is_persisted_and_survives_a_round_trip():
     """新增状态字段必须能落盘再读回（否则每次重启都会重复记同一件事）。"""
 
     async def run():
-        module, plugin, host = _make_plugin(social={"enabled": True})
+        # 同上：落盘往返用例不该被孤独系数改变额度数值
+        module, plugin, host = _make_plugin(
+            social={"enabled": True}, mood={"loneliness_social_scaling": False}
+        )
         host.api_returns[TARGET] = digest_payload()
         # 与上一用例同理：now 与夹具的 generated_at 对齐，时钟漂移不再影响结果。
         now = SOS.local_stamp_to_epoch("2026-10-02 12:00:00", tz_offset_minutes=TZ)

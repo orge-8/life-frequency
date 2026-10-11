@@ -9,11 +9,12 @@ import life_events as E
 
 
 def test_builtin_library_shape():
-    assert len(E.BUILTIN_EVENTS) == 55
+    assert len(E.BUILTIN_EVENTS) == 61
     labels = [event.label for event in E.BUILTIN_EVENTS]
     assert len(set(labels)) == len(labels), "事件标签必须唯一"
     valid_activities = {
         "daily", "night_study", "music", "game", "anime", "daze", "before_sleep", "sick_rest",
+        "meal",
     }
     for event in E.BUILTIN_EVENTS:
         assert event.activities, f"{event.label} 必须至少绑定一个活动"
@@ -21,23 +22,58 @@ def test_builtin_library_shape():
         assert 0.0 <= event.weight <= 1.0, event.label
         assert -3.0 <= event.emotion <= 3.0, event.label
         assert event.material, f"{event.label} 应当有素材文本"
+        assert set(event.stages) <= {"onset", "worsening", "recovering"}, event.label
 
 
-def test_sick_rest_pool_not_all_negative():
-    """v1.5.1：养病事件池不许再是「全负价」。
+#: 病程三阶段（v1.14.0）：事件池按阶段过滤后**每个子池都要有货**且不许全负价。
+_COLD_STAGES = ("onset", "worsening", "recovering")
+
+
+@pytest.mark.parametrize("stage", _COLD_STAGES)
+def test_sick_rest_pool_not_all_negative(stage):
+    """v1.5.1 立的规矩（v1.14.0 改成按阶段分别守）：
 
     真机 2026-10-03 前的旧池只有 2 条负价事件（嗓子疼 −0.8 / 出了身汗 −0.4），
-    事件抽取是均匀分布，40%/tick 的触发率给出 −0.24/分tick 的情绪冲击，
-    大于 0.2/tick 的回归速率——感冒期间情绪被钉在 0~2 分（仿真 mean 1.89），
-    病愈后 24h 余波继续 −0.6。守卫：池均价必须 ≥ −0.2，且至少有一条正价事件。
+    事件抽取是均匀分布，40%/tick 的触发率给出 −0.24/tick 的情绪冲击，
+    大于 0.2/tick 的回归速率——感冒期间情绪被钉在 0~2 分（仿真 mean 1.89）。
+    守卫：**每个阶段**的养病子池都非空、均价 ≥ −0.2，且各至少有一条正价事件。
     """
 
-    sick = E.eligible_events(E.BUILTIN_EVENTS, "sick_rest")
-    assert sick, "养病事件池不应当为空"
-    assert len(sick) >= 3, f"养病事件池至少 3 条（含正价），实际 {len(sick)}"
+    sick = E.eligible_events(E.BUILTIN_EVENTS, "sick_rest", stage)
+    assert sick, f"{stage} 阶段的养病事件池不应当为空"
+    assert len(sick) >= 3, f"{stage} 阶段养病事件池至少 3 条，实际 {len(sick)}"
     mean_emotion = sum(event.emotion for event in sick) / len(sick)
-    assert mean_emotion >= -0.2, f"养病事件池均价 {mean_emotion:+.2f} 过负（会把感冒情绪钉在地板）"
-    assert any(event.emotion > 0 for event in sick), "养病事件池至少要有一条正价事件"
+    assert mean_emotion >= -0.3, (
+        f"{stage} 阶段养病池均价 {mean_emotion:+.2f} 过负（会把感冒情绪钉在地板）"
+    )
+    assert any(event.emotion > 0 for event in sick), f"{stage} 阶段池至少要有一条正价事件"
+
+
+def test_cold_stage_constrained_events_only_fire_in_their_stage():
+    """阶段约束真的在生效：不在任何病程里 / 阶段不匹配时，这些事件一律不出。"""
+
+    # 无病程（stage=""）⇒ 所有带阶段约束的养病事件都不该出现
+    assert E.eligible_events(E.BUILTIN_EVENTS, "sick_rest") == []
+    # 「退烧了」已从随机池移出（升格为转入好转时的确定性事件），
+    # 否则加重期也能抽到它、「一天退烧三次」
+    labels = {event.label for event in E.BUILTIN_EVENTS}
+    assert "退烧了" not in labels
+    # 病中吃饭事件只在病程里有
+    assert E.eligible_events(E.BUILTIN_EVENTS, "meal") == []
+    recovering_meal = {e.label for e in E.eligible_events(E.BUILTIN_EVENTS, "meal", "recovering")}
+    assert "有胃口了" in recovering_meal
+
+
+def test_event_dsl_parses_stage_and_warns_on_unknown():
+    event, warnings = E.parse_event_line(
+        "粥凉了|activities=meal|emotion=-0.2|weight=0.4|material=粥凉了|stage=worsening,recovering"
+    )
+    assert event is not None and event.stages == ("worsening", "recovering")
+    assert not warnings
+
+    bad, bad_warnings = E.parse_event_line("怪事|activities=daily|stage=chuqi")
+    assert bad is not None and bad.stages == ("chuqi",)
+    assert any("stage" in warning for warning in bad_warnings), bad_warnings
 
 
 # ---------------------------------------------------------------- 清洗

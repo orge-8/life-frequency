@@ -422,16 +422,17 @@ def test_pointless_ask_is_provably_equivalent():
             ),
         ),
         (
-            "体力已满",
+            "体力已满且睡够目标",
             dict(
                 activity=A.SLEEP,
-                minutes_in_activity=200,
-                minutes_in_sleep=200,
-                sleep_minutes_today=200,
+                minutes_in_activity=420,
+                minutes_in_sleep=420,
+                sleep_minutes_today=420,
                 energy=10.0,
                 now_minutes=4 * 60,
             ),
         ),
+        ("体力耗尽", dict(activity=A.GAME, minutes_in_activity=120, now_minutes=15 * 60, energy=0.2)),
     ]
     for label, overrides in skip_cases:
         facts = _facts(**overrides)
@@ -452,6 +453,19 @@ def test_pointless_ask_is_provably_equivalent():
         ("在睡眠窗口内", dict(activity=A.DAILY, minutes_in_activity=10, now_minutes=4 * 60, energy=8.0)),
         ("已过停留期", dict(activity=A.GAME, minutes_in_activity=120, now_minutes=15 * 60, energy=6.0)),
         ("体力低于入睡阈值", dict(activity=A.GAME, minutes_in_activity=10, now_minutes=15 * 60, energy=1.0)),
+        # v1.15.0（PR-S1）：体力满了但还没睡够最短睡眠目标 ⇒ 提议「醒来」会被拒，
+        # 而提议别的活动会放行 ⇒ 这一轮问模型**有意义**（不该被判成白问）
+        (
+            "满体力但没睡够目标",
+            dict(
+                activity=A.SLEEP,
+                minutes_in_activity=200,
+                minutes_in_sleep=200,
+                sleep_minutes_today=200,
+                energy=10.0,
+                now_minutes=4 * 60,
+            ),
+        ),
     ]
     for label, overrides in must_ask:
         assert A.request_is_pointless(_facts(**overrides), _policy()) == "", f"{label}：不该被判成白问"
@@ -687,6 +701,143 @@ def test_rule_table_is_deterministic_and_sick_aware():
 def test_is_awake():
     assert A.is_awake(A.DAILY) is True
     assert A.is_awake(A.SLEEP) is False
+
+
+# ---------------------------------------------------------------- 病程分层（v1.14.0）
+
+
+def test_onset_does_not_force_sick_rest():
+    """初起期「带病上班」是允许的：不再刚有点不适就被按在床上。"""
+
+    out = A.enforce(
+        _facts(sick=True, cold_stage=A.COLD_ONSET, activity=A.DAILY), _request(A.MUSIC), _policy()
+    )
+    assert out.activity == A.MUSIC, out
+    assert out.source == A.SOURCE_LLM
+
+
+def test_worsening_blocks_everything_but_sleep_and_meal():
+    policy = _policy()
+    for activity in A.ALLOWED_ACTIVITIES:
+        out = A.enforce(
+            _facts(sick=True, cold_stage=A.COLD_WORSENING, activity=A.DAILY),
+            _request(activity),
+            policy,
+        )
+        if activity in (A.SLEEP, A.MEAL):
+            assert out.activity == activity, (activity, out)
+        else:
+            assert out.activity == A.SICK_REST, (activity, out)
+    # 无有效提议也必须收口（模型挂掉时她不能带病不收口）
+    forced = A.enforce(
+        _facts(sick=True, cold_stage=A.COLD_WORSENING, activity=A.MUSIC), None, policy
+    )
+    assert forced.activity == A.SICK_REST
+
+
+def test_recovering_allows_light_activities_only():
+    """好转期放行 daily/daze/music（外加睡觉吃饭），重活仍被收口。"""
+
+    policy = _policy()
+    for activity in (A.DAILY, A.DAZE, A.MUSIC, A.SLEEP, A.MEAL):
+        out = A.enforce(
+            _facts(sick=True, cold_stage=A.COLD_RECOVERING, activity=A.DAILY),
+            _request(activity),
+            policy,
+        )
+        assert out.activity == activity, (activity, out)
+    for activity in (A.GAME, A.ANIME, A.NIGHT_STUDY, A.WORK, A.COMMUTE):
+        out = A.enforce(
+            _facts(sick=True, cold_stage=A.COLD_RECOVERING, activity=A.DAILY),
+            _request(activity),
+            policy,
+        )
+        assert out.activity == A.SICK_REST, (activity, out)
+
+
+def test_legacy_sick_without_stage_behaves_like_worsening():
+    """旧状态/旧调用点（sick=True 但无阶段）必须逐字保持 v1.13.x 的一刀切行为。"""
+
+    for activity in (A.MUSIC, A.GAME, A.DAILY, A.BATH):
+        out = A.enforce(_facts(sick=True, activity=A.DAILY), _request(activity), _policy())
+        assert out.activity == A.SICK_REST, (activity, out)
+
+
+def test_wake_target_uses_stage():
+    assert A._wake_target(_facts(sick=True, cold_stage=A.COLD_ONSET)) == A.DAILY
+    assert A._wake_target(_facts(sick=True, cold_stage=A.COLD_WORSENING)) == A.SICK_REST
+    assert A._wake_target(_facts(sick=True, cold_stage=A.COLD_RECOVERING)) == A.SICK_REST
+    assert A._wake_target(_facts(sick=False)) == A.DAILY
+
+
+def test_forced_sick_rest_replaces_the_rejected_scene():
+    """收口成养病时用**确定性场景**，不沿用被否决那条提议的 scene。
+
+    真机 2026-10-09 状态卡实拍「养病躺着（吃晚餐）」——模型提议吃饭、强制层把她按回
+    床上，场景却留着「吃晚餐」。骨架由谁收口，场景就该跟着谁。
+    """
+
+    out = A.enforce(
+        _facts(sick=True, cold_stage=A.COLD_WORSENING, activity=A.SICK_REST),
+        _request(A.DAILY, scene="吃晚餐"),
+        _policy(),
+    )
+    assert out.activity == A.SICK_REST
+    assert out.scene == A.sick_rest_scene(A.COLD_WORSENING)
+    assert "吃晚餐" not in out.scene
+
+    recovered = A.enforce(
+        _facts(sick=True, cold_stage=A.COLD_RECOVERING, activity=A.SICK_REST),
+        _request(A.GAME, scene="开黑"),
+        _policy(),
+    )
+    assert recovered.scene == A.sick_rest_scene(A.COLD_RECOVERING)
+
+    # 强制唤醒醒到养病时同理（睡前那句 scene 不该留到病中）
+    woken = A.enforce(
+        _facts(
+            sick=True, cold_stage=A.COLD_WORSENING, activity=A.SLEEP,
+            minutes_in_sleep=800, sleep_minutes_today=800, now_minutes=4 * 60,
+        ),
+        None,
+        _policy(),
+    )
+    assert woken.activity == A.SICK_REST
+    assert woken.scene == A.sick_rest_scene(A.COLD_WORSENING)
+
+    # 初起期不强制养病：模型给的场景照常保留（别把收口逻辑用到不该用的地方）
+    onset = A.enforce(
+        _facts(sick=True, cold_stage=A.COLD_ONSET, activity=A.DAILY),
+        _request(A.MUSIC, scene="耳机里放着老歌"),
+        _policy(),
+    )
+    assert onset.activity == A.MUSIC and onset.scene == "耳机里放着老歌"
+
+
+def test_sick_leave_blocks_work_phases():
+    """病假口：加重/好转期不许出现在岗/通勤等「上班才有」的活动。"""
+
+    schedule = A.ScheduleFacts(enabled=True, is_workday=True, phase=A.SCHEDULE_WORK)
+    facts = _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_WORSENING, schedule=schedule)
+    for activity in (A.WORK, A.MEETING, A.OVERTIME, A.COMMUTE, A.LUNCH):
+        reason = A.activity_blocked_by_schedule(activity, facts, _policy())
+        assert "病假" in reason, (activity, reason)
+
+    # 初起期不开口：带病上班是常态
+    onset = _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET, schedule=schedule)
+    assert A.activity_blocked_by_schedule(A.WORK, onset, _policy()) == ""
+    # 关掉开关就回到旧行为（只有睡眠类的健康例外）
+    off = A.EnforcePolicy(cold_sick_leave=False)
+    assert A.activity_blocked_by_schedule(A.WORK, facts, off) == ""
+
+
+def test_on_sick_leave_predicate():
+    assert A.on_sick_leave(A.COLD_ONSET) is False
+    assert A.on_sick_leave(A.COLD_WORSENING) is True
+    assert A.on_sick_leave(A.COLD_RECOVERING) is True
+    assert A.on_sick_leave(A.COLD_WORSENING, enabled=False) is False
+    assert A.on_sick_leave("") is False
+    assert A.on_sick_leave("nonsense") is False
 
 
 # ---------------------------------------------------------------- 提示词里的「选择影响」小节

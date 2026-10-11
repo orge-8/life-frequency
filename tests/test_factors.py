@@ -207,6 +207,35 @@ def test_sick_rest_activity_factor_is_neutral_so_cold_applies_once():
     assert dict(healthy.factors).get("活动(sick_rest)") is None  # 1.0 的因子不出现在明细里
 
 
+def test_cold_stage_factor_replaces_cold_instead_of_stacking():
+    """v1.14.0：阶段因子是 ``cold`` 的**替代品**，每个阶段只乘一次。"""
+
+    config = _config(cold_stage_factors={"onset": 0.7, "worsening": 0.15, "recovering": 0.5})
+    base = 0.95 * 0.85  # 情绪 5 / 体力 5 的曲线值
+    for stage, factor in (("onset", 0.7), ("worsening", 0.15), ("recovering", 0.5)):
+        out = _adjust(activity="sick_rest", sick=True, cold_stage=stage, config=config)
+        assert out.adjust == pytest.approx(base * factor, rel=1e-6), stage
+        names = dict(out.factors)
+        assert names.get(f"感冒({stage})") == pytest.approx(factor)
+        assert "感冒" not in names, "阶段因子生效时不该再出一次旧的 cold"
+
+
+def test_cold_stage_falls_back_to_legacy_cold():
+    """阶段缺失（旧状态/旧调用点）或不在阶段表里 ⇒ 回退 ``health_factors['cold']``。"""
+
+    legacy = _adjust(activity="sick_rest", sick=True, cold_stage="", config=_config())
+    assert legacy.adjust == pytest.approx(0.95 * 0.85 * 0.3, rel=1e-6)
+    assert "感冒" in dict(legacy.factors)
+
+    empty_table = _adjust(
+        activity="sick_rest",
+        sick=True,
+        cold_stage="worsening",
+        config=_config(cold_stage_factors={}),
+    )
+    assert empty_table.adjust == pytest.approx(0.95 * 0.85 * 0.3, rel=1e-6)
+
+
 def test_sleep_deprived_applies_on_top_of_cold():
     out = _adjust(activity="sick_rest", sick=True, sleep_debt_nights=3)
     assert out.adjust == pytest.approx(0.95 * 0.85 * 0.3 * 0.9, rel=1e-6)

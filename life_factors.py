@@ -35,14 +35,17 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 try:  # 包式加载（Runner 真机）
-    from .life_activity import DAILY, SLEEP, in_window
+    from .life_activity import DAILY, NAP, SLEEP, in_window
 except ImportError:  # 平铺兜底（脚本直跑 / 测试）
-    from life_activity import DAILY, SLEEP, in_window
+    from life_activity import DAILY, NAP, SLEEP, in_window  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------- 默认值
 
 DEFAULT_ACTIVITY_FACTORS: dict[str, float] = {
     SLEEP: 0.0,
+    # 小睡（v1.15.0，PR-R1）：小睡也是睡——同样走硬闸（见 ``compute_adjust``），
+    # 这一行是给 `replace` 模式的缺键告警与因子表展示用的。
+    NAP: 0.0,
     "sick_rest": 1.0,
     "before_sleep": 1.15,
     "night_study": 0.5,
@@ -59,6 +62,18 @@ DEFAULT_HEALTH_FACTORS: dict[str, float] = {
     "cold": 0.3,
     "sleep_deprived": 0.9,
 }
+
+DEFAULT_COLD_STAGE_FACTORS: dict[str, float] = {
+    "onset": 0.7,
+    "worsening": 0.15,
+    "recovering": 0.5,
+}
+"""病程阶段因子（v1.14.0，``[health] cold_stage_factors``）。
+
+每个阶段**只乘一次**（取代旧 ``cold`` 一个值），所以轻症不再与病重同罚。
+``cold`` 保留为兜底：阶段表缺失/解析失败时用它充三个阶段（老 ``config.toml``
+行为不突变）。旧调用点不传 ``cold_stage`` 时也走这个兜底——见 ``compute_adjust``。
+"""
 
 DEFAULT_MOOD_CURVE: tuple[tuple[float, float], ...] = ((0.0, 0.55), (5.0, 0.95), (10.0, 1.35))
 DEFAULT_ENERGY_CURVE: tuple[tuple[float, float], ...] = ((0.0, 0.5), (5.0, 0.85), (10.0, 1.25))
@@ -208,6 +223,10 @@ class FactorConfig:
     health_factors: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_HEALTH_FACTORS)
     )
+    #: 阶段 → 健康因子（v1.14.0）。空 = 用 ``health_factors["cold"]`` 兜底。
+    cold_stage_factors: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_COLD_STAGE_FACTORS)
+    )
     curves_necessity: CurveSet = field(default_factory=CurveSet)
     curves_dynamic: CurveSet = field(default_factory=CurveSet)
     curves_frequency: CurveSet = field(default_factory=CurveSet)
@@ -267,6 +286,7 @@ class AdjustBreakdown:
 
 REASON_OK = "ok"
 REASON_SLEEP = "sleep"
+REASON_NAP = "nap"
 REASON_QUIET_HOURS = "quiet_hours"
 
 
@@ -277,6 +297,7 @@ def compute_adjust(
     energy: float,
     sick: bool,
     sleep_debt_nights: int,
+    cold_stage: str = "",
     date_factor: float,
     material_count: float,
     now_minutes: int,
@@ -296,10 +317,16 @@ def compute_adjust(
     # 这里做一次无条件的收口，保证任何调用路径都不会越过用户设的上限。
     ceiling = max(float(config.max_adjust), float(config.min_adjust), hard_gate_floor)
 
-    # ---- 硬闸 1：睡眠 ----
+    # ---- 硬闸 1：睡眠 / 小睡 ----
+    # 两种「在睡」都直接归零，且**不吃素材加成**（与因子路径不同：因子 0 相乘后
+    # 仍可能被素材加成抬起来，那样睡着的人会因为攒了几条素材而不再静默）。
     if activity == SLEEP:
         return AdjustBreakdown(
             adjust=min(hard_gate_floor, ceiling), raw=0.0, reason=REASON_SLEEP
+        )
+    if activity == NAP:
+        return AdjustBreakdown(
+            adjust=min(hard_gate_floor, ceiling), raw=0.0, reason=REASON_NAP
         )
 
     # ---- 硬闸 2：静默时段 ----
@@ -336,8 +363,18 @@ def compute_adjust(
 
     health_factor = float(config.health_factors.get("healthy", 1.0))
     if sick:
-        cold = float(config.health_factors.get("cold", 1.0))
-        factors.append(("感冒", cold))
+        # v1.14.0：感冒按**病程阶段**出一个因子（初起 0.7 / 加重 0.15 / 好转 0.5），
+        # 仍然只乘一次——阶段因子就是旧 ``cold`` 的替代品，不是叠加项。
+        # 阶段名缺失（旧状态、旧调用点）或不在阶段表里时回退 ``health_factors["cold"]``：
+        # 老 ``config.toml`` 与既有用例的行为逐位不变。
+        stage = str(cold_stage or "").strip().lower()
+        stage_table = dict(getattr(config, "cold_stage_factors", {}) or {})
+        if stage and stage in stage_table:
+            cold = float(stage_table[stage])
+            factors.append((f"感冒({stage})", cold))
+        else:
+            cold = float(config.health_factors.get("cold", 1.0))
+            factors.append(("感冒", cold))
         health_factor *= cold
     if int(sleep_debt_nights) >= int(config.sleep_debt_cap_nights):
         deprived = float(config.health_factors.get("sleep_deprived", 1.0))
@@ -385,6 +422,7 @@ def reason_label(reason: str) -> str:
     return {
         REASON_OK: "正常",
         REASON_SLEEP: "睡眠中",
+        REASON_NAP: "小睡中",
         REASON_QUIET_HOURS: "静默时段",
         "paused": "已暂停（写回 1.0，不干预宿主）",
     }.get(reason, reason)

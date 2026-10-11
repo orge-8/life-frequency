@@ -46,8 +46,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 try:
     from .life_events import sanitize_text
+    from .life_relations import mask_user_id
 except ImportError:  # 平铺兜底（脚本直跑 / 测试）
     from life_events import sanitize_text
+    from life_relations import mask_user_id
 
 # ---------------------------------------------------------------- 常量
 
@@ -583,7 +585,14 @@ def world_events(
                 WorldEvent(
                     kind=KIND_NEWCOMER,
                     label=NEWCOMER_LABEL,
-                    text=_text(f"群 {item.group_id} 来了新成员 {item.user_id}", MAX_TEXT_CHARS),
+                    text=_text(
+                        # v1.13.1（F-001，安全审计）：文案**不携带 QQ 号与群号明文**——
+                        # 这条文本会进 recent_events → 活动决策 prompt（可能发往第三方
+                        # 模型服务）→ 明文落盘 life_state.json。第三方群成员的标识
+                        # 不该离开本机；标识只留在去重 key（本进程内）里。
+                        f"群里来了新成员 {mask_user_id(item.user_id)}",
+                        MAX_TEXT_CHARS,
+                    ),
                     emotion=cfg.newcomer_emotion,
                     energy=0.0,
                     at=item.first_seen,
