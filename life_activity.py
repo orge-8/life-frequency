@@ -875,8 +875,11 @@ def activity_blocked_by_schedule(
         return ""
     # 健康优先：生病或体力低于入睡阈值时，睡眠类（含小睡）一律放行——
     # 她会请假/撑不住，这比让她硬扛着上班更合理。
+    # ⚠ v1.19.0（PR-AF-1）：与 ``_sleep_allowed`` 同一口径（初起不再算「撑不住」，
+    # 与上面 ``on_sick_leave`` 的 onset 不带薪口径一致）。
     if activity in (SLEEP, BEFORE_SLEEP, NAP) and (
-        bool(facts.sick) or float(facts.energy) < float(policy.sleep_energy_threshold)
+        _sick_sleep_short_circuit(facts, policy)
+        or float(facts.energy) < float(policy.sleep_energy_threshold)
     ):
         return ""
     work_text = f"{_clock(policy.schedule.work_window[0])}-{_clock(policy.schedule.work_window[1])}"
@@ -972,6 +975,11 @@ class EnforcePolicy:
     sleep_energy_threshold: float = 3.0
     max_sleep_hours: float = 12.0
     min_awake_hours_per_day: float = 8.0
+    #: 感冒**初起**是否也不短路「每日清醒下限」（v1.19.0 PR-AF-1，默认 True）。
+    #: True = 初起走清醒下限与体力通道入睡（修掉「病中清醒只剩 1 个 tick」）；
+    #: False = 回到 v1.18.1 的「生病即短路」一刀切。加重/好转期**不受**此开关
+    #: 影响，永远短路——那两段她本就该多躺。
+    cold_onset_awake_floor: bool = True
     min_dwell_minutes: int = 60
     min_sleep_minutes: int = 180
     #: 睡眠中体力恢复到上限且睡满最短时长就强制唤醒。默认开；关掉则回到
@@ -1442,8 +1450,43 @@ def on_sick_leave(cold_stage: object, *, enabled: bool = True) -> bool:
     return normalize_cold_stage(cold_stage) in (COLD_WORSENING, COLD_RECOVERING)
 
 
+def _sick_sleep_short_circuit(facts: "ActivityFacts", policy: "EnforcePolicy | None" = None) -> bool:
+    """感冒是否**整体短路**入睡约束（v1.19.0 PR-AF-1）。
+
+    v1.18.1 及之前是 ``bool(facts.sick)`` 一刀切：只要生病，``_sleep_allowed``
+    直接 ``return True``、``urgent_sleep`` 直接为真。真机实测（152 样本 / 12.6 小时）
+    的后果是**清醒被压成 1 个 tick**：睡到体力满醒来 → 下一 tick 因为「病中」立刻
+    躺回去，``continuous_awake_minutes`` 长期恒为 10 分钟，睡觉占比 79.6%。
+
+    本版按病程分级，**只有初起（``onset``）不再短路**：
+
+    - ``onset``：初起本就不强制养病（``_wake_target`` 只对 ``worsening`` /
+      ``recovering`` 送养病）。一边「照常活动」一边又能随时躺回床上，等于把清醒
+      变成不可维持的瞬时态。改后她走正常的清醒下限与体力通道入睡。
+    - ``worsening`` / ``recovering``：这两段她本就该多躺，**保留短路**。
+    - 生病但段位缺失（**旧状态文件 / 旧调用点只填 ``sick=True``**）：
+      ``effective_cold_stage`` 已归一为 ``worsening`` ⇒ **存量行为零变化**。
+    - 不生病（``effective_cold_stage`` 返回空串）：恒 ``False`` ⇒ 逐位不变。
+
+    ``policy.cold_onset_awake_floor``（默认 True）是逃生舱：置 False 即回到
+    v1.18.1 的一刀切短路。``policy`` 为 None 时按默认（True）处理，便于纯模块调用。
+    """
+
+    stage = effective_cold_stage(facts)
+    if not stage:
+        return False
+    if stage != COLD_ONSET:
+        return True
+    # 初起：默认**不**短路（走清醒下限）；开关置 False 回到 v1.18.1 一刀切。
+    return not bool(getattr(policy, "cold_onset_awake_floor", True))
+
+
 def _sleep_allowed(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
     """她现在是否有资格睡觉：睡眠时段内**且体力没满**，或体力很低，或生病。
+
+    ⚠ v1.19.0（PR-AF-1）：「生病」这一路改为按病程分级——只有加重/好转期整体短路，
+    初起（``onset``）**不再短路**，要走体力与清醒下限的常规通道。见
+    ``_sick_sleep_short_circuit``。未感冒与旧状态（``sick=True`` 无段位）行为不变。
 
     ⚠ v1.15.0（PR-S1 的配套闸）：体力已经回满的人**不需要再睡一觉**。
     缺这条会在「最短睡眠目标」下炸出一个 12 小时的坑：
@@ -1453,7 +1496,7 @@ def _sleep_allowed(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
     她只能等到 12 小时上限才醒。加这条之后：体力满就是「睡够了」的确定信号。
     """
 
-    if facts.sick:
+    if _sick_sleep_short_circuit(facts, policy):
         return True
     if float(facts.energy) < float(policy.sleep_energy_threshold):
         return True
@@ -1535,14 +1578,21 @@ def _energy_full_wake(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
 
 
 def _nap_allowed(facts: ActivityFacts, policy: EnforcePolicy) -> bool:
-    """小睡（v1.15.0 PR-R1）成不成立：白天（睡眠时段外）且真的有点困，或生病。"""
+    """小睡（v1.15.0 PR-R1）成不成立：白天（睡眠时段外）且真的有点困，或生病。
+
+    ⚠ v1.19.0（PR-AF-1）：「或生病」与 ``_sleep_allowed`` / ``urgent_sleep`` 同一口径——
+    初起（``onset``）不再享有病中特权，加重/好转期保留。三处共用
+    ``_sick_sleep_short_circuit``，避免改一处漏两处。
+    """
 
     if not bool(policy.nap_enabled):
         return False
     if in_window(facts.now_minutes, policy.sleep_window):
         # 睡眠时段内该睡整觉——「眯一会儿」在那里没有语义
         return False
-    return bool(facts.sick) or float(facts.energy) < float(policy.nap_energy_threshold)
+    return _sick_sleep_short_circuit(facts, policy) or float(
+        facts.energy
+    ) < float(policy.nap_energy_threshold)
 
 
 #: 长睡眠阈值（分钟）：与 ``life_dream.DREAM_MIN_SLEEP_MINUTES`` 同值但**独立定义**
@@ -1792,9 +1842,13 @@ def enforce(
     # 「健康优先」：生病或体力低于入睡阈值时，睡眠**不该**被「每日清醒下限」拦住。
     # 下限的本意是「别刚醒就睡」，不是「累到 0.6/10 也不许睡」；它也不该因为
     # 计数器被清零（停机后重新启用，见 ``life_sim._skip_offline_gap``）而锁死睡眠。
-    urgent_sleep = bool(facts.sick) or float(facts.energy) < float(
-        policy.sleep_energy_threshold
-    )
+    #
+    # ⚠ v1.19.0（PR-AF-1）：「生病」改为按病程分级，初起（``onset``）**不再**短路
+    # 清醒下限——真机实测病中清醒被压成 1 个 tick（10 分钟），睡觉占比 79.6%。
+    # 加重/好转期保留短路。见 ``_sick_sleep_short_circuit`` 的完整推导。
+    urgent_sleep = _sick_sleep_short_circuit(facts, policy) or float(
+        facts.energy
+    ) < float(policy.sleep_energy_threshold)
 
     # ---- 2a-0) 打断窗口内：保住 CHATTING（v1.11.1）----
     # 位置关键：排在「感冒」之后（生病仍优先送她去养病），排在「无有效提议 → 送她
@@ -1872,9 +1926,14 @@ def enforce(
             )
         # 健康优先：已经累到阈值以下（或生病）就直接放行，不看清醒下限。
         if not urgent_sleep and not _awake_floor_ok(facts, policy) and not facts.night_break:
+            # v1.19.0（PR-AF-1）：带上病程阶段——病中被拒睡时要能一眼看出「这次
+            # 是不是初起不再短路导致的」，否则排查时与旧行为完全无法区分。
+            stage = effective_cold_stage(facts)
+            reason = f"今日清醒不足 {policy.min_awake_hours_per_day:g} 小时，拒绝入睡"
+            if stage:
+                reason += f"（感冒{COLD_STAGE_LABELS.get(stage, stage)}，不再短路清醒下限）"
             return ActivityDecision(
-                current, scene, SOURCE_ENFORCED,
-                f"今日清醒不足 {policy.min_awake_hours_per_day:g} 小时，拒绝入睡",
+                current, scene, SOURCE_ENFORCED, reason,
             )
         if not _sleep_allowed(facts, policy):
             return ActivityDecision(
@@ -1899,6 +1958,34 @@ def enforce(
                 "不在睡眠时段且精力还行，现在还不用小睡",
             )
         return ActivityDecision(NAP, scene, source, "眯一会儿")
+
+    # ---- 2b-2) 想「准备睡觉」（v1.19.1 PR-BS-1）----
+    # 「准备睡觉」的唯一目的就是睡觉：**不具备入睡资格时不许进去**。
+    #
+    # 没有这一条，她会在 ``before_sleep`` 里干等到资格成立——真机 2026-10-15 实测：
+    # 02:38 睡满目标醒来 ⇒ ``rested_until`` 指向本轮窗口结束（``sleep_window``
+    # 为 00:00-23:59 ⇒ 次日 00:00），她 05:18 进入 ``before_sleep`` 后被拒入睡，
+    # 滞留 **13.7 小时**；2026-10-13 记录为同一机制（4h+）。``simulate_drift.py``
+    # 复现显示滞留存在于**所有**参数组合，只能从入口根治。
+    #
+    # 判据与「无有效提议 → 硬约束送睡」（分支 1）**同一口径**：``_sleep_allowed``
+    # 且（急睡 / 清醒够 / 夜醒续睡）。与 PR-AF-1 一样，三处共用同一组谓词，
+    # 避免改一处漏两处。
+    #
+    # ⚠ 与 ``request_is_pointless`` 的关系：本分支只收口 ``requested == BEFORE_SLEEP``
+    # 这一种提议，模型仍可提议别的活动且裁定不同 ⇒ **不改变**「这一轮问模型是否白问」
+    # 的判定，故不同步（穷举对拍仍成立）。
+    #
+    # ⚠ 已知残余：生活日边界（默认 12:00）会重置 ``awake_minutes_today``，若她在
+    # 边界前已身处 ``before_sleep``，资格可能在她进去之后才失效——那条路仍由
+    # ``requested == SLEEP`` 的拒绝分支保持 ``current``。留作观察项，不在此处理。
+    if requested == BEFORE_SLEEP and not (
+        _sleep_allowed(facts, policy)
+        and (urgent_sleep or _awake_floor_ok(facts, policy) or facts.night_break)
+    ):
+        return ActivityDecision(
+            current, scene, SOURCE_ENFORCED, "还不具备入睡条件，先不去准备睡",
+        )
 
     # ---- 2b) 普通切换：受最短停留时间约束 ----
     # 例外：打断回退（v1.11.1）——「回到原来的活动」是续上而不是新切换，

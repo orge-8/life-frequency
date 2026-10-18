@@ -182,13 +182,15 @@ def test_f008_store_truncates_user_id_and_hint():
     import tempfile, os
 
     store = LifeStore(os.path.join(tempfile.mkdtemp(), "t.db"))
-    record = new_relationship("U" * 100000, now=NOW)
+    # v1.20.0（Y4）：主键是 person_id；user_id 降级为普通字段但也照样截断。
+    record = new_relationship("P" * 100000, platform="qq", user_id="U" * 100000, now=NOW)
     record["relation_hint"] = "h" * 500
     assert store.put_relationship(record)
-    # 全长查不到（已截断），64 长查得到
-    assert store.get_relationship("U" * 100000) is None
-    got = store.get_relationship("U" * 64)
+    # 全长查不到（主键已截断），64 长查得到
+    assert store.get_relationship("P" * 100000) is None
+    got = store.get_relationship("P" * 64)
     assert got is not None
+    assert got["person_id"] == "P" * 64
     assert got["user_id"] == "U" * 64
     assert len(got["relation_hint"]) == 64
 

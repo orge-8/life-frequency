@@ -764,17 +764,16 @@ def test_webui_visual_mode_shows_field_guidance_as_hints():
 def test_webui_optional_sections_collapsed_by_default():
     """默认关闭的可选功能节默认收起：标题与说明仍可见，点开即用。
 
-    可视化模式所有节默认展开，整页十几张卡片会淹没常用配置；只收起
-    ``proactive`` / ``schedule`` / ``social`` 这三个默认关闭的集成。
+    v1.21.0 起折叠策略从「黑名单三项」改成**常用节白名单**（见
+    ``_WEBUI_PRIMARY_SECTIONS``）：默认视图只剩 7 节 / 35 字段，其余全收。
+    「哪些节展开」由 ``tests/test_webui_default_view.py`` 单点断言，这里只守
+    「这三个默认关闭的集成本身必须是收起的」这条**语义**——它跟白名单怎么调无关。
     """
 
     module = _load()
     sections = _webui_schema(module)
     for name in ("proactive", "schedule", "social"):
         assert sections[name]["collapsed"] is True, f"[{name}] 应默认收起"
-    expanded = [n for n, s in sections.items() if n not in ("proactive", "schedule", "social")
-                and s.get("collapsed")]
-    assert expanded == [], f"不该收起的节被收起了：{expanded}"
 
 
 def test_webui_free_text_fields_use_textarea():

@@ -42,6 +42,9 @@ MANIFEST_ALLOWED_KEYS = {
 ID_RE = re.compile(r"^[A-Za-z0-9_]+(?:[.-][A-Za-z0-9_]+)+$")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 CTX_CALL_RE = re.compile(r"self\.ctx\.([A-Za-z_][A-Za-z0-9_.]*?)\(")
+#: 配置层模块（v1.21.0）：配置模型与 WebUI 展示元数据搬到了这里，
+#: 所以「config_version 是否声明」「有没有 ctx 泄漏」要连它一起扫。
+CONFIG_MODULE = "life_config.py"
 SECRET_PATTERNS = [
     (re.compile(r"sk-[A-Za-z0-9]{16,}"), "疑似 OpenAI/兼容端点 Key 硬编码"),
     (re.compile(r"(?i)(api[_-]?key|access[_-]?token|secret)\s*[:=]\s*[\"'][A-Za-z0-9_\-]{12,}[\"']"),
@@ -102,6 +105,13 @@ CAPABILITY_MAP = {
 }
 FREE_CAPABILITIES = {"api.replace_dynamic"}
 NON_CAPABILITY_PROXIES = {"paths", "logger", "call_capability", "call_host_method"}
+#: 动态分发器里的**字面量**能力名（v1.22.0）。
+#: ``call_capability`` 的能力名通常是运行时参数，静态推不出来；但写成
+#: ``ctx.call_capability("knowledge.search", ...)`` 时名字是确定的。不认这一条，
+#: 「确实用了、也确实声明了」的插件会被反报成「声明了但没用到」——把真警告淹掉。
+CALL_CAPABILITY_LITERAL_RE = re.compile(
+    r"""ctx\.call_capability\(\s*["']([A-Za-z_][A-Za-z0-9_.]*)["']"""
+)
 """不是能力代理的名字。
 
 `paths` / `logger` 是辅助对象；`call_capability` / `call_host_method` 是**动态分发器**
@@ -324,6 +334,28 @@ def _has_config_version_field(tree: ast.AST) -> bool:
     return False
 
 
+def _self_ctx_calls(tree: ast.AST) -> list[int]:
+    """返回 ``self.ctx.<...>`` 出现的行号（AST 级，不看注释与字符串）。
+
+    ``ast.walk`` 能找到 ``self.ctx.api.call(...)`` 里最深的那层 Attribute，
+    也就能覆盖 ``self.ctx.logger.info(...)`` 这种链式调用。
+    """
+
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        inner = node.value
+        if (
+            isinstance(inner, ast.Attribute)
+            and inner.attr == "ctx"
+            and isinstance(inner.value, ast.Name)
+            and inner.value.id == "self"
+        ):
+            lines.append(getattr(node, "lineno", 0))
+    return sorted(lines)
+
+
 def _has_future_annotations(tree: ast.AST) -> bool:
     """AST 级判断是否真的 import 了 `__future__.annotations`。
 
@@ -359,7 +391,15 @@ def _has_os_path_dirname_call(tree: ast.AST) -> bool:
     return False
 
 
-def check_source(source: str, caps: list[str], rep: Report) -> None:
+def check_source(source: str, caps: list[str], rep: Report,
+                 extra_sources: list[tuple[str, str]] | None = None) -> None:
+    """L1 源码检查。``extra_sources`` = 一起参与结构判定的附加模块（名称, 源码）。
+
+    目前只有 ``life_config.py``：配置模型在那里，所以「config_version 是否声明」
+    与「配置层不许出现 ctx 调用」两条必须连它一起看。
+    """
+
+    extra_sources = extra_sources or []
     if re.search(r"^\s*import\s+src\.|^\s*from\s+src\.", source, re.M):
         rep.fail("源码/禁止 import src", "插件只允许导入标准库、第三方库与 maibot_sdk")
     else:
@@ -419,13 +459,46 @@ def check_source(source: str, caps: list[str], rep: Report) -> None:
         else:
             rep.fail("源码/config_model", "插件类未声明 config_model（Runner 无法生成默认配置）")
 
-    if _has_config_version_field(tree):
+    config_version_ok = _has_config_version_field(tree)
+    if not config_version_ok:
+        for name, text in extra_sources:
+            try:
+                if _has_config_version_field(ast.parse(text)):
+                    config_version_ok = True
+                    break
+            except SyntaxError as exc:
+                rep.fail(f"源码/{name} 语法", f"AST 解析失败: {exc}")
+    if config_version_ok:
         rep.ok("源码/config_version", "配置模型含 config_version 字段")
     else:
         rep.fail(
             "源码/config_version",
             "配置模型里没有 config_version 字段（1.2.3 硬性要求，缺失即加载失败）",
         )
+
+    # 配置层（life_config.py）的边界：它只放模型与展示元数据，
+    # 一旦出现 ctx 调用就说明胶水层漏出来了——能力反推只扫 plugin.py，漏出去就查不到。
+    for name, text in extra_sources:
+        try:
+            extra_tree = ast.parse(text)
+        except SyntaxError as exc:
+            rep.fail(f"源码/{name} 语法", f"AST 解析失败: {exc}")
+            continue
+        if _has_future_annotations(extra_tree):
+            rep.fail(f"源码/{name} __future__", f"{name} 同样禁止 from __future__ import annotations")
+        else:
+            rep.ok(f"源码/{name} __future__", "未使用")
+        # AST 级判断，不做文本匹配：文件头说明里本来就会提到 ``self.ctx.*``
+        # （「本文件不许出现宿主调用」这句话本身会把正则喂饱）。
+        leaks = _self_ctx_calls(extra_tree)
+        if leaks:
+            rep.fail(
+                f"源码/{name} 无 ctx 调用",
+                f"{name} 第 {', '.join(str(n) for n in leaks[:5])} 行有宿主调用："
+                "胶水必须留在 plugin.py（能力反推只扫那里）",
+            )
+        else:
+            rep.ok(f"源码/{name} 无 ctx 调用", "OK")
 
     # 装饰器-函数配对
     pairs = list(_function_decorators(tree))
@@ -456,6 +529,13 @@ def check_source(source: str, caps: list[str], rep: Report) -> None:
             used.add(mapped)
         else:
             unknown.add(proxy)
+    # 动态分发器里的字面量能力名（v1.22.0）：``ctx.call_capability("knowledge.search", ...)``
+    # 的名字是确定值，不认这一条会把「用了也声明了」误报成「声明了但没用到」。
+    for literal in CALL_CAPABILITY_LITERAL_RE.findall(source):
+        if literal.startswith(STATISTICS_PREFIX):
+            used.add(literal)
+            continue
+        used.add(CAPABILITY_MAP.get(literal, literal))
     declared = set(caps)
     missing = sorted(used - declared - FREE_CAPABILITIES)
     if missing:
@@ -537,6 +617,9 @@ def derive_capabilities(source: str) -> list[str]:
         mapped = CAPABILITY_MAP.get(call)
         if mapped:
             used.add(mapped)
+    # 与上面同一口径：动态分发器的字面量也算（否则 scaffold 生成的 manifest 会漏声明）
+    for literal in CALL_CAPABILITY_LITERAL_RE.findall(source):
+        used.add(CAPABILITY_MAP.get(literal, literal))
     return sorted(used)
 
 
@@ -547,7 +630,13 @@ def run(plugin_dir: str) -> Report:
     if manifest is not None:
         caps = check_manifest(manifest, rep)
     if source is not None:
-        check_source(source, caps, rep)
+        # v1.21.0：配置模型搬到了 life_config.py（plugin.py 9,384 → 7,009 行）。
+        # 「config_version 真的声明了」这条必须跟着走，否则搬完门禁会假红。
+        extra: list[tuple[str, str]] = []
+        cfg_path = os.path.join(plugin_dir, CONFIG_MODULE)
+        if os.path.isfile(cfg_path):
+            extra.append((CONFIG_MODULE, read_text(cfg_path)))
+        check_source(source, caps, rep, extra_sources=extra)
     check_hygiene(plugin_dir, rep)
     return rep
 

@@ -24,9 +24,22 @@
        └── life-frequency/
            ├── _manifest.json
            ├── plugin.py
-           ├── life_*.py
+           ├── life_config.py        # 配置模型与 WebUI 展示元数据
+           ├── life_*.py             # 纯逻辑模块
            └── ...
    ```
+
+   运行时只需要 `.py` + `_manifest.json`（约 **1.0 MB**）。下面这些**不必**放进真机：
+
+   | 可省略 | 理由 |
+   |---|---|
+   | `tests/` | 开发侧门禁，宿主不加载（约 950 KB） |
+   | `collect_diagnostics.py` | 现场诊断工具，按需单独拷（约 240 KB） |
+   | `CHANGELOG.md` / `docs/` | 文档，不参与加载 |
+   | `check_plugin.py` / `run_gates.py` / `calibrate_curves.py` / `simulate_drift.py` | 开发工具 |
+
+   整目录替换当然也能跑，只是白占体积；`__pycache__/` 一律先删掉再拷贝
+   （Windows 上跨机器复制 `.pyc` 会因为解释器版本不同而报错）。
 
 2. **完整重启 MaiBot**（不是热重载）。首次启动时 Runner 会按配置模型生成
    `plugins/life-frequency/config.toml`。
@@ -711,214 +724,25 @@ use_llm = true       # 用一次短模型调用生成梦；关掉只用模板库
 3. 文本第一人称、口语向、**不带 user_id**（有关系备注用备注，否则「很久没聊的
    朋友」）；素材 TTL 2–6 小时，走既有保鲜衰减。
 
+### 长期记忆：只读 A_Memorix（v1.22.0，默认关闭）
+
+宿主 SDK 2.8.x 没有 memory 能力，插件侧唯一入口是 `knowledge.search`（底层 A_Memorix），所以这一层**只读**：
+读得到就用，读不到什么都不发生（写回只能走 `database.*` 改宿主表，不做）。接入点只有两个：**主动开口素材**
+（带 `target_user_id`，只在该人的会话里可见）与**关系档案**（`/生活 关系`、状态卡里的「记得 …」）。
+
+三个**刻意的不接**：活动提示词（`activity` 全局单份）、回复摘要（`_life_digest` 直接进回复 prompt）、
+`state.materials`（全局池 + 落盘）。细节与检索契约见 [`docs/config.md`](docs/config.md)、[`docs/interop.md`](docs/interop.md)。
+
 ---
 
 ## 配置
 
-配置文件由 Runner 生成在 `plugins/life-frequency/config.toml`。
-下面只列关键的，其余在 WebUI 插件页里都有中文说明与分组。
+全部配置项、默认值与填法见 [`docs/config.md`](docs/config.md)。
 
-> **WebUI 与 `config.toml` 的对应关系**：配置页是按「分组 = 配置路径」渲染的，
-> 所以嵌套节会显示成独立分组：`[activity.llm]` → 分组「活动模型调用参数」、
-> `[emotion_energy.curves.frequency]` → 分组「计数门曲线（frequency）」。
-> 页面上改哪个分组，写回的就是 `config.toml` 里同一个键路径，**两边随时可互换编辑**。
-> （v1.3.0 起插件会覆写 `get_webui_config_schema` 做这件事：SDK 只在顶层把配置模型
-> 展开成分组，嵌在节里的配置对象原本会退化成 `type=object`，而配置页的控件分发里
-> 没有 `object/json` 分支 ⇒ 页面显示成 `[object Object]` 且无法编辑。
-> 这一修正**不改任何配置键**，旧 `config.toml` 原样继续生效。）
-
-| 配置节 | 关键项 | 默认 | 说明 |
-|---|---|---|---|
-| `[plugin]` | `enabled` | `true` | 关掉后写回 1.0 且停止推进状态 |
-| | `config_version` | `1.6.0` | **必需**，删了会「插件配置版本非法」。新增配置字段会 bump 它（宿主只在版本变化时才把新字段补进已部署的 `config.toml`） |
-| `[simulation]` | `tick_seconds` | `600` | 生活推进间隔（参考设定 10 分钟） |
-| | `dry_run` | `false` | 演算模式：不写宿主 |
-| | `seed` | `""` | 随机种子，同种子可复现同一条时间线 |
-| | `tz_offset_minutes` | `480` | 本地时区（UTC+8） |
-| | `day_boundary_hour` | `12` | 熬夜结算的分界小时 |
-| | `sleep_window` | `03:00-11:00` | 睡眠时段 |
-| | `energy_full_wake_min_hours` | `6.5` | **最短睡眠目标**（v1.15.0）：体力回满且睡够它才醒。0 = v1.6.0 旧行为（回满即醒，短夜 + 睡↔醒往复会回来） |
-| | `rest_day_sleep_extension_minutes` | `60` | 休息日（法定节假日 / 班表休息日）在目标上额外顺延的分钟数；0 = 不区分 |
-| | `routine_can_wake` / `physio_can_wake` | `false` | 习惯表 / 三餐生理窗**能否把她从睡眠里叫起来**（v1.15.0 默认睡眠优先）；置 true 恢复 v1.14 行为（那两个开关打开时，睡满最短睡眠时长后 07:00 的习惯/早餐会叫醒她） |
-| | `wake_daze_minutes` | `15` | 长睡眠（≥3h）醒来先赖床的分钟数（同一窗口也被「夜间易醒」复用）；0 = 关 |
-| | `nap_enabled` | `true` | 启用小睡（v1.15.0）：白天精力低时可 `nap`，静默、不做梦、20–90 分钟 |
-| | `nap_max_minutes` / `nap_min_minutes` | `90` / `20` | 小睡时长上限 / 最短时长（分钟） |
-| | `nap_energy_threshold` | `4.0` | 体力低于它（或生病）才会小睡；在岗相位不许小睡 |
-| | `wake_on_at` | `true` | **睡眠时被 `@` 就醒来**（v1.7.0）：临时把该会话的倍率抬到清醒值，`wake_minutes` 分钟后自动回睡；只在 `activity = sleep` 且不在 `[frequency] quiet_hours` 里生效。关掉 = 「睡就是睡」，`@` 也叫不动 |
-| | `wake_minutes` | `10` | 唤醒后保持清醒的分钟数（窗口内再来消息只顺延）；`0` = 关闭唤醒 |
-| | `wake_on_private` | `false` | **私聊也叫醒她**（v1.15.0）：私聊没有 @ 这个概念，原来完全叫不醒；打开后判据与打断机制对齐（私聊任意消息 / 群聊被 @） |
-| | `wake_extend_on_message` | `true` | 窗口内对方继续说话就顺延（不重写宿主）——她回一句、对方接着聊，不会 10 分钟后突然断线 |
-| | `wake_max_extensions_minutes` | `30` | 一次被叫醒的总清醒上限（从第一次算起）；0 = 不设上限 |
-| | `wake_grumpy_note` | `true` | 被吵醒的语气：睡下不到两小时就被叫醒时，提示词带一句「还有点迷糊、有点不情愿」（只改措辞） |
-| `[activity]` | `mode` | `llm` | `llm` / `rules` |
-| | `min_dwell_minutes` | `60` | 最短停留 |
-| | `sleep_hard_floor` | `0.5` | 体力 ≤ 它时**无视模型提议**强制入睡（v1.15.0）；0 = 关闭 |
-| | `reseed_after_hours` | `8` | `0` = 关闭重新取种子 |
-| | `activity_factors` | 见上 | 每行 `活动=因子`；merge 模式缺键按内置补齐并告警（v1.15.0 起含 `nap=0.0`） |
-| | `factors_mode` | `merge` | `merge` = 与内置默认合并（防升级丢因子）；`replace` = 以配置为准、不再补齐——删掉的内置因子保持删除（该活动按 1.0），内置缺键告警提醒一次，删 `sleep=0` 前想清楚（睡觉即静音的硬闸） |
-| `[activity.llm]` | `min_interval_seconds` | `600` | 决策最小间隔 |
-| | `sleep_interval_seconds` | `1800` | **睡眠中**的决策间隔（v1.15.0）：每晚 18–30 次调用 → 4–8 次；`0` = 睡眠中完全不问模型（醒来交给确定性条件） |
-| | `timeout_ms` | `120000` | 整条 cap.call 的等待预算（毫秒）：覆盖宿主侧「模型回退链 + 重试」的**总耗时**，超时即按失败处理（SDK 内建默认只有 30000，真机一次成功决策实测约 19 秒，别调回 20 秒级） |
-| | `fail_streak_limit` / `cooldown_minutes` | `3` / `30` | 连续失败后的冷却 |
-| | `recent_events_in_prompt` | `8` | 近期经历**总条数**（近/中/远三层合计；`0` = 不带） |
-| | `recent_pick_mode` | `smart` | 经历挑法：`smart` = 显著性排序 + 每层同标签去重 + 空层配额回收；`recent` = 旧行为（固定配额、只取最新、不去重），可一键回退 |
-| | `recent_max_per_label` | `1` | 同一标签在**每层内**最多出现几次；`0` = 不去重（跨层允许重复＝「这几天一直在做同一件事」的信号） |
-| | `recent_near_hours` / `recent_mid_hours` / `recent_far_days` | `12` / `72` / `14` | 三层的窗口：近 12 小时、中 3 天、远 14 天 |
-| | `recent_events_keep` | `300` | 经历留存条数：状态文件里保留多少条经历（近/中/远三层共用这个池子，约 18.9 条/日）；`0` = 不保留 |
-| `[schedule]` | `enabled` | `false` | 作息班表：打开后提示词写明工作日/在岗/岗位，强制层禁止上班睡、在岗摸鱼（见上） |
-| | `workdays` / `work_window` | `1-5` / `09:30-18:30` | 工作日与在岗时段；支持 `六日`、`1,3,5`、`6-1` 跨周 |
-| | `commute_minutes` / `lunch_window` | `45` / `12:00-13:00` | 单程通勤（上下班各一段）与午休（不算在岗） |
-| | `duty` / `work_scene` | `""` / `""` | 岗位职责文本（进提示词）与「在岗」场景文本（冷启动/规则表用） |
-| | `honor_calendar` | `true` | **班表吃日历**（v1.17.0）：法定节假日算休息日、调休的周末算上班日；`false` = 只按 `workdays` 星期判定（v1.16.3 旧行为） |
-| | `daily_jitter_minutes` | `0` | **按日微扰**（v1.17.0）：窗口整体前后平移 0–60 分钟，按生活日确定性派生（同一天恒定）；`0` = 关 |
-| | `overtime_probability` / `overtime_extra_minutes` | `0.0` / `60` | **加班日**（v1.17.0）：按日派生，命中则下班端顺延并在提示词写「今天要加班」；`0` = 关 |
-| `[emotion_energy]` | `inertia_minutes` | `40` | 情绪惯性期（基准值） |
-| | `recover_per_tick` | `0.2` | 每次回归分数（**仅** `recover_ratio_per_tick = 0` 时生效） |
-| | `recover_ratio_per_tick` | `0.08` | **比例回归**（v1.16.1）：每个推进间隔消除「与基线差距」的比例；`0` = 旧线性行为 |
-| | `recover_min_step` | `0.05` | 比例回归的每 tick 最小步长（`0` = 不设下限） |
-| | `inertia_scale_enabled` | `true` | 惯性期按 `\|情绪增量\|` 缩放（v1.16.1）：`40 × \|delta\|`，钳进下面两个值；`false` = 一律固定惯性期 |
-| | `inertia_scale_min_minutes` / `inertia_scale_max_minutes` | `5` / `90` | 缩放上下限（上限取「本值与 `inertia_minutes` 的较大者」，配长惯性期时不会被反缩） |
-| | `afterglow_cap` | `0.6` | 24h 余波上限（±） |
-| | `afterglow_decay` | `true` | 余波按年龄线性衰减（v1.16.1）：`1 − 年龄/窗口`；`false` = 旧等权 |
-| | `afterglow_gain` | `0`（自动） | 余波折算系数：`0` = 按开关自动（衰减 **0.30** / 等权 **0.15**）；显式给值以配置为准 |
-| | `baseline_diurnal_curve` | `300=-0.3` / `780=0.15` / `1200=0.3` / `1380=0` | **日内节律**（v1.16.1）：`本地时刻分钟=基线偏移`，按 24 小时闭环；**清空 = 关闭** |
-| | `emotion_fatigue_penalty` | `0.3` | **疲劳压情绪基线**（v1.16.2）：体力 < 阈值时基线下移 `系数 × (阈值 − 体力)`；`0` = 关闭。⚠ 这是「身体状态不直接进倍率」纪律的唯一开口 |
-| | `emotion_fatigue_threshold` | `3.0` | 体力低于它才开始压低基线 |
-| | `low_energy_drain_multiplier` | `1.25` | **低体力消耗放大**（v1.16.2）：体力 < 阈值时负的体力变化 ×本值（恢复项不动）；`1.0` = 关闭 |
-| | `low_energy_threshold` | `3.0` | 体力低于它才开始放大消耗 |
-| | `emotion_impact_scaling` | `true` | **情绪冲击边际效用**（v1.16.3）：低谷雪中送炭、高涨快乐麻木、高处跌落更疼、麻木时挨一下没那么疼；作用在事件/日期/社交三条通道；`false` = 增量原样进出 |
-| | `impact_positive_curve` / `impact_negative_curve` | `2=1.3,5=1.0,8=0.7` / `2=0.7,5=1.0,8=1.2` | 正/负向冲击曲线（`当前情绪=系数`，分段线性、端点外取端点值） |
-| | `fatigue_ramp_curve` | `12=0` / `16=-0.15` / `20=-0.4` / `24=-0.7` | **清醒疲劳**（v1.16.0）：`清醒小时=额外体力/小时`（负值，分段线性），睡一觉（含小睡）清零。12 小时以内不额外掉体力（不惩罚正常的一天）。**清空 = 关闭 = 与升级前逐位一致** |
-| | `curves.frequency` / `curves.necessity` / `curves.dynamic` | 见上 | **三套**曲线，按宿主模式自动选（`dynamic` = MaiBot 1.3.2 起的动态触发） |
-| `[frequency]` | `mode_source` | `auto` | `auto` / `frequency` / `reply_necessity` / `dynamic`；`auto` = 读宿主 `reply_trigger_mode` |
-| | `max_adjust` / `min_adjust` | `2.0` / `0.0` | 倍率钳制；`max_adjust` 必须不小于另外两个下限，配错会告警并自动抬高上限 |
-| | `quiet_hours` | `23:30-08:00` | 命中写 0 |
-| | `paused` | `false` | 暂停干预（归还基数） |
-| | `silence_floor` | `0.0` | 硬闸落地倍率下限；**>0 就不再是真静默**（任何模式下 `@` 都会穿透 + 其它插件的主动开口生效），见「与其它插件共存」 |
-| `[health]` | `sleep_debt_threshold_minutes` | `300` | 低于它算熬夜（24 小时滚动窗口，睡觉与小睡都算） |
-| | `sleep_debt_cap_nights` | `3` | 连熬夜数 |
-| | `sleep_debt_recovery_step` | `1` | 一晚「睡够了」清几晚债（v1.15.0 滞回：连熬三晚要三个好觉）；0 = 旧行为（一晚清零） |
-| | `sleep_deprived_energy_cap` | `8.5` | 熬夜后的体力上限 |
-| | `cold_stage_factors` | `onset=0.7` / `worsening=0.15` / `recovering=0.5` | 病程阶段因子（v1.14.0）：轻症不再与病重同一个压制值；阶段表留空则回退 `health_factors.cold` |
-| | `cold_immunity_days` | `5` | 病愈后几天内不再掷中招骰子（`0` = 关掉免疫期） |
-| | `cold_convalescent_hours` | `24` | 病后余韵时长：不算生病，只在提示词与状态卡里带一句「刚好利索」 |
-| | `cold_care_daily_cap` | `2` | 每日**计入病程流转**的关心次数上限；多出来的关心仍有情绪收益，但不再加速康复（`0` = 关心完全不影响病程） |
-| | `cold_sick_leave` | `true` | 加重/好转期自动请病假：提示词与班表强制层都不再让她上班（关掉 = 只有强制养病、没有病假说法） |
-| | `cold_care_patterns` | 两条默认正则 | 关心句式表（每行一条正则）。默认要求**第二人称**（`你吃药了吗`）或**叮嘱/询问词**（`记得吃药`、`多喝热水`、`好点了吗`），防「我昨天也感冒了」「他感冒一礼拜了」被判成关心；写了坏正则只告警并忽略。想更宽松就自己加行，例如 `^早点睡` |
-| | `cold_season_factors` | `[]` | 季节风险系数（`1=1.5`、`7=0.7` 这种行），留空 = 不启用；启用后冬天更容易感冒 |
-| `[mood]` | `enabled` | `true` | 内心维度：压力 / 孤独 / 社交电量（只影响怎么说、何时开口，不进倍率） |
-| | `insomnia_enabled` | `true` | **入睡困难**（v1.15.0）：压力大时躺下也睡不着——把入睡收口成「翻来覆去睡不着」，并记一条经历 |
-| | `insomnia_stress_threshold` / `insomnia_probability` | `7.0` / `0.5` | 压力达到它才可能睡不着；满足条件时这一觉睡不着的概率（每生活日至多一次） |
-| | `night_waking_enabled` / `night_waking_probability` | `false` / `0.02` | **夜间易醒**（v1.15.0，默认关）：长睡眠中段偶尔醒一下（切「发呆」一小段再睡回去），并记一条「半夜醒了一下」；每个推进间隔的概率，每夜至多一次 |
-| | `stress_breakdown_enabled` | `true` | **高压崩溃**（v1.16.2）：压力达到阈值并**持续**够久就真的崩一次（情绪 −0.8 + 一条「绷不住」的素材与经历，每生活日至多一次）。措辞硬编码（与病程事件同一套确定性管线），只暴露开关与阈值 |
-| | `stress_breakdown_threshold` / `stress_breakdown_hours` / `stress_breakdown_reset` | `7.0` / `2.0` / `5.0` | 崩溃压力阈值 / 需要持续几小时 / 回落到它以下就重新计时 |
-| | `loneliness_social_scaling` | `true` | **孤独放大社交收益**（v1.16.2）：孤独 ≥7 → ×1.5、≤2 → ×0.8，其间线性；**仍受 `[social] daily_emotion_cap` 约束**（先缩放、再封顶）。关掉 = 所有人生效相同 |
-| | `loneliness_social_curve` | `2=0.8` / `7=1.5` | 孤独 → 系数曲线（分段线性、端点外取端点值）；清空 = 回退内置曲线 |
-| `[date]` | `birthday` | `""` | `MM-DD`；格式错/该月没这天会告警（不会静默失效） |
-| | `festivals` | `[]` | 行 DSL，可配具体事件 |
-| | `date_factors` | `[]` | 按名称覆盖节日倍率，如 `生日=1.4`（v1.1.0 是死配置，v1.1.1 起生效） |
-| `[events]` | `fire_probability` | `0.4` | 每个推进间隔的事件概率 |
-| | `material_ttl_hours` | `6` | 素材有效期 |
-| | `material_best_ratio` / `material_decay_floor` | `0.5` / `0.25` | 素材「最佳保鲜相位」：TTL 的前半是全额权重，之后线性衰减到下限（衰减而非清零）；主动开口按有效权重挑素材，素材加成按有效条数折算。`1` / `1` = 旧行为 |
-| | `extra` / `disabled` | `[]` | 追加 / 停用事件 |
-| `[apply]` | `interval_seconds` | `60` | 同步倍率到会话的间隔 |
-| | `filter_mode` / `target_chats` | `all` / `[]` | 生效范围；写错值会告警并在 `/生活` 里显示「本轮命中 0 个会话」 |
-| | `only_active_sessions` | `true` | 只干预有活动迹象的会话（见过消息或本来就在管）。关掉＝对 `get_all_streams` 返回的**全部历史会话**都先写一遍 |
-| | `compose_external` | `true` | 与其它写倍率的插件乘性合成，见「与其它插件共存」 |
-| | `unbacked_retry_minutes` | `15` | 「写不进去」的会话首次重试间隔（指数退避，封顶 24h） |
-| `[proactive]` | `enabled` | `false` | 主动开口（见下） |
-| | `score_threshold` | `0.45` | 开口阈值 |
-| | `daily_max` / `min_interval_minutes` | `1` / `180` | 每日上限 / 最小间隔 |
-| | `unanswered_backoff_factor` / `unanswered_backoff_max_streak` | `2.0` / `4` | 未回应退避（G1，仅私聊）：对方连续不回应时最小间隔 ×系数^连击（默认封顶 ×16 = 48 小时），对方一回话立即归零；群聊与判不出类型的会话维持现有硬闸。系数 `1` = 关闭。⚠ 封顶必须**大于** 24 小时才有意义：默认 `daily_max=1` 下，封顶 24h 时退避永远不是约束条件（实测间隔恒为 24h，与不开退避逐位相同）；48h 才确定性地变成「隔天一次」。退避档位会进沉默台账，`/生活 为什么` 能看到「距上次主动太近 ×4：N 次」 |
-| | `filter_mode` / `target_chats` | `all` / `[]` | 主动开口自己的范围（v1.5.2）：在 `[apply]` 的范围内**再收窄**（最终范围 = 两者交集，`[apply]` 始终是总闸）。语法与 `[apply].target_chats` 一致（`"group:群号"` / `"private:QQ号"`）；写错值按最保守的 whitelist 处理并告警一次；whitelist 为空 = 不在任何会话主动开口。状态卡显示当前范围 |
-| `[economy]` | `enabled` | `true` | 接入 `budget-pacer` 的真实月度预算（**不参与倍率**，只影响行为与展示）；关掉则完全不调用跨插件 API |
-| | `api_plugin_id` / `api_name` / `api_version` | `org.orge-8.budget-pacer` / `get_budget_status` / `1` | 只读 API 的坐标；`api_name` 也可以直接写完整名 |
-| | `refresh_interval_minutes` | `30` | 取数间隔（只读 RPC，不唤醒模型） |
-| | `stale_after_minutes` | `180` | 超过它算过期：仍显示并带 ⚠，但不再约束她的行为；`0` = 关闭过期检查 |
-| | `broke_ratio` / `tight_ratio` / `roomy_ratio` | `0.10` / `0.30` / `0.60` | 见底 / 手头紧 / 宽裕的余额占比阈值（颠倒会自动排序） |
-| | `tight_pacing` / `pacing_from_spend_ratio` | `1.20` / `0.50` | 节奏比升级为「紧张」的阈值，以及它生效所需的最低花费进度 |
-| | `hint_in_prompt` | `true` | 手头紧时是否写进活动提示词（关掉＝只展示） |
-| | `api_timeout_seconds` | `10` | 跨插件调用超时；超时即降级为「未接入」，不会拖住生活循环 |
-| `[social]` | `enabled` | `false` | 把 `better-diary` 的选材摘要接成她的「近期经历」（**默认关闭**，见「与 `better-diary` 联动」） |
-| | `api_plugin_id` / `api_name` / `api_version` | `org.orge-8.better-diary` / `get_day_digest` / `1` | 只读 API 的坐标 |
-| | `fetch_days` | `2` | 一次往回取几天（日记是睡前生成的，取 2 天才盖得住「昨天睡前」到「今天现在」） |
-| | `refresh_interval_minutes` | `30` | 取数间隔（只读 RPC，不唤醒模型） |
-| | `digest_emotion` | `0.4` | 一条「她今天和人聊到的事」值多少情绪（只算 24 小时内的） |
-| | `mention_emotion` / `group_emotion` | `0.3` / `0.1` | 被点名找她 / 只是群里有动静值多少情绪 |
-| | `daily_emotion_cap` | `1.5` | **每生活日的社交情绪总额度**；用完就只记事、不再加情绪（防止「群里今天多热闹」变成她的情绪基线） |
-| | `record_while_asleep` / `emotion_while_asleep` | `true` / `false` | 睡觉时照常记录（醒来能看到有人找过她），但**不产生情绪增量** |
-| | `include_quote` | `false` | 是否把对方「原话」写进经历正文（默认关：更省 token、少一点外部原文） |
-| | `max_digest_events_per_day` / `max_live_events_per_day` | `3` / `2` | 每天最多接进几条摘要 / 几条「有人找我」（**必须有上界**：经历池子只有 `recent_events_keep` 个位置，默认 300） |
-| | `relation_emotion_scaling` | `true` | **社交情绪按关系加权**（v1.16.3 M7）：陌生 1.0 / 熟 1.2 / 亲密 1.5（单向只放大、封顶 1.5）；**新装插件（无档案）= 旧行为逐位一致**；仍受每日额度约束 |
-| | `relation_emotion_curve` | `20=1.0` / `50=1.2` / `80=1.5` | 熟悉度 → 社交情绪系数（分段线性；系数被钳到 `[1.0, 1.5]`） |
-| | `api_timeout_seconds` | `10` | 跨插件调用超时 |
-| `[routines]` | `enabled` | `true` | 习惯层（**配了 `lines` 才有作用**，默认没有习惯行） |
-| | `lines` | `[]` | 行 DSL `HH:MM-HH:MM\|场景\|活动\|weight=..\|jitter=..\|days=..\|workday_only=..\|holiday_only=..\|physio=..`，见上。**场景可用 `；` 写多句候选**（v1.17.0，按生活日 + 小时桶轮换）；`physio=true` 的行会真的回饱并计「今日已吃」 |
-| | `jitter_minutes` | `15` | 默认抖动幅度（按生活日固定一次） |
-| | `llm_gap_minutes` | `120` | 习惯命中后至少隔这么久才再问一次模型 |
-| `[physio]` | `enabled` | `true` | 三餐生理锚点（饱腹结算 + 时间窗 proposal） |
-| | `meals` | 早/午/晚餐 + 晚间洗澡 | 行 DSL `HH:MM-HH:MM\|名称\|类型\|修饰符`；类型 `meal`/`bath`/`snack`；修饰符 `weight=`/`scene=`，**v1.17.0 起还有 `days=`/`workday_only=`/`holiday_only=`**（与习惯行同一套语义） |
-| | `satiety_decay_per_hour` | `0.8` | 清醒时每小时饱腹下降（睡着不消耗） |
-| | `meal_duration_minutes` | `40` | **一餐的最短停留期**（v1.17.0 起真的生效——以前这个键零消费），仅 `meal` 活动使用（其余活动仍按 `[activity] min_dwell_minutes`） |
-| `[prompt]` | `inject_enabled` | `true` | 把生活摘要注入回复请求 |
-| `[security]` | `admin_ids` | `[]` | 留空 = 只有本机操作者（fail-closed） |
-
-**列表字段可以写成逗号分隔的字符串**，插件会归一化：`admin_ids = "123,456"` 等价于
-`admin_ids = ["123", "456"]`。
-
-### 主动开口（默认关闭）
-
-开启后（`proactive.enabled = true`），她攒到「想跟你说的素材」时会**主动开话**：
-
-```
-分数 = 素材权重 + 体力偏置 + 情绪偏置       ≥ 0.45 才开口（只负责排序）
-```
-
-数量由一组**正交硬闸**独立控制（模型看不到，也不参与评分）：睡眠中、体力低于下限、
-静默时段、没有未过期素材、今日已达上限、距上次主动太近、对方刚说过话。
-
-群聊与私聊都可以主动开口；唯一的差异是「未回应退避」（×2^连击）只在私聊生效，
-群聊没有退避。范围由两道闸共同决定：`[apply]` 的 `filter_mode/target_chats` 是
-**总闸**（频率 + 主动开口），`[proactive]` 自己的 `filter_mode/target_chats`
-（v1.5.2）只能在总闸内**再收窄**——最终范围 = 两者交集。只想让指定的几个群/私聊
-能被主动搭话、频率照旧管全部会话时，把 `[proactive].filter_mode` 设为 `whitelist`
-并填 `target_chats`（语法与 `[apply].target_chats` 一致，`"group:群号"` / `"private:QQ号"`）。
-写错 `filter_mode` 按最保守的 whitelist 处理并告警一次。
-
-开口走宿主的 `maisaka.proactive.trigger`，是**提案而非直发**——Planner 仍有权沉默。
-`send.text` 只用于命令回复，绝不用来发聊天内容。
-
-**主动开口不挂引用**（v1.8.1，代码层纪律，不可配置关闭）：她主动找话说时**不许引用任何消息**——
-引用了别人刚说过的话，看起来就像在回复那个人，语义完全错位。两处同时生效：
-
-1. **任务描述**（`life_proactive.build_intent`）里写明「这是主动开口，不是回复谁」，
-   并要求 `set_quote = false`；
-2. **Planner 请求注入**（`maisaka.planner.before_request`）：触发成功后的 180 秒内，
-   该会话的 Planner 请求会被追加一条系统级发言规则（更靠近决策位置）。
-
-⚠️ **这是引导而非强制**：`set_quote` 是 Planner 调 `reply` 时的工具参数，插件无法干预工具参数，
-只能提高「选对」的概率。措辞是 group-welcome 四轮迭代后的结论：只说「不要引用任何消息」会把模型
-逼到无路可走（`reply` 必须带 `msg_id`），所以同时给了可执行路径——**引用对象只能是她自己**。
-窗口只对刚触发的那一个会话生效，其他场合的正常引用行为完全不受影响。
-
-**开口的「来由」会显式告诉模型**（v1.8.1，借鉴 `XXXxx7258/idle_proactive_chat`，MIT）：
-触发前先往该会话写一条上下文事实（`maisaka.context.append`）——
-「她主动开口了，不是在回复谁。她现在的活动：…；情绪 …/10、体力 …/10。她想聊聊刚发生的…」，
-措辞是**世界内**的，不出现插件/静默检测这类系统实现细节。写不进去只降级并告警一次，
-**绝不拦住开口**。可用 `[proactive] inject_context_fact = false` 关掉。
-
-同时借用它两条经验：主动任务传 **`priority="low"`**（不抢占更高优先级的主动任务，例如新人欢迎语）；
-`reason` 写**人话**（`生活状态主动开口：<素材标签>（分数 0.80）`），结构化信息放 `metadata`。
-
-**「对方上次说话」基线会从历史补**（v1.8.1，同上来源）：`last_user_message_at` 只由入站钩子写，
-所以**首装当天 / `/生活 重置` 之后**所有会话都是 0 ⇒「对方刚说过话」这道闸形同不存在，
-她可能在一个刚刚还在热聊的会话里突然开口。现在会对缺失基线的会话查一次历史
-（`message.get_by_time_in_chat`，`filter_mai=True, filter_command=True`，只要最后一条**人类**消息），
-每个会话只补一次、每轮最多 3 次、连续失败 3 次就停手并告警一次。
-
-每次沉默的原因都会计数，`/生活 为什么` 直接回答「她怎么不说话了」。
-
----
+可视化模式（WebUI）把每个字段的说明直接渲染在控件下方，**日常只动 7 个常用节**：
+`plugin` / `apply` / `security` / `activity` / `frequency` / `prompt` / `date`。
+其余各节默认收起——标题旁写着「什么时候需要动」，不需要调的人不会被淹没。
+改这些走**配置热重载**；新增字段或改 `capabilities` 必须完整重启。
 
 ## 命令
 
@@ -968,301 +792,7 @@ maisaka.proactive.trigger  llm.generate  config.get  api.call
 
 ## 与其它插件共存
 
-MaiBot 里**每个会话只有一个频率倍率标量**（`runtime.py:183` 的 `_talk_frequency_adjust`），
-`frequency.set_adjust` 是**后写覆盖先写**，宿主不提供任何仲裁或 provider 机制。
-所以只要还有别的插件写它，就会互相抹掉。真正需要处理的只有两条：
-
-### 1. 与 `budget-pacer` 乘性合成（默认开启）
-
-`budget-pacer` 也写 `frequency.set_adjust`。两个插件原先会互相覆盖，最糟的是**卸载时**：
-本插件把会话写回 `1.0`，而 `budget-pacer` 只在「自身目标变化时」才重写，
-所以那一下会把它的压制**永久抹掉**（反向同理：它禁用时写 `1.0` 也会抹掉本插件那一层）。
-
-现在 `[apply] compose_external = true`（默认）：
-
-```
-下发倍率 = 外部基数 × 生活倍率
-```
-
-- **外部基数**靠自证识别：本插件记着自己最后写下的值（`life_state.json` 的 `applied`），
-  宿主现值与它不同 ⇒ 这一笔是别人写的，认成新基数并记住（`foreign`）。
-- **卸载 / 暂停时归还基数**，而不是写 `1.0`：只撤掉自己那一层。
-  若发现有人在我们之后写过，就**不碰**它（现值里已经没有我们的因子了）。
-- `applied` / `foreign` **不随「会话暂时离开生效范围」清理**。这条容易写错：一旦忘掉
-  「宿主上那一层是自己写的」，等会话回到范围就会把它误判成外部基数，
-  把生活倍率**乘两次**（`0.5×0.8` 变 `0.64`），而且这个错误基数会被永久记住——
-  `budget-pacer` 不会自愈。回归测试见 `tests/test_interop.py::test_leaving_and_reentering_scope_never_double_applies`。
-- 值没变就不调 RPC —— `set_adjust` 内部会 `_schedule_message_turn()`（`runtime.py:563`），
-  无脑重写会白唤醒 Planner。判定用 1e-6 的容差（`_ADJUST_EPSILON`）：情绪体力每 tick
-  只漂 1e-7 量级，为这种变化去烧一次模型不划算；代价是宿主上的倍率最多滞后
-  1e-6（相对误差百万分之一，不可见）。
-- **读不到宿主现值时这一轮什么都不写**，而不是拿缓存的旧基数盲写。盲写的危害是自封死路：
-  写下去的那一笔会被记成「我们自己写的」，此后每轮都认不出差异，若期间对方改过基数，
-  错误值就永久留存（`budget-pacer` 只在自身目标变化时才重写，不会来救）。
-  这个策略由 200 轮随机交错的属性测试守着：
-  `tests/test_interop.py::test_randomized_interleaving_never_diverges`。
-- **「写不进去」的会话会自证并退避。** 宿主里 heartflow chat 是**懒创建 + LRU**，
-  而 `chat.get_all_streams` 返回的是**全部历史会话**，所以「有会话但没有 heartflow chat」
-  是常态。这种会话上 `set_adjust` 会**静默 no-op**（只记一条 warning）却返回成功——
-  本插件写入后下一轮读回自证，发现没生效就按 15min→30min→… 指数退避（封顶 24h），
-  并且**目标值一变就立刻重试**，所以进入睡眠该归零时不会被退避挡住。
-  该会话一有消息进来也会立刻重试。参数：`[apply] unbacked_retry_minutes`。
-- **对账记忆单独落盘**（`adjust_memory.json`）。它描述的是「宿主上那个标量现在是什么、
-  是谁写的」，与生活状态无关；混在 `life_state.json` 里的话，该文件损坏/被删或将来升
-  `STATE_VERSION` 会把记忆一起丢掉，于是下次巡检把「外部基数 × 我们的因子」当成外部基数
-  **再乘一次**。所以两份分开存，主文件丢了也能从副文件救回来。
-
-`budget-pacer` **一行都不用改**。`/生活 频率` 会显示「外部基数（别人写的）」，
-如果对方被卸载但倍率留在宿主上（它不会自愈），用 `/生活 重锚` 一键丢弃这个基数
-（重锚会**连当前不在生效范围内、但记得写过的会话一起处理**，不留「宿主上有我们的因子、
-而我们忘了」的空档）。
-
-设 `compose_external = false` 回到「直接覆盖宿主倍率」的旧行为。
-
-> 说明一句边界：这个机制避免的是**自伤式抹除**（本插件卸载时把对方的值踩成 1.0）。
-> 宿主重启后倍率本来就会归零（内存态），那时如果 `budget-pacer` 也已被卸载或没有重新
-> 下发，0.5 就真的没了——那不是本插件抹掉的，也不该由本插件凭空恢复。
-
-### 2. 经济维度读 `budget-pacer` 的只读 API（不重复压制）
-
-`budget-pacer` 从 1.1.0 起公开一个 version 1 的只读 API，本插件的经济维度就靠它取真实预算：
-
-```python
-payload = await self.ctx.api.call(
-    "org.orge-8.budget-pacer.get_budget_status", version="1", refresh=True
-)
-```
-
-- **`api.call` 能力必须写进 manifest**（`_manifest.json` 的 `capabilities`）。
-  官方手册说它免声明，实测 Host 1.2.3 仍按 manifest 授权；改了能力要**完整重启**。
-- **只读到底**：那条 API 保证不调 `frequency.set_adjust`、不落盘（宿主侧 `set_adjust`
-  会连带唤醒 Planner = 花钱）。本插件这边也没有任何因子把余额变成倍率。
-- **失败不抛异常**：跨插件调用失败时 Host 返回 `{"success": False, "error": ...}`，
-  而 SDK 只对带 `result` 键的成功包装做解包，所以失败字典会**原样**落回插件——
-  必须先判这个形状，否则会把 `error` 文本当成预算数字。`tests/fakehost.py` 的
-  `api.call` 分支按这条真机语义复刻，`tests/test_economy.py` 有专门用例。
-- **取不到就降级**：未安装 / 未授权 / 超时 / 返回结构不符 → 记一次 warning（退避期内不刷屏），
-  卡片显示「经济：未接入预算插件」，生活循环照常跑。没装预算插件的人只会看到一条提示
-  （`[economy] enabled = false` 可关掉）。恢复后会自动重新接入，若再次故障会重新告警。
-- **契约有真值测试**：`tests/test_budget_pacer_contract.py` 直接加载邻居插件的源码、
-  调它真正的 `api_budget_status`，把返回值喂给本插件的解析器。任一侧改字段名就红。
-  找不到对方源码时该文件整体 SKIP（可用 `LF_BUDGET_PACER_DIR` 指定路径）。
-
-### 3. 与 `better-diary` 联动：把「这几天聊了什么」接成她的经历（默认关闭）
-
-她推演生活时看到的「近期经历」原来只有**她自己碰上的事**（事件库）。开着这一维，
-她的经历里会多出**人际往来**，两条来源各管一段：
-
-| 来源 | 给出什么 | 带原文吗 |
-|---|---|---|
-| `better-diary` 的只读 API | 「当天最值得写的几件事」：谁、做了什么、原话 | 有（已是模型摘要，可关） |
-| 入站消息钩子 | 「有人找过她」这类事实 | **没有**（只记会话数与类型，不存正文） |
-
-为什么必须两条：日记是**睡前批量生成**的，从生成到次日睡前最长有 24 小时空档。
-
-```python
-digest = await self.ctx.api.call(
-    "org.orge-8.better-diary.get_day_digest", version="1", days=2
-)
-```
-
-**三条纪律**（不守就会被反噬）：
-
-- **按会话/按条数收敛，不按消息条数**：一个活跃群一天几百条消息，经历池子只有 `recent_events_keep` 个位置（默认 300）。
-  实时信号一律聚合成**至多一条**「有人找我」（`max_live_events_per_day`），
-  日记摘要每天至多 3 条（与对方的 `max_events` 同量级）。
-- **每个生活日有情绪总额度**（`daily_emotion_cap`，默认 1.5）：额度用完就只记事、不加情绪。
-  没有这道闸，「群里今天多热闹」会直接变成她的情绪基线。
-- **睡眠中照常记录、但不产生情绪增量**：醒来时能在「近层」看到「有人叫过我」，
-  情绪不吃这笔账（`emotion_while_asleep = false`）。
-
-**只读到底**：那条 API 不生成日记、不调模型、不写盘，也**不含日记正文**
-（只给 `/日记来源` 已经在聊天里展示过的那些字段）。本插件这边同样不碰倍率、
-不写宿主——`tests/test_social.py` 有一条用例专门钉住「整条链路零 `frequency.set_adjust`」。
-
-**取不到就降级**，并且**区分两种「没有内容」**：对方按契约答了但这几天没日记 = 正常状态
-（不告警、不退避）；对方的回答根本不是这个契约（旧版本没有这个 API / 提供方没装 / 报错）
-= 故障（退避 + 只告警一次 + 卡片显示「未取到」）。**「没联动」绝不能看起来像「没问题」。**
-
-**契约有真值测试**：`tests/test_better_diary_contract.py` 直接加载 `better-diary` 的源码、
-调它真正的 `api_get_day_digest`，把返回值喂给本插件的解析器与入库层。任一侧改字段名就红
-（找不到对方源码时整体 SKIP，可用 `LF_BETTER_DIARY_DIR` 指定路径）。
-
-**部署顺序**：先更 `better-diary` 到 **1.4.4+**（`get_day_digest` 是它新增的 API，
-加 `@API` 属于组件变更，**光热改配置不够，要重载它**），再更新本插件，
-最后把 `[social] enabled` 设成 `true`。日记插件没装 / 版本太旧都只是降级，不会让本插件起不来。
-
-### 4. 静默是有代价的：`silence_floor`
-
-倍率 `= 0` 会让宿主进入**静默消费**（1.3.2：`turn_trigger/scheduler.py:57` 判静默 →
-`reasoning_engine.py:1188` 的 `_handle_silent_turn`；≤1.3.1 里是 `turn_scheduler.py:90`）：
-不跑 Planner/Replyer、零模型开销，`@` 也叫不动（`_handle_silent_turn` 第一件事就是
-`_clear_forced_turn_state()`，把 `@` 刚武装的强制轮抹掉）。但它还会**把其它插件的主动开口一起丢掉**：
-
-```
-插件 A: maisaka.proactive.trigger  →  宿主入队并把 <plugin_proactive_task> 写进模型历史
-                                       + 返回 {"success": true, "queued": true}
-静默轮: _handle_silent_turn()      →  清掉强制轮、消费掉 proactive 触发，什么都不做
-```
-
-调用方**收到成功**，消息却不会发出。桌面插件里至少有两个受害者：
-
-| 插件 | 后果 |
-|---|---|
-| `group-welcome` | 它的欢迎语**完全**依赖 `proactive.trigger`（「不自己发欢迎语」）。静默窗口内进群的新人**不会**被欢迎 |
-| `impression-card-lite` | 周期性主动搭话被丢掉，且它会先记下 `last_fired_at`，于是整个间隔都不再提 |
-
-如果你更在意这些，把 `[frequency] silence_floor` 设成 `0.02` 之类的正数：
-
-| 宿主模式 | `silence_floor > 0` 的实际含义 |
-|---|---|
-| `frequency`（计数门） | 不再静默；阈值 `T = ceil(1/(talk_value×floor))`，例如 `talk_value=1`、`floor=0.02` ⇒ 攒 50 条才进 Planner，`@` 与主动开口都能穿透 |
-| `dynamic`（动态触发，1.3.2） | 不再静默；`floor` 就是窗口内的**目标回复比例**（如 0.02 = 只保留 2% 的预期回复机会），概率门槛极高但 `@` 与主动开口仍能穿透 |
-| `reply_necessity`（评分门，≤1.3.1） | 普通闲聊也要多攒（倍率越小、条数越多；低于 0.39 才推不动），但 **`@` 会穿透** |
-
-⚠ **`@` 穿透与触发模式无关**，三行都成立的原因是宿主的判定顺序：先判「频率是否静默」
-（`turn_trigger/scheduler.py:57`），再判「`@` 强制触发」（`:65`），最后才是概率门/计数门
-（`:80` / `:94`）。所以只要倍率不是**精确的 0**，`@` 就一定会进 Planner，且不受
-`talk_value` 与动态门概率的影响（宿主开关 `chat.reply_timing.inevitable_at_reply`
-默认就是 `true`）。下面这两行只解释「评分门里为什么连普通请求都推不动、`@` 却推得动」：
-
-「`@` 会穿透」在评分门里还有个宿主机理：评分门的乘数是
-`necessity_factor = 0.5 + 0.5·min(1, freq)`，其值域是 `[0.5, 1.0]` —— 倍率再小也只砍一半；
-而 `@` 给 100 分相关性、内容分上限 70（问题 15 + 请求 20 + 征询 20 + 长文本 5 + 较长文本 10）：
-
-```
-(100 + 70) × 0.5 = 85 ≥ 80   ← @ 且是长请求/征询 ⇒ 穿透
-( 80 + 70) × 0.5 = 75 < 80   ← 仅提及，不穿透
-```
-
-这两行在 `tests/test_interop.py` 里钉成断言，并在 `tests/test_host_model.py` 里
-**直接调用宿主自己的 `score_reply_necessity` / `_score_content`** 复核（不是自说自话）。
-
-所以默认仍是 `silence_floor = 0.0`：「睡就是睡」优先，代价写在这里由你决定要不要换。
-
-### 5. 睡眠时被叫醒（v1.7.0 `wake_on_at`；v1.15.0 补私聊与对话顺延）
-
-她睡着时倍率是 0，宿主会走**静默轮**：消息被消费、不进 Planner，`@` 也一样
-（见上一条：静默判定排在 `@` 强制触发**之前**）。所以「睡着时被叫醒」这件事，
-**插件必须先动手把倍率抬起来**，否则那条消息连被看见的机会都没有。
-
-打开 `wake_on_at`（默认）后：
-
-| 时机 | 插件做什么 |
-|---|---|
-| 睡眠中收到 `@`（`chat.receive.after_process`，`bot.py:812`） | 记下「清醒窗口到 `now + wake_minutes`」，并**立刻**把这个会话的倍率写成清醒值 |
-| 睡眠中收到**私聊**（v1.15.0，需 `wake_on_private = true`） | 同上——私聊没有 `@` 这个概念，判据与打断机制对齐（私聊任意消息 / 群聊被 `@`） |
-| 同一窗口内又收到 `@` 或对方继续说话（v1.15.0 `wake_extend_on_message`） | 只顺延窗口，不重复写宿主（那笔值已经是清醒值）；顺延受 `wake_max_extensions_minutes`（默认 30）封顶 |
-| 窗口结束（默认 10 分钟） | 她**仍在睡** ⇒ 倍率自动回到 0，不需要额外写入或定时器 |
-| 她醒着 / 已暂停 / 命中 `[frequency] quiet_hours` / 不在 `[apply]` 范围 | 一律不唤醒 |
-| 她在**小睡**（`nap`） | 不唤醒：小睡 90 分钟自己会醒，但它**可被打断**（回完消息还能倒回去接着眯） |
-
-**为什么必须写在钩子里**：宿主处理一条消息的顺序是
-`bot.py:812`（插件钩子）→ `bot.py:841`（入队）→ `heartflow_message_processor.py:62`
-→ `runtime.register_message()`（`:923` 武装 `@` 强制轮、`:935` 调度）。
-钩子**先于**「这条 `@` 算不算数」返回，所以这一笔赶得上；等下一轮巡检再写
-（`[apply] interval_seconds` ≥ 15 秒）那条消息早被静默轮吃掉了。
-
-**它是什么、不是什么**：
-
-- 是「**临时清醒窗口**」，不是「起来过日子」：`state.activity` 仍是 `sleep`，睡眠时长照常
-  记账，状态卡只多一行「被 @ 唤醒：清醒到 HH:MM」。
-- 注进回复请求的提示词会补一句「她本来在睡、刚刚被叫醒」；睡下不到两小时就被吵醒时
-  还会带上「还有点迷糊、有点不情愿」（`wake_grumpy_note`，v1.15.0）；免得她的语气像一直醒着。
-- **不会**因此产生主动开口：主动开口有自己的硬闸（睡眠/小睡中不开口），`wake_on_at` 不碰它。
-- 想回到「睡就是睡」（连 `@` 都不回）：`wake_on_at = false`，或 `wake_minutes = 0`。
-
-**那睡眠期间群里的消息去哪了**：宿主的静默轮会把这批消息**写进她的聊天历史**
-（`_collect_pending_messages` + `_ingest_messages` 在静默分支之前跑），所以她醒来后
-在上下文里看得到；随后清掉 `@` 强制轮标记、推进已处理位置，也就是「**收到了，但不会补答**」。
-全程零模型调用、不发送。群里刷屏不会攒出「醒来后爆发回复」的待办；若这段时间消息多到触发
-上下文裁剪，被裁掉的部分**不会生成聊天回想**（静默轮的维护开关是关的，没进中期记忆）。
-
-**和 `silence_floor` 的区别**（两条路都能让睡眠时回 `@`，代价不同）：
-
-| | `wake_on_at`（推荐） | `silence_floor = 0.02` |
-|---|---|---|
-| 普通消息 | 进不来（倍率仍是 0） | 进不来（三种模式下都推不动） |
-| `@` | 回（临时窗口） | 回（任何模式） |
-| **其它插件的主动开口** | **照旧被丢掉**（她仍然是静默状态） | **会被放进来**（宿主只认「是不是精确 0」） |
-| 睡眠静默本身 | 不受影响，窗口一过自动回 0 | 失效（整段时间都不再静默） |
-
-### 6. 审计过的其它面（结论：无冲突）
-
-| 面 | 结论 |
-|---|---|
-| 命令 | 双向扫描过 19 个插件的 **66 条** `@Command`：别人截胡本插件 0 条；本插件截胡别人**曾经 31 条**（`/点歌 生活`、`/卡片 生活`…），已改掉。详见下条 |
-| 命令正则 | 宿主的命令匹配是 `pattern.search()` 且**第一个命中的插件赢**（`component_query.py:665-679`），所以本插件的 `/生活` 必须锚在消息开头——否则别的命令把「生活」当参数时会被本插件整条截胡、对方命令永不执行。代价：**「生活」必须在消息最前面**（可带 `@麦麦 ` 前缀），`今天 生活 好累` 这类普通聊天不再误触。验证脚本 `compat-audit/commands.py`（作者本地工具，未随本仓库分发） |
-| `maisaka.replyer.before_request` | 只有本插件用。别的插件（bilibili-video-parser / cv_lyric_context / file-reader / character-recognizer）**全在 `before_model_request` 上改 `items`** —— 两条链、两个字段，天然不争用。宿主确实消费 `extra_prompt`（`maisaka_generator_base.py:1128-1131` 折进「额外回复要求」） |
-| `chat.receive.after_process` | 8 个插件共用，由宿主 dispatcher 串行处理，互不干扰。本插件的旁路记录是 **BLOCKING + EARLY**：blocking 一律先于 observe，而 `music-request` 是 blocking 且会 `abort`（发完音乐卡片就丢弃该消息，`bot.py:790`）——observe 模式会被它整条跳过。本插件在该 Hook 上排第 2（前面是同样 BLOCKING+EARLY 的 `cv_lyric_context`，它从不 abort） |
-| 命令链 | 静默**不影响**任何插件的命令：命令派发在 `bot.py:260-361` 的入站管线里，与 Maisaka 的回复门控完全无关。`/预算`、`/日记`、`/点歌` 在睡眠期间照常响应 |
-| `maisaka.proactive.trigger` | 桌面有 2 个插件共用（group-welcome、impression-card-lite），本插件默认关闭。**注意宿主是每会话单槽**：同一会话两条排队会丢一条，两边却都收到成功。本插件不主动去抢 |
-| `maisaka.context.append` / `chat.open_session` | 别的插件用，本插件不用 |
-| 配置与数据 | 每个插件有自己的 `config.toml` 与 `ctx.paths.data_dir`，无共享文件、无 id 重名、无 `dependencies` 指向本插件 |
-| 能力声明 | 无互相排斥；宿主不做能力互斥检查 |
-
----
-
-### 7. 外面的世界：四个上游插件的只读 API（v1.8.0，默认开）
-
-她的经历此前只有「她自己碰上的事」与「和她说话的人」。v1.8.0 起接上**外面的世界**：
-关注的 UP 主开播了、发了新动态，群里来了新人，有人聊到了某首歌。数据全部来自四个
-上游插件的**只读** API（`version="1"`、`public=True`、零网络零写盘），本插件只读不写：
-
-| 事件 | 上游插件 / API | 去重键 | 默认情绪 |
-|---|---|---|---|
-| UP 主开播了 | `bilibili-live-gateway.get_live_status` | `live!<房间号>!<生活日>` | +0.20 |
-| UP 主发了新视频 / 新动态 | `bilibili-dynamic-push.get_recent_pushes` | `push!<url>` | +0.15 |
-| 群里来了个新人 | `group-welcome.get_recent_newcomers` | `newcomer!<群号>!<QQ号>` | +0.10 |
-| 有人聊到了《X》 | `cv_lyric_context.get_recent_songs` | `song!<歌名>!<命中时刻>` | +0.12 |
-| （仅状态卡）订阅了几位 UP 主 | `bilibili-dynamic-push.get_subscriptions` | — | — |
-
-**每个源都有最低上游版本**（旧版本里没有这些 API，状态卡会显示
-「未取到（未找到版本为 1 的 API: …）」——那是**对方的版本旧**，不是本插件坏）：
-
-| 源 | 最低上游版本 | 依据 |
-|---|---|---|
-| 直播 | `bilibili-live-gateway` **≥ 0.5.0** | `get_live_status` 是 0.5.0 新增 |
-| 动态 / 订阅 | `bilibili-dynamic-push` **≥ 1.5.0** | `get_recent_pushes` / `get_subscriptions` 是 1.5.0 新增 |
-| 新人 | `group-welcome` **≥ 1.4.0** | `get_recent_newcomers` 是 1.4.0 新增 |
-| 歌曲 | `cv_lyric_context` **≥ 2.9.0** | `get_recent_songs` 是 2.9.0 新增 |
-
-两种「取不到」的措辞别混：**`未找到版本为 1 的 API: <插件 id>.<API>`** = 对方装了但版本旧（去升级）；
-**`未找到 API 提供方插件: <插件 id>`** = 对方没装、或装了但**未激活**（宿主插件列表里点启用）。
-真机 2026-10-05 两种都出现过：`group-welcome` 停在 1.4.0 之前（升级即可），
-`bilibili-live-gateway` 处于未激活（启用即可）。
-
-配置在 `[world]`：**总开关默认开、每个源独立可关**（`live_enabled` / `video_enabled` /
-`newcomer_enabled` / `song_enabled`），取数间隔默认 10 分钟。**未装那些插件不会报错**——
-每个源独立降级（未安装 / 未升级 / 超时 / 返回坏结构都只少那一类事件，其余照常），
-四个源全取不到时退避重试并且**只告警一次**（日志里写明是哪一项没接上）。
-
-三条设计约束（与 `[social]` 同源）：
-
-1. **外部世界不能挤掉她自己的生活**：每个生活日最多接进 `max_events_per_day`（默认 6）条，
-   情绪另有 `daily_emotion_cap`（默认 1.0）——用完只记事、不加情绪；
-2. **睡眠中照常记录、但不产生情绪增量**（沿用 `[social]` 的策略：醒来能在近层看到
-   「外面发生过什么」，情绪不吃这笔账）；
-3. **外部文本一律净化 + 限长**：UP 名 / 歌名 / 标题都走 `life_events.sanitize_text`
-   （去控制字符与 `<>{}`【】「」），并截到标签 24 字 / 正文 80 字。
-
-**三条数据边界**（不是缺陷，写出来免得以为是漏做）：
-
-- **新人没有昵称**：`group-welcome` 落盘只存 QQ 号 + 首次出现时间戳（昵称从不缓存），
-  所以事件只能写「群里来了个新人」，正文里是群号与 QQ 号；
-- **开播没有开始时刻**：上游只给「当前是否开播」与最近一次成功探测时刻，因此按
-  **生活日**去重——连续多天开播会每天各记一次；
-- **歌曲按「一次命中」去重**（键带命中时刻）：同一天反复聊到同一首歌会各记一次，
-  因为它们是不同的发生。另：上游手动 `/dyn test` 推送（旧动态）走 `record=False`，
-  **不会**产生事件，免得把旧动态当成「UP 主刚发了新动态」。
-
-> 状态卡（`/生活 状态`）新增「外面的世界」几行：订阅数、直播状态、动态 / 新人 / 歌曲
-> 各自的接入情况与今日条数。「没接上」会显示具体原因，不会看起来像「没问题」。
->
-> 新增状态字段 `world_seen` / `world_daily`（去重表与每日额度）：`state_version` 不变、
-> **旧状态文件零迁移**（缺字段走默认值，坏条目由 `_sanitize_float_map` 丢掉）。
-
----
+倍率是**乘性合成**（不覆盖别人写进去的值），素材是**加分不压制**，静默时段有 `silence_floor` 兜底。与四类上游只读 API（`budget-pacer` / `better-diary` / 外面的世界 / 唤醒）的详细契约见 [`docs/interop.md`](docs/interop.md)。
 
 ## 与两个参考仓库的关系
 
@@ -1419,116 +949,14 @@ v1.15.0 有「本轮窗口已睡够」这条抑制，正常不会发生；先确
 
 ## 自检与门禁
 
-这一节是**开发侧门禁，不是插件的运行时逻辑**：MaiBot 加载插件时不会执行
-`check_plugin.py` / `run_gates.py` / `tests/`。它们的运行时机是**改动 manifest 或代码之后、
-发布 / 真机部署之前**，由人手动跑一遍做回归确认（审查者也可用来复现检查）。
-
-在插件目录里跑（**SKIP ≠ PASS**）：
-
 ```bash
-python check_plugin.py --plugin .     # L1 静态：manifest / 生命周期 / 装饰器配对 / 能力一致性
-python tests/smoke_test.py            # L2 FakeHost 冒烟（包式加载 + 能力调用断言）
+python check_plugin.py --plugin .     # L1 静态结构 / manifest / 能力一致性
+python tests/smoke_test.py            # L2 FakeHost 冒烟（不启动 MaiBot）
 pytest -q tests                       # L3 纯逻辑单测
-python run_gates.py --plugin .        # 三道门禁一起跑，退出码 0/1
+python run_gates.py --plugin .        # 三门禁一起跑
 ```
 
-**曲线标定**（v1.16.3 起）：改过情绪体力机制之后跑一遍分布对照——它不调模型
-（活动提议走 `rule_based_activity` 的时段表、事件走内建库、固定种子可复现），
-同时给出「新机制全开」与「A/B/C/D 全关」两条时间线的分布位移与 ASCII 直方图：
-
-```bash
-python calibrate_curves.py --days 7 --out docs/curve-calibration.md
-```
-
-判定规则写在报告里：**只有「相对旧机制的位移 > 0.4」才需要重新标定曲线点值**；
-锚点漂移若在旧机制里同样存在，那是这条确定性路径的属性，不该通过改点值抹平。
-
-### 现场诊断：一个报告回答「它到底正常吗」
-
-`collect_diagnostics.py` 是**独立程序**（只读、只用标准库、**不需要 maibot_sdk**）：
-它把判断「这个插件是否正常运转」所需的全部证据收集进**一个可读的 Markdown**，
-并逐项判定 FAIL / WARN / OK / UNKNOWN，每条都带「为什么这算不正常」与「怎么修」。
-
-```bash
-# 最省事：自动找数据 + 补一份离线引擎自检
-python collect_diagnostics.py
-
-# 真机现场（推荐把三样都指上）
-python collect_diagnostics.py \
-  --data-dir <MaiBot>/data/plugins/org.orge-8.life-frequency \
-  --config   <MaiBot>/config/plugins/org.orge-8.life-frequency/config.toml \
-  --log      <MaiBot>/logs/maibot.log \
-  --bundle
-
-# 没有真机数据时，至少证明「机制能跑」
-python collect_diagnostics.py --offline-simulate 48
-```
-
-输出到 `diagnostics/life-frequency-诊断-<时间戳>.md`（外加同名 `.json`；`--bundle` 再打一个
-zip，把报告与现场数据一起带走）。报告包含：**总判定** → 检查清单（含证据与修法）→
-采集到的数据源（含被排除的「像但不是本插件」的目录）→ 代码侧（版本/能力/哈希/git）→
-配置侧（实际生效的关键参数 + 缺字段）→ **状态侧（她此刻在做什么、生活循环多久没推进、
-模型连续失败几次、有几个会话写不进宿主）** → 库侧（关系档案分布、习惯命中）→
-日志侧（故障签名计数 + 最近错误）→ 附录（逐文件 SHA256，确认「真机跑的就是这一份」）。
-
-判定口径写死在代码里，都是可复现的：
-`last_tick_at` 超过 6 个 tick 就是「生活循环没有在跑」；连续清醒 > 30 小时算睡眠链路失效；
-`llm_fail_streak ≥ 3` 或冷却中算模型侧故障；配置里 `paused` / 非法 `filter_mode` / 白名单为空
-算「看起来在跑、其实什么都没发生」。日志里只认**确定性故障签名**（加载失败、推进异常、
-状态文件损坏、能力超时…）；正常轮次的日志不会进可疑栏——误报比漏报更烦人。
-
-> **它自己也有回归测试**：`tests/test_diagnostics.py` 造两份夹具（健康 / 坏数据），
-> 断言健康数据**零 FAIL**、坏数据**逐条报出**上述故障并给出非零退出码。
-> 现场报告里的凭据（`p_skey`/`token`/`cookie`）一律 `<redacted>`，
-> 带身份语境的号码（`session=`/`user_id:`/`group-123456`）写成 `***`，**不含消息正文**。
-
-> **真机第一次跑出来的三个坑（都已在工具里修掉，写在这里免得再踩）**：
-> ① 把脚本丢进 `<MaiBot>/plugins/` 直接跑，`--plugin-dir` 默认就是脚本所在目录 ⇒ 报告
-> 把整个 plugins 根当成插件目录，误报两条 FAIL、读不到真机版本、附录塞进 `.update_backups`
-> 里 1160 个别人的文件。现在会**自动定位**真正的插件目录（按 manifest id 匹配）并如实说明；
-> ② 日志可能不叫 `*.log`（`.txt` / 无扩展名 / `maibot.log.1`），只认 `*.log` 会得到
-> 「未采集到日志」；现在 `logs/` 下有界扫描任意文件 + 根目录 `*.log*`；
-> ③ 「没有真机数据」绝不能说成「正常运转」——离线自检通过只证明机制能跑。
-
-### 方案 §5 验收对账
-
-《情绪体力改进方案》§5 的每一条验收标准都有一条同名用例（`tests/test_acceptance.py`），
-失败时会直接指出「方案的哪一条没做到」。**实测数据**（确定性时间线，命令见上）：
-
-| 标准 | 方案要求 | 实测 | 结论 |
-|---|---|---|---|
-| 行为 M1 | 清闲日 16–18 h 内触到入睡阈值 3.0 | **15.8 h**（旧机制 18.2 h） | ✅ 落在窗口下沿前约 12 分钟（方案自己算的是 15.7 h） |
-| 行为 M1 | nap 一周内至少自然触发一次 | 清闲日下午 **14.2 h** 跌破 nap 阈值 4.0，且此刻的 NAP 提议被强制层放行 | ✅（是否真的小睡仍由模型提议，这一步只证明「够得着」） |
-| 行为 M1 | 最闲的路（旧机制永远不困） | 纯 `daze` 24 h：新 **1.8** / 旧 **5.6** | ✅ |
-| 行为 M5 | 大冲击前 1 h 回落 > 旧线性、4 h 后仍有余量 | 从 10.0 回落：1 h 新 **8.03** / 旧 **8.80**；4 h 新 **5.68** / 旧 **5.20** | ✅（只在**大**冲击下成立：差距 < 2.5 时比例步长更小） |
-| 行为 M3a | 高压日归因里能看到「绷不住」，每天 ≤ 1 次 | 事件进 `recent_events` + 归因卡片可见；同日第二次被去重挡下 | ✅ |
-| 行为 C 期 | 7 天里 emotion ≥ 1.5 的占比 ≥ 80% | 7 天 × 144 tick = 1008 个样本：**100%**，最低 **3.17** | ✅（无死亡螺旋） |
-| 行为 C 期 | **判定要能区分「正常」与「失控」** | ⚠ 审计的反向验证发现：「1.5 地板」**单独不够**——把耦合调到荒谬值（疲劳系数 1.2、放大 3.0、崩溃时长 0）跑 7 天，最低仍有 **2.14**、占比 100%。真正的判别器是**归因里有界的两个量**：疲劳项被 `系数 × 阈值` 封顶（默认 −0.9，荒谬配置才 −3.6）、崩溃事件每生活日至多一次 | ✅（判读方式是看归因构成，不是看有没有跌破某条线） |
-| 纪律 | 内心维度 / 经济维度不出现在 `compute_adjust` 因子表 | 接口层与拆解层双向断言；体力只通过**基线**间接影响情绪 | ✅ |
-
-> 注意最后两条的**口径**：C 期验收要求「能区分机制正常工作与失控」，所以它跑的是
-> **机制全开**（含疲劳偏移与崩溃事件这两条合法压低源）的 7 天时间线，而不是把耦合
-> 关掉图个好看。真机 7 天观察仍由你来做——这里的结论只覆盖确定性路径。
-
-> `run_gates.py` 原本是 devkit 脚本，**这个目录里带了一份副本**（上面命令因此能跑）。
-> 注意它与 devkit 当前版本已双向分叉（本副本带 UTF-8 标准输出加固与 Host 1.3.1 基线，
-> devkit 版带 `NON_CAPABILITY_PROXIES` 与 `os.path.dirname` 告警）。发布时若只复制
-> 「插件本身该有的文件」，请把 README 里的这条改成在 devkit 目录执行
-> `python run_gates.py --plugin <插件目录>`。
-
-L2 刻意复刻真机的**包式加载**（先断言插件目录不在 `sys.path` 上，再以
-`submodule_search_locations` 载入），因为平铺加载能过、真机却会报
-`No module named 'life_sim'`。
-
-L3 里有一条**真值校验**：把宿主的门控公式与**本机 MaiBot 源码**
-（`src/maisaka/reply_necessity.py`）逐点对拍；找不到源码时该用例会 SKIP
-（SKIP 不算通过）。源码路径可以指向任意检出：
-
-```bash
-$env:LF_MAIBOT_SRC = "D:\repos\MaiBot"      # 或把检出放在仓库的 repos/MaiBot 下
-```
-
----
+现场诊断与长期监控（`collect_diagnostics.py`，只读、零第三方依赖）的完整用法见 [`docs/gates.md`](docs/gates.md)。
 
 ## 已知限制与未验证的部分
 
@@ -1657,48 +1085,15 @@ $env:LF_MAIBOT_SRC = "D:\repos\MaiBot"      # 或把检出放在仓库的 repos/
 
 ## 版本历史
 
-| 版本 | 变更 |
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)（每条都带当时的验证数据与真机观测）。
+
+| 版本 | 一句话 |
 |---|---|
-| 1.17.2 | **文档整理（无行为变更）**——`_manifest.json` 的 `description` 从 **4664 压到 613 字符**：删掉 v1.13.1 起的逐版本流水账（那是 README「版本历史」的活，不该由插件简介背着），只留「插件是什么 + 当前能力清单 + 可选接线 + 命令」，末尾指向 README。同时清掉 README 里指向已删 `docs/` 的引用：1.17.0 条目的「方案见 `docs/life-frequency-作息活动改进方案.md`」（文档已随 v1.17.0 移除）、1.16.3 条目的报告落点；`calibrate_curves.py` 的示例输出路径去掉旧版本后缀（改 `docs/curve-calibration.md`，脚本本身会自动建目录）。能力清单逐条对着代码与旧描述核对过，**未增删任何功能描述**。全量 1262 passed，三门禁 3/3 PASS |
-| 1.17.1 | **内心维度从未演化（真机 P0 修复）**——`_sim_tick` 里内心维度的时长用 `now - state.last_tick_at` 算，但 `life_sim.settle` 的**每一个出口**（正常步进 / `elapsed <= 0` / 停机间隙 `_skip_offline_gap`）都会把 `last_tick_at` 推进到 `now`，于是那个差分恒为 `0`，`mood_evolve` 在 `hours <= 0` 处直接 return ⇒ **压力 / 孤独 / 社交电量三个维度永远冻在初值**。真机证据：22:16（睡 80 分钟）与 00:22（睡 199 分钟）两版诊断报告的「内心」行都是 `3.0 / 0.0 / 0.0`，中间两小时一动不动——而睡眠本该按 1.0/小时回充电量。连带后果：① `battery_gate` 恒返回 `low_battery`，`[proactive] enabled = true` 形同虚设（她从不开口）；② `injection_lines` 因电量恒 <3 而每天给每个会话注入「她今天社交得有点累，回复会简短一些」，一条错误的人设偏移被永久注入。修法：在 `settle` **之前**把锚点取到 `prev_tick_at`（`should_reseed` 早就因为同一个坑留过警告注释），`mood_evolve` 改用它；停机间隙按 `_skip_offline_gap` 同一口径不结算。新增 `tests/test_mood_tick_anchor.py`（**4 条**：三出口都推进锚点 / 旧写法复现出冻结 / 修好后睡 2 小时电量越过 2.0 硬闸 / 源码级守卫钉住锚点顺序），全量 1258 → **1262 passed**，三门禁 3/3 PASS。⚠ **这是一次真实的行为变更**：修复后压力会随加班上升、孤独会在无人互动 6 小时后累积、电量会在睡眠与独处时回充，主动开口与「社交得有点累」注入将按设计生效 |
-| 1.17.0 | **作息活动改进方案（11 个 PR 全量落地）**——全部在焊「子系统之间的接缝」。① **PR-CAL-1 班表吃日历**（`[schedule] honor_calendar`，默认开）：`schedule_facts` 新增 `workday_override` / `day_name`，plugin 侧 `_schedule_calendar_override` 是**唯一入口**，**四个计算点同源**（提示词 `_schedule_facts_now` / 强制层 `_enforce_and_apply` 的 `enforce_facts` / 白问判定 `pointless_ask_reason` / 重新取种子）——此前日历只接了习惯表与睡眠顺延，国庆节当天同一段提示词里「今天是国庆节」「现在：在岗」「今天是休息日，不用上班」三句并存、强制层还照样在上班相位禁睡禁游戏；现在法定节假日真的休息、调休的周末真的上班，`honor_calendar=false` 回到 v1.16.3。② **PR-PRM-1 候选清单与相位矩阵同源**：`PromptInput.schedule` → `activity_choices()` 按同一张矩阵收窄，新增 `schedule_restriction_line()`（把「这段时间她…都不合适」从事实行搬到【可选活动】下面，只列不能做什么）——之前【可选活动】恒为全枚举、班表行另给一个「适合」清单，模型从全枚举里挑禁项再被收口。③ **PR-PHY-2 `meal_duration_minutes` 真的生效**：`EnforcePolicy.dwell_overrides` 接进强制层与 `request_is_pointless`（两处同口径、穷举对拍用例扩参），该键以前定义装配齐全却**零消费**。④ **PR-PHY-1 回饱走 `eat_amount`**：`floor=0.65 / rescue=4.5`，饱腹 ≥2.0 与旧 `+4.5` **逐位一致**，只有饿透（0.5 → 6.5）被 floor 托起——README 从 v1.9.1 起就写着这条语义，代码一直是死分支。⑤ **PR-ROU-1 习惯行 `physio=true` 真的进账**：与生理窗共用 `_settle_physio_intake`（回饱 + 记时刻 + 计「今日已吃」），**同一顿 180 分钟内不重复回饱**，仍只在被强制层采纳时入账；该标记以前全库零消费点（配置描述却写着「physio 消费」）。⑥ **PR-PHY-3 生理窗日期修饰符**：`days=` / `workday_only=` / `holiday_only=`（日标志与习惯层同一份来源），并把星期与布尔的解析核心合并成一份（`life_activity.parse_weekday_set` / `parse_bool_flag`，三处 DSL 共用）。⑦ **PR-SCH-2 班表按日微扰 + 加班日**：`daily_jitter_minutes`（窗口整体平移 0–60 分钟）、`overtime_probability` + `overtime_extra_minutes`（下班端顺延并在提示词写「今天要加班」），由 `sha1(生活日\|窗口\|用途)` **确定性派生**（同一天恒同答案、重启一致、零新表），`day_key` 同样穿透四个计算点。⑧ **PR-ROU-2 习惯场景多候选**：行内用 `；` 写多句，按 `sha1(生活日\|行ID\|小时桶)` 轮换（同桶稳定、跨桶换句、零额外模型调用），单候选逐位不变。⑨ **PR-PRM-2 饱腹进提示词**：【现在的状态】多一行「饱腹 X/10；今日已吃 N 顿；上一餐约 H 小时前」，`[physio]` 关闭或 NaN 时不出现。⑩ **PR-OBS-1 模型调用分解统计**：新增状态字段 `llm_ask_stats`（键 `"生活日\|桶"`，与 `care_today` 同一套惰性清理），`/生活 活动` 印「今日模型：问 N 次（失败 F）　跳过 M 次（习惯窗口 · 生理窗口 · 习惯/生理间隔 · 注定白问 · 打断中）」——只有一个总数时分不清模型是不是被习惯表饿死了。⑪ **PR-DOC-1 文档修正**：`reseed_after_hours` 正文默认值 24 → **8**（与代码和配置表对齐）、两条已过时的局限条目（班表无日历 / 习惯的节假日判据）改写。**配置 schema `1.5.0 → 1.6.0`**（新增 `[schedule] honor_calendar` / `daily_jitter_minutes` / `overtime_probability` / `overtime_extra_minutes`）。新增 4 个测试文件（`test_schedule_calendar.py` / `test_schedule_jitter.py` / `test_physio_intake.py` / `test_llm_stats.py`）+ 既有文件补节，全量 1192 → **1258 passed**，三门禁 3/3 PASS。**两处刻意的行为变更**（都有回退路径与逐位一致对照）：班表吃日历（法定节假日不再算工作日）、`meal_duration_minutes` 真的生效（`meal` 的停留期默认从全局 60 分钟变为 40 分钟，配成 60 即回到旧行为） |
-| 1.16.3 | **情绪体力改进方案 D 期（M6 边际效用 + M7 关系加权 + 曲线重标定）**——体验润色。① **M6 情绪冲击的边际效用**（`emotion_impact_scaling`，默认开）：纯函数 `impact_scale(emotion, delta)` 乘在**事件 / 日期 / 社交**三条通道的情绪增量上——低谷雪中送炭（正向 ×1.3）、高涨快乐麻木（正向 ×0.7）、从高处跌落更疼（负向 ×1.2）、麻木时再挨一下没那么疼（负向 ×0.7），分段线性、两条曲线可配。`_apply_event` 记进经历的是**缩放后**的增量（余波与归因都按它算，记原始值会让卡片与她真正经历的情绪对不上）。② **M7 社交情绪按关系加权**（`[social] relation_emotion_scaling`，默认开）：`life_relations.emotion_factor(familiarity)` 给系数——**陌生（<20）1.0 / 熟（50）1.2 / 亲密（≥80）1.5，单向只放大、封顶 1.5**。**中性锚点钉在陌生人身上**（决议 3）：新装插件 relations 全空 ⇒ 系数 1.0 = **与升级前逐位一致**，原设计的 0.7/1.0/1.4 作废（锚 0.7 等于开箱第一天社交收益被悄悄打七折）；单向只放大还顺带取消了原定的「真机熟悉度分布 go/no-go 检查」，`/生活 关系` 降级为标定参考。实现上走**内存熟悉度索引**（`_record_relation` 顺手更新 + 每天随衰减全量刷新一次），tick 里零额外读库；信号里带了 `user_id`（只在内存流转，不落盘、不进提示词，脱敏纪律不变）。**一处有意的收窄**：日记摘要只给昵称、认不出人，所以**只有实时信号（私聊/被 @）按关系加权**，摘要仍按 1.0——宁可不放大，也不猜错人。③ **乘法顺序与分工写进代码注释**：`最终增量 = 基础值 × 关系系数(M7) × 孤独系数(M3b) × 边际效用(M6)`，全部在**日额度扣除之前**（先缩放再封顶，否则额度用完系数就形同虚设）；`append_social_event` 只写数值、**不许再乘一次**（「不要双重抑制」），这条有专门用例。④ **曲线重标定**：新增 `calibrate_curves.py`（确定性模拟，不调模型；活动提议走 `rule_based_activity` 时段表、事件走内建库、固定种子可复现），跑 7 天并**对照「A/B/C/D 全关」的旧机制**给出分布位移与 ASCII 直方图，报告落盘。**本轮结论：三套宿主曲线的点值不动**——情绪中位数 5.19（旧 5.13）、体力 3.31（旧 3.29），位移均 < 0.4，说明新机制没有移动「情绪 5 = 基线」这个锚点；体力中位数本就偏低（3.31）是这条**确定性时段表路径**的属性（旧机制同样 3.29），不该通过改曲线点值把它抹平（那等于把偏差写进曲线）。一个真实位移：情绪 max 从 10.00 降到 8.08、>8 占比 1.6% → 0.5%——M6 的高涨折扣 + 比例回归长尾共同作用，目标就是「快乐 plateau」而不是频繁顶到 10。⑤ **回退**：`emotion_impact_scaling = false` / `relation_emotion_scaling = false` / 空曲线各有回退路径与用例；配置 schema `1.4.0 → 1.5.0`。新增 `tests/test_impact_scaling.py`（**39 条**）+ 标定脚本确定性回归，全量 1136 → **1174 passed**，三门禁 3/3 PASS。⚠ 方案文档里 M7 写了「intake_live / intake_digest 都乘系数」，实现只对**认得出人**的实时信号生效（见上），这是本期的唯一缩减，理由与取舍都写在代码注释里 |
-| 1.16.2 | **情绪体力改进方案 C 期（M2 体力耦合 + M3 内心维度通道）**——方案自评「风险最高的一期」（耦合族），两条都做了**单向**。① **M2a 疲劳压低情绪基线**（`emotion_fatigue_penalty = 0.3`）：体力 < 3 时基线再减 `0.3 × (3 − 体力)`（体力 1 → −0.6、体力 0 → −0.9），走的是 `_regress_emotion` 的**基线通道**（与余波、节律并列的一项，归因卡片上就叫「疲劳」），不是把体力第二次乘进因子表。**方案决议 1 明确这是「身体状态不直接进倍率」纪律的唯一开口**，README 与代码注释都写死了「后续不得援引本条放行」。② **M2b 低体力消耗放大**（`low_energy_drain_multiplier = 1.25`）：体力 < 3 时**负的**体力变化 ×1.25，恢复项（睡觉 +1.20/h、吃饭 +0.20/h）**不动**——「心情好抗疲劳」这个正向耦合按决议 4 明确不做，因为「越累回血越慢」会把她焊在床上。③ **M3a 高压崩溃**（`[mood] stress_breakdown_*`，默认开）：`stress ≥ 7` **持续 2 小时**触发一次「绷不住」——情绪 −0.8、素材「最近真的有点累，感觉自己快绷不住了」、经历「情绪有点绷不住」（weight 0.75、TTL 8h），每生活日至多一次、压力回落到 5 以下重新计时。走**确定性管线**（与病程 `_COLD_EVENTS` 同表同思路，硬编码、不进 `[events] extra` 随机池，见决议 2），并进惰性期（一次真实的情绪打击，与病程事件「事实通报不动情绪」的口径差异写进注释）；持续时长由新增状态字段 `stress_high_since` 在 `life_mood.evolve` 里维护（瞬时高压不算）。**它修的是方案 P2 的言行不一**：注入的提示词说「她最近压力很大、没什么耐心」时，情绪数值终于也真的下来了。④ **M3b 孤独放大社交收益**：`life_social` 的 `want` 在**日额度扣除之前**乘孤独系数（≥7 ×1.5、≤2 ×0.8，其间线性；坏值 fail-open 按 1.0）。乘法顺序按方案的纪律写进代码注释——`最终增量 = 基础值 × 关系系数(M7) × 孤独系数(M3b) × 边际效用(M6)`，**先缩放再封顶**，否则额度一用完系数就形同虚设（方案点名的边界用例「剩余额度 0.2 × 1.5 = 0.3 → 实际只能发 0.2」已落地）。⑤ 每项都有**回退路径**（`0` / `1.0` / `false`）与**逐位一致**的对照断言；`[social]` 的两条额度记账用例显式关掉孤独系数（它们钉的是额度本身，不是系数）。配置 schema `1.3.0 → 1.4.0`；新增 `tests/test_mood_coupling.py`（**30 条**），全量 1106 → **1136 passed**，三门禁 3/3 PASS |
-| 1.16.1 | **情绪体力改进方案 B 期（M5 回归/惯性 + M4 节律/余波）**——情绪基线族一起上（彼此强相关）。① **M5a 比例回归**（`recover_ratio_per_tick`，默认 **0.08**）：每个推进间隔消除「与基线差距」的固定比例，取代固定步长。**实测对照**（从 10 回到基线 5）：前 **12** 个 tick 消掉 63%（旧线性 **16** 个），完全收敛要 **~37** 个 tick（旧线性 **25** 个）——初期更快、尾巴更长，即「爆发快消、余味长」。多 tick 步长（长期离线后的补偿步）走 `(1−k)^steps` 的解析式，**绝不过冲**；另有 `recover_min_step = 0.05` 兜住「距基线 0.01」时的浮点尾巴。`recover_ratio_per_tick = 0` = 回到线性（有**逐位一致**的回归用例，连乘法顺序都复刻）。② **M5b 惯性期按冲击缩放**：`scaled_inertia(delta) = clamp(inertia_minutes × \|delta\|, 5, max(90, inertia_minutes))`——「笔没水了」（−0.3）冻 12 分钟、生日（+1.5）冻 60 分钟、大冲击封顶 90 分钟；`_apply_event` 与 `_fire_date_rules` **共用同一个 helper**（两处各写一份迟早漂成「事件按冲击缩放、日期仍固定 40 分钟」，有用例钉住）。上限取「本值与 `inertia_minutes` 的较大者」：用户把惯性期配成 240 分钟时，缩放不该反而把它缩短。`inertia_scale_enabled = false` = 旧行为。③ **M4a 日内节律**（`baseline_diurnal_curve`）：`5.0 + 余波 + 节律(时刻)`——05:00 −0.3、13:00 +0.15、20:00 +0.3、23:00 归零。曲线按 **24 小时闭环**处理（末点之后线性回到首点值），否则「23:00 → 0」与「05:00 → −0.3」之间会在午夜出现**台阶**（23:59 是 0、00:01 是 −0.3），那不是节律是缺陷，有跨午夜连续性用例。幅度 ±0.3 按决议 5 保持保守（对倍率 ≤4%）。④ **M4b 余波按年龄衰减**（`afterglow_decay`）：`权重 = 1 − 年龄/窗口`，23 小时前的事贡献 < 1 小时前的 10%，出窗自然归零不再跳变；等权→衰减后有效总量约减半，所以 `afterglow_gain` **自动**从 0.15 翻到 **0.30** 维持同等稳态（`afterglow_gain` 显式给值以配置为准；关掉衰减自动回 0.15）。⑤ 归因输出跟着改口径：`/生活 归因` 的回归行按模式换措辞（「按比例回归（每 10 分钟消除 8% 的距离）」/「按 0.20/10 分钟回归」），Eta 用 `log(下限/差距)/log(1−k)` 算，惯性期照旧不参与；基线构成多一项「节律」。提示词的「选择影响」节也会在节律开着时印出 ±幅度（数值取自曲线）。**四条回退路径**（比例 0 / 惯性缩放 false / 衰减 false / 节律清空）全部有用例；配置 schema `1.2.0 → 1.3.0`。新增 `tests/test_emotion_regress.py`（**35 条**），全量 1071 → **1106 passed**，三门禁 3/3 PASS。⚠ **文档两处算术订正**（按实测口径落地，不照抄）：方案写的「daze 20 h 后 < 3.0」在它自己给的疲劳曲线下是 4.6（真实触阈约在 22.7 h，README 1.16.0 已按实测改写）；「29 tick 消除 95%」实际是 **91%**（95% 要 33 tick） |
-| 1.16.0 | **情绪体力改进方案 A 期（M8 归因 + M1 清醒疲劳）**。① **M8 观测先行（零行为变更）**：新增纯函数 `life_sim.attribution_lines(state, now, config)` 与命令 **`/生活 归因`**——把「为什么是这个数」摊开：情绪基线构成（基础 + 余波 = 合计）、近 24 小时余波来源 top 3、情绪冲击 top 5（按 \|增量\|）、惯性剩余与预计回归、近 1 小时体力流水（主活动 + 背景活动 0.3 权重 + 清醒疲劳 + 事件体力项）。**只读**最近经历与活动锚点：不新增状态字段、不碰任何结算路径；活动切换不回溯（状态里没有活动历史，那一段就明写「不归因」，不编数字）。基线分项抽成 `emotion_baseline_parts()`，归因输出与 `_regress_emotion` **共用同一份口径**（回归用例直接对账「卡片合计 == 实际回归目标」）。同批落地 **`/生活 关系`**（熟悉度分布：各档人数 + 平均/中位/最高 + 最熟几位，QQ 号脱敏）——决议 3 之后它不再是 go/no-go 检查，而是后续曲线标定的参考输入。② **M1 清醒疲劳代谢**（`[emotion_energy] fatigue_ramp_curve`，默认 `12=0` / `16=-0.15` / `20=-0.4` / `24=-0.7`）：新增状态字段 `continuous_awake_minutes`（醒着累加、**跨生活日边界不清零**、一觉结束才归零、睡着期间不参与消耗），额外消耗叠加在活动 delta 之上。修的是「困意完全由睡眠窗口驱动」：此前最闲的路径 `daze`（−0.10/h）连熬 24 小时也只从 8.0 掉到 5.6，**永远碰不到入睡阈值 3.0**。**实测标定**（两条都写进了回归用例，文档与实现同源）：发呆 24 小时 8.0 → **2.0**（旧行为 5.6）；`daze`/`daily` 混合 ≈ −0.3/h 的清闲日约 **15.7 小时**触到 3.0——方案文档里「daze 20 h 后 < 3.0」的写法与它自己给的曲线不一致（那条路 20 h 只到 4.6），这里按**实测**口径落地并写进 README。插件级行为验收：把睡眠窗口关掉（`sleep_window=(0,0)`）后，纯发呆的清闲日仍会在 24 小时内因**累**而睡着，旧行为走 30 小时也睡不着。⚠ 已知取舍：与 `sleep_hard_floor` 叠加后她可能更频繁地被强制入睡（默认曲线已给保守值，真机观察一期再调）；`fatigue_ramp_curve` **清空 = 关闭 = 与升级前逐位一致**，旧状态文件零迁移（新字段缺省 0，坏值被净化到 `[0, 366 天]`）。配置 schema 版本 `1.1.0 → 1.2.0`（新增字段必须 bump，否则已部署实例的 `config.toml` 不会出现该键）。顺带把提示词里「选择影响」那节补一行清醒疲劳（只在启用时出现，数值取自曲线），并修正 `test_interop` 里一条过宽断言（它用裸的「12 小时」判「旧配置残留」，会被疲劳曲线里合法的「清醒 12 小时」误伤，改成判那句话本身）。新增 `tests/test_attribution.py`（27 条）+ `test_sim.py` 8 条（含关窗睡眠的行为验收与坏状态净化），全量 1030 → **1071 passed**，三门禁 3/3 PASS |
-| 1.15.0 | **睡眠子系统改造（按《life-frequency 睡眠改进方案》全部 11 个 PR 落地）**。审查起点是「睡觉 = 体力充电」这个前提：① **P0-1 越熬越短**——`energy_full_wake` 让睡眠时长 = `(体力上限 − 入睡体力)/1.2`，清闲夜晚只睡 3–5 小时（正好压在 300 分钟熬夜阈值上），连熬三晚把上限压到 8.5 后睡得更短、债更还不清；现在加**最短睡眠目标** `energy_full_wake_min_hours`（默认 **6.5** 小时，> 阈值）并在睡满目标醒来后记「本轮窗口已睡够」（`rested_until` = 本轮窗口结束）——探针实测从「同一时段睡出十几段 10 分钟的假觉／第二个 6.5 小时长觉」变成「每个睡眠时段恰好一觉 6.5 小时」；熬夜恢复改**滞回**（`sleep_debt_recovery_step`，一晚只还 1 晚债）。② **P0-2 文档与代码不符**——`enforce` 睡眠分支在睡满 `min_sleep_minutes` 后对**任何** proposal 一律放行「醒来」，于是 07:00 的习惯行与早餐窗真的会把她叫起来（README 与注释却写着「不会被叫醒」）；现在默认**睡眠优先**（`routine_can_wake` / `physio_can_wake`，默认 `false`，置 true 回到 v1.14）。③ **P1-3**——`sleep_hard_floor`（默认 0.5）：体力耗尽时**无视模型提议**强制入睡，补上「模型坚持不睡」这条一直开着的路（v1.3.0 只修了「模型无输出」那条）。④ **P1-4 省 token**——`sleep_interval_seconds`（默认 1800）：睡眠中的决策间隔从 10 分钟放宽到 30 分钟（每晚 18–30 次调用 → 4–8 次），`0` = 睡眠中完全不問（醒来交给确定性条件）。⑤ **唤醒链路**——`wake_on_private`（私聊也叫得醒，默认关，判据与打断机制对齐：私聊任意消息 / 群聊被 @）、`wake_extend_on_message` + `wake_max_extensions_minutes`（对话顺延、30 分钟封顶、顺延不重写宿主）、`wake_grumpy_note`（睡下不到两小时被吵醒时补一句「还有点迷糊、有点不情愿」）。⑥ **拟真层**——新增 `nap` 小睡（白天精力低时 20–90 分钟、体力 +0.60/h、不做梦、**硬闸静默**、可被打断、在岗相位不许睡；全库 `== SLEEP` 字面判断收敛为 `is_asleep()` 谓词）、失眠（压力 ≥7 时把入睡收口成「翻来覆去睡不着」，每生活日至多一次，rng 注入、只在提议睡觉那轮掷）、夜间易醒（默认关）、醒后赖床（长睡眠醒来先进 `daze` + `wake_grace` 宽限窗，不被硬约束立刻送回床、也不受最短停留期约束）、休息日睡懒觉（法定节假日/班表休息日目标 +60 分钟并在提示词写明）。新增 5 个状态字段（`wake_grace_until` / `last_night_waking_at` / `rested_until` 全部进 `from_dict` 净化，旧状态零迁移）、`[mood]` 配置节首次进 WebUI，`tests/test_sleep_improvements.py` **70 条**专项用例（含三个跨 PR 回归：满体力不许回睡、夜醒要活过同一个 tick 的 enforce、睡眠中不問模型时仍按时醒），全量 957 → **1028 passed**，三门禁 3/3 PASS。⚠ **两处默认行为变更**（都留了 0/true 回退）：最短睡眠目标 6.5 小时（`0` = v1.6.0 旧行为）与睡眠优先（`routine_can_wake`/`physio_can_wake` = true 恢复 v1.14）；`energy_full_wake_min_hours = 0` 时旧行为里那条「睡下→满体力被叫醒→又睡」的短周期往复会回来，README 一直把它写在已知代价里 |
-| 1.14.1 | **首轮真机日志驱动的六处修复**（2026-10-09 真机反馈：`/生活 状态` 显示「感冒加重（第 3 天）…；今日收到关心 2 次」，`/生活 送药` 生效 −4 小时，但**「今日已吃 0 顿、饱腹 3.4」**）。⑤ **用餐窗口不再被一次收口作废**（据真机配置定位的机制性缺陷）：`fired_today` 以前在提案**之前**就记账，于是「第一次提案被硬约束收口」（她正好在睡 / 刚换活动未满最短停留期）＝ 这个窗口当天再也吃不上——她一天只有 3 个窗口、每个窗口只有一次机会；现在**只有真的吃成才记账**，收口则在窗口内继续重试（窗口 90 分钟 ≈ 9 次机会），且因为「窗口内本来就不问模型」，重试不会增加模型调用；⑥ **`factors_mode="replace"` 漏键的可见性**：漏掉的键按 1.0 处理，而 1.0 的因子在 `/生活 频率` 的拆解里**被过滤掉**——真机配置实拍漏了 `night_study`/`meal`/`bath`/`chatting`（v1.9.1、v1.11.1 新增的键），卡片上一个字都没有；现在该卡会印一行「⚠ 因子表 replace 模式缺内置键：…」。① **病中不再掷「这顿不吃」的骰子**：`_run_physio` 的 weight 判定原本在病中照样生效，掷到「不吃」就**当天不再重掷**——病重期一顿不吃等于一天不吃（真机实拍），现在病中三餐必出 proposal，吃不吃由强制层裁定；② **`[physio] meals` 为空从静默改为告警**：以前这条 `return False, ""` 没有任何日志，饱腹照常下降却一餐都不触发（真机排查时的最大盲区），现在打一次 warning 并在状态卡新增**「生理窗：N 个（早餐、午餐…）」**一行——没配就明写「（未配置——她不会自己吃饭）」；③ 「今天这顿不吃」与「加餐不饿」两条跳过路径补 info 日志（含窗口名与 weight），把「她怎么不吃饭」变成可查；④ **强制养病/病中唤醒改用阶段化确定性场景**：模型提议吃饭的 scene 曾被原样带进养病裁定，状态卡出现「养病躺着（吃晚餐）」这种自相矛盾的组合，现在收口成「躺在床上裹着被子，什么都不想干」（好转期「靠在床头慢慢缓着，还有点虚」）。新增 6 条回归（含「健康时仍会偶尔不吃」的正反对照、窗口收口后仍能补吃、缺键可见性）；全量 **957 passed**，三门禁 3/3 PASS。⚠ **配置层提醒**：`sleep_window` 覆盖了用餐窗口时，按设计「睡着的她不会被叫醒吃饭」——真机这份配置 `sleep_window="07:00-17:00"` 覆盖了早餐 07:00-08:30 与午餐 12:00-13:30，一天实际只剩晚餐一个窗口，建议把 `[physio] meals` 挪到她的清醒时段（并可用 `snack` 窗兜底，它只在饱腹 < 2.5 时出现） |
-| 1.14.0 | **生病机制：从一枚二值骰子升级成完整病程（按《life-frequency 生病机制改进方案》PR-1~3 落地）**。此前「感冒」是 `cold_until = 中招时刻 + 随机 1~3 天` 的一次性数值：**中招无声无息**（无事件、无素材，用户只能从她突然话少来猜）、**病程落子无悔**（之后睡得好不好、有没有人关心都不影响）、**病中不吃不洗**（physio 的三餐/洗澡 proposal 被 `enforce` 全数收口）、**轻症与病危一个待遇**（一律强制 `sick_rest` + 健康因子恒 0.3）、**病好次日就能无缝再病**（没有免疫期）。现在：① **四段病程**——初起 `onset`（嗓子痒、还能做事，**不强制养病**）→ 加重 `worsening`（除睡觉/吃饭外强制养病）、好转 `recovering`（放行 `daily`/`daze`/`music` 轻活动），外加一段**病后余韵**（不算生病，只进提示词与事件）；② **阶段流转按天结算**（与感冒骰子同一处、同一个 `rng`）：休息分 = 睡够 +1 / 此刻在养病或睡觉 +1 / 被关心 +0~2，≥2 向好（`onset` 可直接跳 `recovering`，`recovering` 再休息好即**提前痊愈**），否则没睡够或体力低于入睡阈值就向坏（并小幅推后 `cold_until`）；`cold_until` 每次只许挪 0.5~1 天、总量封顶 `cold_max_days + 2` 天——「关心刷满 = 秒愈」与「连熬 = 永久感冒」都被这条挡住；③ **起病/加重/好转/痊愈四个时点各有一条确定性产出**（素材 + 经历，不走 40% 抽取、停机重启不重发），随机池里那条「退烧了」**移出**并升格为好转事件，避免「一天退烧三次」；④ **病中放行三餐**（`meal` 不再被收口，还有 3 条病期限定吃饭事件），洗澡仍然不放行；⑤ **病假口**（`cold_sick_leave`）：加重/好转期她请病假，`schedule_facts` 的提示词换成病假文案、`rule_based_activity` 的种子变成「请了病假在家躺着」、`activity_blocked_by_schedule` 挡掉上班/通勤/开会/加班/午休——修掉「提示词说该上班、强制层把她按在床上」导致的场景精分；⑥ **关心互动**：`chat.receive.after_process` 旁路识别**严格句式**（默认两条正则，要求第二人称或叮嘱/询问句式，`我昨天也感冒了`/`他感冒一礼拜了` 不命中），命中给 `care_today` +1 与情绪 +0.3（每会话每日一次、不动情绪回归）；新增命令 **`/生活 送药`**（本插件首个改变她身体状态的用户命令：每次缩短病程 4 小时、情绪 +0.8，12 小时会话冷却、每场病最多 2 次、累计缩短 ≤ `cold_max_days/2`）；⑦ **免疫期**（`cold_immunity_days=5`）与 **`cold_season_factors` 季节风险系数**（默认空 = 不启用）；⑧ **提示词/状态卡双口径**：进模型与注入回复的 `health_label_prompt` 只说「感冒正厉害，烧得迷迷糊糊（第 2 天）」，**不再报「约剩 37.5 小时」**（真人没有上帝视角），精确口径（阶段 + 第几天 + 剩余小时 + 已请病假 + 今日收到关心次数）留在 `/生活` 状态卡。新增状态字段 `cold_stage` / `cold_started_at` / `cold_stage_checked_day` / `cold_immunity_until` / `convalescent_until` / `care_today` / `medicine_cooldown` / `cold_medicine_count` / `cold_medicine_seconds` / `cold_medicine_key`（全部带默认值，旧状态文件零迁移；`cold_until=inf` 的永久感冒夹具不会被自动治好）；`[plugin] config_version` **1.0.0 → 1.1.0**（新增字段要 bump，宿主才会把它们补进已部署的 `config.toml`）。⚠ 已知取舍（拍板「更严句式」的结果）：默认两条正则里，第一组要求**第二人称**（`你吃药了吗`），第二组只认**本身就是对她说**的叮嘱/询问词（`记得吃药`、`多喝热水`、`好点了吗`）——像「你要好好的」这种没有关心词的宽泛问候不命中，而「我昨天也感冒了，吃了药才好」「他感冒一个礼拜了」也不会被误判成关心。想更宽松就往 `cold_care_patterns` 加行（坏正则只告警、绝不影响消息主链）。 |
-| 1.13.1 | **上线前全检修复（GStack 三方审查：代码审查 + 安全审计 + QA，全部先复现后修复）**。🔴 **P0 ×4**：① **F-001 隐私**——`[world]` 新人事件文本原来写「群 {群号} 来了新成员 {QQ 号}」，原样进 `recent_events` → 活动决策 prompt（可能发往第三方模型服务）→ 明文落盘；现在统一走 `mask_user_id`（前3后2，标识只留在去重 key 里）——根因是 `mask_user_id`「定义了、导出了、import 了两次、生产调用 0 处」，本次一并接上并删死 import（F-006）；② **F-002 稳定性**——关系层 4 处 SQLite 读写（`_record_relation` / `_relation_multiplier` / `decay_all` / `/生活 状态` 的 top3）原来直接跑在宿主事件循环上（消息主链每条消息最多 3 次事务），全部改 `asyncio.to_thread`；`LifeStore` 的全局锁从无限 `acquire()` 改为 `acquire(timeout=2.0)` fail-open（慢盘上宁可丢一次记账，不冻住调用方）；③ **R1 时区**——`_noon_epoch` 漏减 `tz_offset_minutes*60`（`local_datetime` 返回的 datetime 已含偏移），真机默认 UTC+8 下梦素材触底平移 8 小时（她会在傍晚讲梦，完全静默）；测试盲区：夹具默认 `tz_offset=0` 把偏差归零；④ **R6 状态机**——`CHATTING` 在别名表里，模型输出「聊天」会被归一化后当普通切换放行，制造 `interrupted_from` 为空、`interrupt_until=0` 的假打断态（`expire_interrupt` 永不触发，卡在没有出口的系统态至少一个停留期）；现在窗口外 `enforce` 把 chatting 提议按无效处理（窗口内不受影响）。🟠 **P1 ×5**：⑤ R2——打断/建档路径的 `is_at`/`is_command`/`is_bot` 从宽松 `bool()` 统一到 `flag_value` 严格真值（`bool("false")` 是 True，同钩子睡眠唤醒路径一直是严格口径）；⑥ R3——`note_session`（BLOCKING 消息钩子）补 `timeout_ms=1500`（`error_policy=SKIP` 只对抛异常生效，对挂起无效），打断注入套 `asyncio.wait_for(1.2s)`；⑦ R4——打断顺延 30 分钟总上限（活跃群每 5 分钟一条 @ 原本可无限顺延 → 永久 chatting、习惯表与三餐窗整段失效），到顶后不再顺延让窗口自然回退，新打断重新计；新状态字段 `interrupt_started_at`（含净化）；⑧ F-003/R7——`mood_injected` / `interrupt_injected` 注入去重表统一 14 天 TTL 清理（原来无上界，一年可到 18 万条）；⑨ F-004——打断注入去重键加批次号（`_interrupt_batch`，每次新打断 +1）：原来只按 `(session, 原活动)`，同活动第二次打断永久不注入。🟡 **P1/P2 若干**：R5 独占型活动（睡觉/养病）强制收口时清空背景活动；R8 打断总开关关闭时残留窗口立即失效（hold/routine 跳过都看 enabled）；R9 梦 pending 超 2h 丢弃；R10 分享动机只在可分享活动下生成（睡眠中不再冒「想说说话」）；F-005 `sanitize_dream` 净化补齐 `【】<>{}`（全项目唯一绕过结构符净化的模型输出通道）+ 梦境 prompt 补防注入脚注；F-008/F-009 `put_relationship` 对 user_id / relation_hint 截断 64。新增 `tests/test_prelaunch_fixes.py`（7 条，修复前全红）；全量 900 → **907** passed；门禁 3/3 PASS。审查报告：`deliverables/gstack/pre-launch-check-life-frequency-2026-10-09.md` |
-| 1.13.0 | **主动开口动机扩展（`[motives]`，默认开，人味改造方案步 9）**：人不是「有素材才说话」——三类**动机素材**进既有 `state.materials` 管道，**发不发仍由主动开口管线裁决（阈值/间隔/静默时段/社交电量硬闸照旧），不进倍率**：① **问候**：早安窗 06:00–11:00 / 晚安窗 22:00–01:00（跨午夜），每生活日每窗至多一条；② **生活分享**：按当前活动低概率（0.08/tick）冒出「想说说」的念头（模板按活动分桶 9 组 + 兜底），同活动同日只一条；③ **关系维护**（依赖步 5 的 relations 档案，`top_relationships` 线程池读）：familiarity ≥20 且超 `relation_idle_days`（默认 3 天）没说话的人 → 「好久没聊了」，每次至多一人（**最久没聊优先**）、同人同日只念叨一次；文本第一人称、不带 user_id（有 `relation_hint` 用备注）。去重表 `LifeState.motive_seen` 落盘（`_sanitize_float_map` 净化，超 400 条按最旧淘汰）；标记写在素材入池之后；`idle_days=0` / 各类开关关闭完全惰性；整个 `_refresh_motives` 自兜异常（动机是锦上添花，绝不拖垮 tick）。新模块 `life_motives.py`（纯函数：时段窗/分享概率/关系筛选/素材 stamp——`expires_at` 先存时长、plugin 侧补绝对时刻）；新增 `tests/test_motives.py`（9 条）；全量 891 → **900** 条 |
-| 1.12.1 | **多活动并行（side_activities，人味改造方案步 8）**：模型在活动决策里可多提议一个 `side` 字段（0–2 个背景活动，「吃饭时顺便看番」）。**主活动唯一进 enforce**（强制层只收口主活动；`enforce` 仅在「切换成功」出口透传 side，停留期/睡眠等被拒路径不带）；**倍率只按主活动**（`compute_adjust` 读 `state.activity`，side 不参与）；**体力加权**：主 1.0 + 每背景 0.3（`settle` 能量结算合成速率）；scene 拼接「{场景}，顺便{第一背景}」；状态卡加「背景：」行。白名单 `SIDE_ACTIVITIES` 禁 `sleep/sick_rest/before_sleep/chatting`（独占型/系统态），去重、去主、上限 2、坏项静默丢弃（`normalize_side` 纯函数）。**生命周期**：只由 `SOURCE_LLM` 决策驱动——模型没提 ⇒ 清空（防残留）；routine/physio/enforced 不带 side ⇒ 保留现状（确定性层不替模型清）；**打断清空**（`apply_interrupt`，回消息不「顺便看番」）、**回退不恢复**（背景是上一轮决策产物，恢复会穿帮）。`LifeState.side_activities: list[str]`（`from_dict` 逐项白名单净化；⚠ 刻意用 **list** 不用 tuple——`from_dict` 通用拷贝没有 tuple 分支，tuple 字段会永远载不进来）。提示词【输出要求】加 side 说明、【可选活动】改用 `activity_choices()`（不含 CHATTING）。新增 `tests/test_side.py`（9 条）；全量 882 → **891** 条 |
-| 1.12.0 | **梦境与睡眠余波（`[dream]`，默认开，人味改造方案步 7）**：梦是廉价的真实感——一行文本、一上午的余韵。触发点 = **睡够 ≥3 小时**后醒来的那一刻（在 `_enforce_and_apply` 收口路径检测「睡→醒」，apply 前记住 `sleep_started_at`——apply 内部会清锚点；只标记 pending，LLM 调用回到 tick 的 async 流程，绝不在收口路径上发 RPC），按概率（默认 0.35，`[dream] probability`）生成。**生成两级、永不阻塞醒来流程**：① 首选一次短模型调用（约 50 token、10s 超时、走 `[activity.llm].task_name` 路由），种子 = 最近几条经历摘要（排除旧梦）+ 当前压力/孤独，压力高基调偏焦虑、孤独高偏「梦见有人陪」；② 兜底内置模板库（20 条第一人称日常向，按基调三桶抽取），LLM 超时/失败/**输出了一整段**（`sanitize_dream` 剥「好的，梦境是：」类壳与引号、超长判失败）都落到模板。**落库只进叙事层**：`recent_events`（label=梦境、`kind=dream`、情绪体力增量恒 0，进下一轮提示词近层）+ 主动开口素材「我昨晚梦到…」（权重 0.6，`expires_at` = 本地今天 12:00——上午全额线性衰减到午后触底；**下午醒来不产素材**）。⚠ 小憩（<3h）不做梦；`probability=0` / `enabled=false` 完全惰性。新模块 `life_dream.py`（纯函数：概率/分桶/模板/prompt/净化/素材构造，LLM 在 plugin 侧——模块不 import ctx）；新增 `tests/test_dream.py`（11 条）；全量 871 → **882** 条 |
-| 1.11.1 | **打断机制（`[interrupt]`，默认开，人味改造方案步 6）**：收到**对她说的话**（私聊任意 / 群聊被 @，与关系建档同判据）时把主活动临时切到 `chatting`（默认 5 分钟，连续消息只顺延、不重复记录），回完回到原活动。**新活动 `CHATTING`（聊天中）**进枚举/别名/因子表（1.1——回消息时理应多说几句）与体力表（+0.05/h 小回血），**新来源 `SOURCE_INTERRUPT`**；⚠ `CHATTING` 是系统态，**模型的活动候选里不含它**（`activity_choices` 排除），只有打断能切进去。**新模块 `life_interrupt.py`**（纯函数：判据/开窗/顺延/过期/白名单）。四条咬合：① 窗口内 `enforce` **保住 `chatting`**——不主动送她入睡/切走（全插件唯一盖住入睡硬约束处，留 `hold_over_sleep` 开关），`request_is_pointless` 同步判「打断窗口中」跳过提问（对拍矩阵加 `in_interrupt` 一维，穷举等价性有回归）；② 窗口内**不跑习惯表与生理窗**（打断优先级高于 routine）；③ **回退豁免最短停留期**（「回到吃饭」是续上，不是新切换；不豁免她会被 60 分钟停留期卡死在「聊天中」——通过 `ActivityFacts.interrupt_return_to` 只对那一次 enforce 生效），但**班表不豁免**（在岗回完消息回岗位）；回退落一条 `recent_events`（「XX到一半去回了会儿消息」）；④ **低电量收窄白名单**（电量 < 2.0 只剩 `daze/music/anime`，方案七 §7.3 联动；mood 未启用时绝不静默失效）。可向会话注入「她放下手里的事」（`inject_notice`，按 `(session_id, 原活动)` 批次去重、失败只降级）；状态卡显示窗口剩余。⚠ **`bath` 有意不在白名单**（方案 §6.3 原表没有它）。新增 `tests/test_interrupt.py`（18 条：判据/白名单/顺延/过期一次/对拍矩阵/回退豁免/接线）；全量 853 → **871** 条通过；`check_plugin` 40 PASS / FAIL 0；冒烟 65 PASS / FAIL 0 |
-| 1.11.0 | **关系模型（`[relations]`，默认开，人味改造方案步 5）**：只对「明确跟她说过话」的人建档（私聊任意消息 / 群聊被 @ 或被回复她的消息；群聊围观者一律不进库），档案落 `life_store.db` 的 `relationships` 表（SQLite 第二租户，库不可用降级内存态）。熟悉度 0–100：被 @ 互动 +0.2、共同经历 +1.0、超 7 天未互动按周 −0.5、档案上限 200 按「最近互动最久远」淘汰。消费点全在阈值与提示词层、**不进倍率**：主动开口阈值系数按档位 亲密0.5×/熟络0.8×/认识1.2×/陌生2.0×；提示词按档位给「该怎么说话」（陌生档不进 prompt）；状态卡显示熟人概况（user_id 掩码 `123***89`）。新模块 `life_relations.py`；新增 `tests/test_relations.py`（8 条）；全量 845 → **853** 条 |
-| 1.10.1 | **内心维度（`[mood]`，默认开，人味改造方案步 4 前半）**：压力 stress / 孤独 loneliness / 社交电量 social_battery 三条 0–10 慔变维度。压力按活动（工作/熬夜↑、睡眠↓、平时向基线回归）；孤独无互动累积、有互动回落、满 6 小时 +0.5；电量每条消息 −0.05、被 @ −0.15、主动开口 −0.3、独处与睡眠回血。**纪律：只进 prompt / 素材 / 硬闸，不进倍率**。消费点：① 主动开口硬闸——电量 < 2.0 直接不开口（沉默台账记 `low_battery`，且**放在会话列表获取之前**，空会话列表也留痕）；2.0–4.0 阈值 +0.5 档（`dataclasses.replace` 改 `score_threshold`）；② 注入——压力/孤独 ≥7 或电量 <3 时向会话注入一条语气提示（每天每会话至多一条，**去重标记写在 RPC 成功之后**，失败可重试、连续 3 次失败停手）；③ 活动决策 prompt 增加内心状态节；④ 状态卡 verbose 区。新模块 `life_mood.py`；新增 `tests/test_mood.py`（11 条）；全量 834 → **845** 条 |
-| 1.10.0 | **中国日历（`data/calendar.toml`，人味改造方案步 3）**：离线节日/调休表（当年+次年，农历节日公历日期预计算硬编码，不引农历算法库），覆盖 2026/2027 元旦春节清明劳动端午中秋国庆与主要农历节日、`workday_swap` 调休。消费点：活动 prompt 日期行追加节日名（「春节没反应」这个最刺眼的非人味缺口）、状态卡追加日期节日、习惯表 `workday_only/holiday_only` 改用**真实法定工作日**判定（不再按周一到五猜）。表缺当年数据 → 降级为「全部按普通日」+ 启动告警一次。新模块 `life_calendar.py`；新增 `data/calendar.toml`（**随插件分发的数据文件，不是用户配置**）；新增 `tests/test_calendar.py`（11 条）；全量 823 → **834** 条。⚠ 2027 年数据为按惯例推算，国务院正式公布后更新 |
-| 1.9.1 | **三餐与生理锚点（`[physio]`，人味改造方案步 2）**：饱腹 0–10 清醒时按小时衰减（睡着不消耗）、三餐/洗澡时间窗确定性触发（默认早/午/晚餐 + 晚间洗澡，weight<1 = 偶尔不吃）、加餐只在饿过头时出现。**吃饭回饱 = max(当前+救援增量, 70%)**，一顿是一顿。新活动 `meal`（因子 0.8）/`bath`（0.5）。⚠ proposal 仍过 enforce：睡着的她不会被早饭窗叫醒，且**被硬约束拒绝时不记账**（不回饱、不计数）；同一生活日同一窗口只触发一次，权重未中记 SKIPPED 不重掷。新模块 `life_physio.py`；新增 `tests/test_physio.py`（11 条）；全量 812 → **823** 条 |
-| 1.9.0 | **习惯层（routine）+ SQLite 持久化基建（人味改造方案 §10 步 1）**。真人不是每 10 分钟重新想一次「我接下来干嘛」——她 07:00 起床洗漱、23:00 洗澡。新增 `[routines]` 配置节（行 DSL `HH:MM-HH:MM\|场景\|活动\|weight=..\|jitter=..\|days=..\|workday_only=..\|holiday_only=..`），习惯表作为一个 **proposal 源**置于**模型之下、强制层之上**：命中即出 proposal 交给 `enforce_and_apply` 唯一收口，本轮**不问模型**，并进入 `llm_gap_minutes`（默认 120 分钟）提问间隔——模型的舞台是习惯之间的空隙。**三条纪律**：① **一天只命中一次**（命中状态落 SQLite，键 `(生活日, 行 ID)`；没有它 40 分钟的窗口在 10 分钟一个 tick 下会被命中四次）；② **抖动按天固定**（`jitter` 默认 ±15 分钟，当天掷一次就写死——每 tick 重掷会让窗口在边界上反复进出，同一顿早饭被命中好几次）；③ **习惯只是 proposal**,仍要过 `enforce`——睡着的她不会被 07:00 那条「起床」叫醒（真要起床靠睡眠上限/体力回满正好放行），班表与感冒同理（有回归钉住）。**新模块 `life_routines.py`**（纯函数：DSL 解析 + 窗口命中 + 权重掷骰）与 **`life_store.py`**（SQLite：`routine_daily` + `relationships` 两张表，`user_version` 做 schema 版本）。四个工程细节：⚠ **行 ID 用 SHA1 而不是内置 `hash()`**（内置带随机盐 ⇒ 重启后库里的「今天已命中」全部对不上，习惯天天重复触发）；⚠ **每次操作开新连接 + 一把全局锁**——只开新连接不够：实测 Windows + WAL 下四个线程同时写会撞出 `attempt to write a readonly database`（最后一个连接关闭时 `-wal`/`-shm` 会被删掉，下次冷启动多个连接抢着重建就踩空；同样语句串行 100% 成功）；⚠ **开不出库降级 `MemoryStore`**（接口一致，只丢「当天的命中记忆」，绝不因为数据库不可用就让插件罢工）；⚠ **`journal_mode=WAL` 只在建库时设一次**（它写进库文件头，是持久属性）。**坏行一律告警**（时间窗解析失败 / 活动名不在枚举里 / 零长度窗口 / `days` 认不出来 / `workday_only=false` 之外的布尔值 / 未知修饰符），不静默少一条习惯——与事件 DSL `activities=` 同一类静默死配置。**新来源标签 `SOURCE_ROUTINE`**：`/生活 活动` 显示「习惯表命中」。⚠ **`lines` 默认为空**：不配就不生效（习惯表会压住模型的决定权，默认塞示例等于悄悄改写存量实例的作息）。新增 `tests/test_routines.py`（19 条）+ `tests/test_store.py`（15 条，含真线程并发写）+ `tests/test_routine_wiring.py`（11 条，含整轮 `_sim_tick` 命中时不问模型）；冒烟 `FLAT_MODULES` 登记两个新模块。全量 767 → **812** 条通过；`check_plugin` 40 PASS / FAIL 0；冒烟 65 PASS / FAIL 0 |
-| 1.8.2（审计修复） | **上线前全检（静态 + 行为探针 + 9 模块逐行审查）修出 1 中 7 低，全部先复现后修复**；新增 `tests/test_audit_fixes.py`（23 条回归，复现脚本修复前全红、修复后全绿），全量 744 → **767** 条通过；`check_plugin` **40** PASS / FAIL 0；冒烟 PASS=65。**① M1（中）状态文件 NaN/Infinity 致整机静默冻结**：`LifeState.from_dict` 的 float 分支以前 `float(value)` 直转，JSON 的 `NaN`/`Infinity` 字面量原样入库——`last_tick_at=NaN` 让 `settle` 的比较恒为假 ⇒ 每 tick 空转、记账零推进**且无任何日志**（实测连续 1000 秒模拟时长零记账）；`cold_until=inf` 是永久感冒；`llm_last_success_at=NaN` 让「模型失败重取种子」安全阀失效（`nan` 是真值，`nan or activity_since` 会选中 NaN）。现在 float/int 分支只认**真正的有限数字**（拒 bool/字符串/非有限，坏值回默认），`except` 补 `OverflowError`（**L1**：`int(inf)` 会穿透旧 except 名单让插件加载失败）；`settle` 对 NaN 锚点自愈（第二道闸）；`should_reseed` 的锚点改走 `_as_float`。**② L3 运行中时钟回拨静默冻结**：NTP 校正/虚拟机快照让墙钟倒退后 `elapsed` 恒为 0、锚点永远追不回来——回拨多久冻结多久，日志一个字都没有。现在 `settle` 检测到 `now < last_tick_at` 就把锚点重置到现在（这段倒流的时间本就无从结算），回拨 ≥60 秒时经新回调 `on_clock_rollback` 留痕一次（毫秒级抖动不刷日志）。**③ L4 `skip_ledger`/`sessions` 值类型不清洗**：这两张表以前走通用 `dict(value)`，坏值活到消费点才炸（`bump_skip_ledger` 的 `int("abc")` 抛 ValueError ⇒ 整 tick 中止；`last_user_message_at=NaN` 让「对方刚说过话」的闸比较恒假 ⇒ 静默失效）。现在条目级净化（值非 dict 丢弃、时间/计数走数值校准），与另外六张映射表对齐。**④ L2 病态小频率**：`trigger_threshold` 在 ≈1e-160 的频率下 `1/f²` 下溢（ZeroDivisionError）或溢出（`ceil(inf)` 抛 OverflowError）——`clamp_frequency` 没有下限，配坏的 `min_adjust`/`silence_floor` 就能触达；现在钳到 1e-6 下限，返回有限大数。**⑤ L5 `life_social._text` 与 `life_world` 口径对齐**：以前只做空白折叠+截断，不剥控制/结构字符——日记摘要（源自群聊原话的模型摘要）带着 `【】「」{}` 原样入库；当时所有消费点有二次净化故不可利用，但任何新增消费点会直接吃到伪造分节。现在入库前走统一 `sanitize_text`（顺带保证 `（原话：「…」）` 的引用边界不被子串破坏；副作用：去重键含摘要文本，升级后第一条旧摘要可能重录一次，有每日条数与情绪额度兜底）。**⑥ L6 单行代码围栏**：```` ```{...}``` ````（无换行）以前解析成空串 ⇒ 丢弃一次有效决策；现在直接从 ``` 之后剥，单行/多行/带语言标记都正确。**⑦ L7 事件 DSL `activities=` 校验白名单**：写错活动名（如 `workk`）时 `matches()` 永远为 False、事件静默永不触发且零告警——现在 plugin 装配层逐条对照 `is_known_activity`（life_activity 新增，别名口径与 `normalize_activity` 一致；life_events 不反向 import 防循环依赖）并告警。**⑧ L8 `bool("false") is True` 陷阱**：`life_world` 的 `active`/`is_live` 以前用宽松真值，上游把 bool 序列化成字符串时「未开播」判成「开播了」、凭空产假事件——现在 `_strict_bool` 与本插件自己在 `flag_value` 文档化的口径一致。**⑨ 注入分隔**：`inject_life_context` 以前把生活摘要直接拼在已有 `extra_prompt` 末尾（摘要头会粘在别人提示词的最后一行上），现在补换行并把分隔符计入 `max_chars` 预算。**⑩ 门禁可读性**：`run_gates.py` 给子进程强制 `PYTHONIOENCODING=utf-8`（Windows 管道下子进程 GBK 输出曾让摘要行全部变 U+FFFD）、PASS/SKIP 摘要改为取 **stdout** 末行（以前取 stdout+stderr 合并末行，会选中运行中途的 warning 而把结果行顶掉） |
-| 1.8.1 | **三件真机反馈修完：状态卡措辞、主动开口引用、一条时间炸弹测试**。**① 状态卡措辞**（真机 v1.8.0，2026-10-05）：`/生活 状态` 上出现「动态：降级（暂无推送记录）」「歌曲：降级（暂无歌曲命中记录）」——上游 `active=True`、数据只是**还没有**，却被渲染成了劣化。现按上游契约把「空窗」与「劣化」分开：`暂无推送记录` / `时间窗内没有推送记录`（dynamic-push）· `暂无任何成员记录` / `时间窗内没有新成员`（group-welcome）· `暂无歌曲命中记录`（cv_lyric）五种空窗措辞 → 显示「已接入（…）」；**未知措辞一律仍按「降级」显示**（宁可误报、不可漏报；白名单逐字钉在 `BENIGN_EMPTY_REASONS` 并有回归）。真降级不受影响：`推送记录不可读，已降级：…`（`active=True`）与直播的「尚未探测成功」仍显示「降级」；带条目 + reason（如「部分条目被截断」）同样仍显示「降级」。顺带把「无 reason 且无条目」的兜底文案统一为「已接入（暂无…）」，并把四个源的**最低上游版本**写进 README（正是真机碰到的 `未找到版本为 1 的 API` / `未找到 API 提供方插件` 两种措辞的区别）。**② 主动开口不挂引用**（用户要求）：`set_quote` 是 Planner 调 `reply` 的工具参数、插件无法强制，所以走「任务描述 + Planner 注入」双保险——`life_proactive.NO_QUOTE_DISCIPLINE`（代码层常量，intent 与注入共用同一份，避免措辞漂移）要求 `set_quote = false`，并给一条**可执行路径**（「只写不要引用」会把模型逼到无路可走，`reply` 必须带 `msg_id` ⇒ 引用对象只能是她自己；措辞与 group-welcome 四轮迭代的结论一致）；新增 `maisaka.planner.before_request` 钩子在**触发成功后的 180 秒窗口内**、只对**那一个会话**追加系统级规则，其他场合的正常引用不受影响，形态不匹配时打 warning（「注入了但没生效」必须留痕）。**③ 修掉一条会自爆的测试**：`test_group_welcome_contract` 把 `now` 写死成 `1791174000.0`，而上游按 `cutoff = time.time() - since_seconds` 过滤 ⇒ 墙钟走过 24 小时后第二条成员掉出窗口、断言 `== 2` 变 1（2026-10-06 正是这样红的，与本次改动无关）；改成相对墙钟的偏移并写明原因。新增 `tests/test_world_card.py`（16 条）+ `tests/test_proactive_no_quote.py`（15 条：纪律在代码层 / intent 携带 / 注入窗口内才发生 / 过期与异会话不注入 / 同一请求幂等 / `modified_kwargs` 必须是**完整** kwargs / 触发成功才开窗 / 窗口表会清理 / 缺会话键且窗口开着时告警一次）。**④ 借鉴 [`XXXxx7258/idle_proactive_chat`](https://github.com/XXXxx7258/idle_proactive_chat)（MIT）补四处主动开口质量**：`priority="low"`（主动找话说不再抢占更高优先级的主动任务，例如 group-welcome 的新人欢迎语）／`reason` 改**人话**、结构化信息挪进 `metadata`（`reason` 会被宿主日志与 WebUI 显示，塞 JSON 没人看得懂）／触发前用 `maisaka.context.append` 写一条**世界内**的「来由事实」（「她主动开口了，不是在回复谁。她现在的活动：…」，配置项 `inject_context_fact`，失败或被宿主拒绝只降级并告警一次、绝不拦住开口）／**首装与 `/生活 重置` 后用 `message.get_by_time_in_chat`（`filter_mai=True, filter_command=True`）补「对方上次说话」基线**（每个会话只补一次、每轮最多 3 次、连续失败 3 次停手并告警）——没有这一步，`last_user_message_at` 首装当天全为 0，「对方刚说过话」这道闸形同不存在，她可能在一个刚还在热聊的会话里突然开口。新增能力声明 `maisaka.context.append` / `message.get_by_time_in_chat`。拆解与取舍见工作区 `idle_proactive_chat借鉴分析.md`（含**刻意不采纳**的两条：群聊退避、`chat.open_session` 开新会话）。全量 726 → **744** 条通过；`check_plugin` **40** PASS / FAIL 0；冒烟 PASS |
-| 1.8.0 | **外面的世界：接四个上游插件的只读 API（`[world]`，默认开、每源可关）+ 一处真机加载缺陷**。新增 `life_world.py`（纯模块，照 `life_economy` / `life_social` 的写法）：契约解析（四源各一个 `parse_*`，坏结构一律降级为 `reason` 而不是抛）、事件规范化（`kind/label/emotion/energy/at/key`）、入库（去重、每日条数与情绪额度、睡眠策略）、状态卡文案。事件四类：UP 主开播了（`bilibili-live-gateway.get_live_status`）／UP 主发了新视频或新动态（`bilibili-dynamic-push.get_recent_pushes`）／群里来了个新人（`group-welcome.get_recent_newcomers`）／有人聊到了《X》（`cv_lyric_context.get_recent_songs`），订阅表（`get_subscriptions`）只进状态卡。四条纪律：① **每源独立降级**——未安装／未升级／超时（每源 5 秒）／坏结构都只少那一类事件，四源全挂时退避重试且只告警一次；② **外部世界不能挤掉她自己的生活**——每日 `max_events_per_day`（6）条、情绪 `daily_emotion_cap`（1.0），用完只记事；③ 睡眠中照常记录但不产生情绪增量；④ 外部文本走 `life_events.sanitize_text` + 限长。新增状态字段 `world_seen` / `world_daily`（`state_version` 不变、旧状态零迁移）。**三条数据边界写进 README**（不是缺陷）：新人没有昵称（上游只落盘 QQ 号 + 时间戳，事件只能写「群里来了个新人」）、开播没有开始时刻（按生活日去重）、歌曲按「一次命中」去重（键带命中时刻，同一天反复聊到会各记一次）；上游手动 `/dyn test` 走 `record=False`，不会产生假的世界事件。**真机加载缺陷（冒烟测试抓到）**：`life_world.py` 最初写的是平铺导入 `from life_events import sanitize_text`，而真机是**包式加载**（插件目录不在 `sys.path` 上）⇒ 相对导入抛 `ImportError` 后平铺兜底也失败，`tests/smoke_test.py` 立刻红（`PASS=65 FAIL=0` → `ModuleNotFoundError: No module named 'life_activity'`）；已改为仓库统一的 `try: from .life_events import ... except ImportError: from life_events import ...` 双路径，并把 `life_world` 登记进冒烟的 `FLAT_MODULES` 泄漏检查。**契约测试 4 份**（`test_bilibili_live_contract` / `test_group_welcome_contract` / `test_bilibili_dynamic_contract` / `test_cv_lyric_contract`）：直接加载上游源码、调真 `@API` handler，每个覆盖 结构契约（public + version 1 + handler 名）/ 正常返回 / 空与坏数据降级 / **只读性**（调用前后对方状态与文件不变）。两个落地坑已避掉：上游目录**不能留在 `sys.path` 上**（上游也有 `plugin.py`，而本仓库 `test_plugin_helpers.py` / `test_interop.py` 会裸 `import plugin as P`）⇒ 测试用「临时插路径 → 取兄弟模块句柄 → 立刻撤」；`fakehost` 在两个插件里同名 ⇒ 契约测试一律用最小 ctx 替身。另按新维度**加强** `test_economy.py::test_sim_tick_refreshes_economy_before_asking_the_model` 的顺序断言（按 API 名分辨调用，并断言四个世界源同样发生在活动决策之前），原断言把所有 `api.call` 都当成经济取数、已不成立。全量 682 → **707** 条通过；`check_plugin` 39 PASS / FAIL 0；冒烟 65 PASS / FAIL 0；`check_submission` FAIL 0 |
-| 1.7.1 | **把「选这个活动会影响什么」如实告诉模型**（活动决策提示词新增一节，默认 8 行事实）。起因：模型此前**完全不知道后果**——我在真提示词里数过，「频率 / 因子 / 倍率」出现 **0 次**，它只知道 15 个活动的名字与中文标签，加上「睡眠时段 / 最短停留 / 每日清醒」三条约束。后果有两处：① 你把 `[activity] activity_factors` 改成什么样（尤其 `replace` 模式）都与它的选择无关；② 它不知道 `sleep` 意味着彻底静默、熬夜会压体力上限、感冒从哪来。现在每轮多一节 `【这些选择会影响什么】`：体力每小时增减（逐活动，取自 `SimConfig.energy_delta_per_hour`，即 `settle` 用的同一张表）／情绪回归速率与事件概率／今日已睡·清醒的记账与上下限／睡觉怎么结束／熬夜与体力上限／感冒概率与持续／作息班表（仅启用时）／钱与活动无关（仅在有经济提示时）／「睡觉＝完全静默」（`wake_on_at` 开着就说「被 @ 会临时醒来一次」，关着就说「连 @ 也不回」）＋「其余活动最多相差约 N 倍」。**数值全部从配置现算、一个都不写死**：提示词印一个和实现不同的数比不印更糟（模型按错因果选择、`enforce` 按真值收口，两边永远对不上），用户改 `fire_probability` / `max_sleep_hours` 等提示词必须跟着变（`test_effect_lines_track_config` 用整份换配置反向验证）。另配一句纪律「请按生活合理性选活动，不要为了数值挑活动」——把「睡觉 +1.20/小时」交给模型而不配这句，等于请它刷数值。**刻意不给**活动→倍率的数值清单（只说「睡觉＝静默」与「最多相差约 N 倍」），列出来会诱导「为了少说话而挑活动」。用例：`test_effect_lines_track_config` / `test_effect_lines_state_the_at_wake_and_money_facts` / `test_effect_lines_quote_the_activity_factor_range_not_a_hardcoded_one` / `test_effect_lines_render_with_discipline_header` / `test_effect_lines_are_optional_and_sanitized`（伪造分节符被中和）/ `test_activity_prompt_discloses_choice_effects_from_live_config`（断言 `ctx.llm.generate` **实际发出的 prompt**，不是自拼模板）。代价：每轮多 **722 字 / 9 行**（默认配置实测，≈500 token 量级），默认 600 秒一轮 ⇒ 约 **7 万 token/日的输入增量**，嫌贵调大 `[activity.llm] min_interval_seconds`。**行为零变化**（只改提示词，倍率算法与强制层未动）。全量 676 → **682** 条通过 |
-| 1.7.0 | **睡眠时被 `@` 唤醒（`[simulation] wake_on_at`，默认开）+ 一处真机才暴露的载荷缺陷**。起因：真机 1.3.2 的判定顺序是「先判频率是否静默（`turn_trigger/scheduler.py:57`）→ 再判 `@` 强制触发（`:65`）→ 最后才是概率门/计数门（`:80`/`:94`）」，而 `_handle_silent_turn` 在静默轮里第一件事就是 `_clear_forced_turn_state()`（`reasoning_engine.py:1197`）——所以倍率为**精确 0** 时，睡眠期间连 `@` 都进不了 Planner（状态卡却只显示「睡觉」）。现在：`chat.receive.after_process` 钩子检测到「正睡着 + 被 `@`」时写一条临时清醒窗口（新增 `LifeState.at_wake_until`，`state_version` 不变、旧状态文件零迁移、坏时间戳净化）并**立刻**下发清醒倍率。三条设计约束：① **必须在钩子里写** —— 钩子（`bot.py:812`）先于 `runtime.register_message()`（`:923` 武装 `@`、`:935` 调度）返回，等下一轮巡检（≥ `apply.interval_seconds`）那条消息早被静默轮吃掉；② **只开窗口、不改 `state.activity`** —— 她仍在睡（睡眠记账照常，主动开口照旧被睡眠硬闸挡着），窗口一过自动回到 0，不需要额外写入或定时器；③ **只认 `@`**（提及不唤醒，与宿主 `mentioned_bot_reply` 默认 false 对齐），`[frequency] quiet_hours` / 暂停 / `[apply]` 范围优先于一句 `@`（否则会出现「写一个 0 出去、卡片却说被唤醒」的自相矛盾）。配套：状态卡与 `/生活 频率` 显示「被 @ 唤醒：清醒到 HH:MM」，注入提示词补一句「她本来在睡、刚被 @ 吵醒」避免语气失真；`_apply_sweep` 的单会话写入抽成 `_apply_one_session`，唤醒与巡检共用同一份**自证记账**（`applied`/`observed`）——否则与 budget-pacer 的乘性合成会在两条路径上漂移、倍率被乘两次（守备用例 `test_wake_keeps_compose_bookkeeping_single_written`）。**顺带修真机缺陷**：`note_session` 原来只从 Hook 载荷顶层读 `group_id`/`user_id`，而宿主把群号/QQ 号嵌在 `message_info.group_info` / `message_info.user_info` 下（`plugin_runtime/host/message_utils.py:412-450`），真机上 `_seen_sessions` 这两个字段恒为空串、`[apply]`/`[proactive]` 的 `group:xxx`/`private:xxx` 兜底匹配悄悄失效（本地夹具用平铺键，所以一直绿）；现在统一走 `life_social.session_ids`（平铺与嵌套都认），`is_at` 判定与社交信号也统一到 `flag_value`。`silence_floor` 文案同时订正为「任何模式下 `@` 都会穿透」。用例新增 10 条（唤醒/不唤醒/提及不唤醒/quiet_hours 与范围优先/窗口顺延不重复写/过期回睡/关闭开关与 `wake_minutes=0`/演算模式不写/卡片与提示词显示/嵌套载荷取名），全量 664 → **674** 条通过；反向验证：关掉 `wake_on_at` 后核心断言「写入 > 0」立刻失效。⚠ 真机时序未联调，见「已知限制」 |
-| 1.6.1（文档订正） | **把「`silence_floor > 0` 会漏 `@`」的范围写对**（来源：1.3.2 源码复核）。旧文案（配置字段说明与 README「静默是有代价的」）只在 `reply_necessity` 那一行点了 `@` 穿透，容易读成「动态门/计数门不漏」。实际宿主的判定顺序是**先判静默（`turn_trigger/scheduler.py:57`）、再判 `@` 强制触发（`:65`）、最后才是概率门与计数门（`:80`/`:94`）** ⇒ 只要倍率不是**精确的 0**，任何模式下 `@` 都会进 Planner，且不受 `talk_value` 与动态门概率影响；`_handle_silent_turn` 反过来在静默轮里第一件事就是 `_clear_forced_turn_state()`（`reasoning_engine.py:1197`），把 `@` 刚武装的强制轮抹掉——这就是「睡就是睡」能压住 `@` 的唯一原因。同时订正两处过时引用：静默分支的 1.3.2 行号（`turn_scheduler.py:90` → `turn_trigger/scheduler.py:57`）、1.6.0 行里 `@` 的预期回复数（0.9 → **0.91**，与源码 `FORCED_TURN_EXPECTED_REPLIES` 一致）。**纯文档改动，行为零变化**（仍默认 `silence_floor = 0.0`） |
-| 1.6.0 | **适配 MaiBot 1.3.2 + 体力回满立刻唤醒**（两件都是真机需求）。**① 动态触发模式（`dynamic`）**：MaiBot 1.3.2 把 `reply_trigger_mode` 收紧为 `Literal["frequency", "dynamic"]`——**必要性回复（`reply_necessity`）被动态门取代**（`src/maisaka/turn_trigger/` 下只剩 `gates.py` 的计数门与 `dynamic_gate.py` 的动态门，`reply_necessity.py` / `turn_gates.py` 均已不存在）。旧插件读到 `dynamic` 会**静默退回计数门**（曲线选错、状态卡印错结论、无任何告警）。现在：`life_host_model` 增加 `MODE_DYNAMIC` 与三值识别（保留 `reply_necessity` 以兼容 ≤1.3.1 的宿主），复刻动态门的**静态阈值表** `_STATIC_KEEP_RATIO_THRESHOLDS`（`0.1→0.605 … 1.0→0`，段内线性）与 `keep_ratio = min(1, max(0, 生效频率))`；`trigger_threshold` 明确「1.3.2 的 `_get_message_trigger_threshold` 不分模式」（动态门下条数只进宿主日志与等待节奏）；`plain_chatter_messages_needed` 在动态门下返回「不适用」；`preview` 输出 `probability_gate` / `dynamic_keep_ratio` / `dynamic_static_threshold`，`/生活 频率` 改为印「条数门槛（仅供对照日志）+ 目标回复比例 + 静态概率门槛」，不再报「纯闲聊需要几条」。**语义澄清（写进 README）**：动态门下倍率是「1 小时窗口内的目标回复比例」，**≥1 即全放行、没有上行空间**（想更活跃要调宿主的 `talk_value`），倍率只负责往下压；群聊走概率门、**私聊不适用**（有新消息直接进 Planner）；`@` 强制触发按 0.91 次预期回复计入窗口。**② 三套曲线**：`[emotion_energy.curves]` 新增 `dynamic` 组（默认与另外两组同曲线，可独立调），`[frequency] mode_source` 也可强制 `dynamic`（此前白名单只有 frequency / reply_necessity，写 dynamic 会被忽略）。**③ 体力回满立刻唤醒**：`_energy_full_wake` 去掉「且本次睡眠已满最短时长」的附加条件——真机状态卡实拍「体力 10.0/10、本次睡眠已持续 73 分钟仍在睡」，而那段时间不恢复任何东西。已知代价写进配置说明：满体力时模型若仍反复提议睡觉且处于睡眠窗口内，会出现「睡下→下个推进间隔被唤醒→再提议睡」的短周期往复，不想要就关 `[simulation] energy_full_wake`。`request_is_pointless` 复用同一函数，`ALLOWED_ACTIVITIES` 穷举对拍自动守住等价性。**④ 顺带订正上一轮审查发现的文档漂移**：`reply_necessity` 的纯闲聊不可达边界由「约 0.35」改为实测的 **0.38 不可达 / 0.39 可达（35 条）**；体感表里 0.43 的「约 25 条」改为实测 **27 条**。对照源码：`docs.mai-mai.org` 的配置文档与更新日志（更新至 2026-09-29）尚未收录 1.3.2，本插件的契约直接取自 GitHub `Mai-with-u/MaiBot` **1.3.2 tag**（[releases](https://github.com/Mai-with-u/MaiBot/releases/tag/1.3.2)）。 |
-| 1.5.2 | **主动开口独立白名单（`[proactive] filter_mode` / `target_chats`，默认 `all` / 空）**：此前主动开口与频率干预共用 `[apply]` 的范围——想让指定群/私聊能被主动搭话，就必须把整个插件的白名单一起收窄。现在 `[proactive]` 有自己的范围闸，语义是**在 `[apply]` 总闸内再收窄**（最终范围 = 两者交集）：频率照旧管全部会话、只让指定会话能被主动搭话成为可能。语法与 `[apply].target_chats` 完全一致（`"group:群号"` / `"private:QQ号"`，`filter_mode` 取 all/whitelist/blacklist）；非法值按最保守的 whitelist 回退并告警一次（沿用 v1.1.1 的「保守但绝不静默」纪律），whitelist 为空 = 不在任何会话主动开口（告警一次）。实现上把 `_target_matches` 抽成 `_matches_scope` 公共实现，`[apply]` 行为零变化（原有告警键与文案语义保留）；`_maybe_proactive` 过 apply 总闸后再过 proactive 闸；状态卡显示当前范围（`主动开口：已启用（范围：白名单 N 个）`）。默认值下行为与 1.5.1 逐位一致。用例：白名单命中/不命中、与 apply 总闸的交集、黑名单、非法值回退、默认 all 等价性（`tests/test_interop.py::test_proactive_scope_*`）。顺带记录一个测试脚手架事实：`tests/fakehost.py` 对未接住的能力会**双记** `host.calls`（`ScaleHost.rpc_call` 记一次、落穿的 `FakeHost.rpc_call` 再记一次），断言触发条数需去重（`_proactive_triggered` 辅助函数），产品侧无此问题 |
-| 1.5.1（审查修复） | **两处数值修复 + 一处文档订正，全部有真机数据与仿真证据**（2026-10-03 审查）。**① 每日睡眠上限不再被多相小睡软化（`_must_wake`）**：旧条件是「日累计到上限 **且** 当前一觉也满最短时长」——真机实拍（多相小睡 + 12:00 生活日边界）日累计 11:47 就到 720 分钟，但当前一觉才 82 分钟（部署配置 `min_sleep_minutes=120`），唤醒被否决后拖过 12:00 边界、计数被清零，当天的上限账整段蒸发，**账本实测一天睡 12.8 小时**。现在「单次连续睡眠或日累计，任一到达上限即唤醒」；单次睡眠的最短时长保护仍属于普通唤醒路径与 `energy_full_wake`，锚点不可信时退回日累计的 v1.1.1 兜底不变；`request_is_pointless` 直接复用同一函数，等价性由 `ALLOWED_ACTIVITIES` 穷举对拍守住（回归用例：`test_enforce_daily_cap_wakes_even_when_current_nap_is_young` / `test_enforce_daily_cap_under_keeps_young_nap_sleeping`）。**② 养病事件池补 3 条（`鼻塞` −0.5 / `退烧了` +0.8 / `有人送药` +0.6）**：旧池只有 2 条全负价（嗓子疼 −0.8、出了身汗 −0.4），事件抽取是均匀分布、40%/tick 触发 → 情绪冲击 −0.24/tick，大于 0.2/tick 的回归速率——**仿真实测感冒期间情绪 mean 1.89/10、中位 1.0、p5=0.0，病愈后 24h 余波继续 −0.6**（`afterglow_cap=±0.6` 防的是余波，防不住事件流本身）。补后池均价 −0.06，仿真感冒情绪 **mean 1.89 → 4.03、中位 1.0 → 4.2**，偶发低谷可自行恢复、不再永久钉地板；「感冒时话少」仍由健康因子 0.3 出一次。**曾试过只加两条正价（池均价 +0.05）的版本**：仿真里感冒情绪反而漂到 mean 5.8、p95 9.4——病中狂喜同样失真，负一票。守卫用例 `test_sick_rest_pool_not_all_negative`（池均价 ≥ −0.2 且至少一条正价）。内建库 52 → 55 条。**③ 文档数字订正（审查复算）**：`reply_necessity` 模式倍率 0.43 的纯闲聊可达条数实际为 **27 条**（README 误写 25；「40 条左右更长的消息」与任何消息长度都对不上——每条 ≥4 字时压力分主导，恒为 27 条）；纯闲聊不可达边界实际是 **0.38**（0.39 可达需 35 条），不是「约 0.35」；事件产出率连续运行实测 **26.9 条/日**（真机 2026-10-03 快照，45 条/1.67 天），300 条留存 ≈ **11 天**而非 15.9 天，「远（14 天内）层首次真正有货」仅在真机停机较多的口径下成立。审查其余结论：宿主公式复算（触发阈值表、@ 穿透 85/75、6.1 倍联合摆幅、8.5→1.13→1.02 等 24 项）与真机 `/生活 频率` 读回逐项一致。 |
-| 1.5.0（本地修改） | **`recent_events_keep` 开放为配置项**（`[activity.llm]`，默认 **300**；v1.4.0 及以前固定 40 条 ≈ 2.1 天）：状态文件里保留多少条近期经历（事件库与社交经历共用这个池子），提示词的近/中/远三层都从这里取。按事件约 18.9 条/日估算，300 条 ≈ 15.9 天，**「远（14 天内）」层首次真正有货**；`0` = 不保留任何经历，负数夹到 0。接线在 `_sim_config()`（`SimConfig` 默认值同步 300），WebUI「活动模型调用参数」分组出现「经历留存条数」字段；schema 断言与映射用例同步更新（`tests/test_schedule.py`）。另修正 README 配置表 `timeout_ms` 默认值（v1.3.1 代码已改 120000，表格漏更 20000）。**③ 体力满强制唤醒（`[simulation] energy_full_wake`，默认开）**：睡眠中体力恢复到**动态上限**（连熬 3 晚后是 8.5）且本次睡眠已满最短时长（180 分钟）就强制唤醒（感冒醒到养病）——睡觉的目的是恢复体力，满了继续睡只是空转，此前她带着满体力也要睡到 12 小时上限或等模型自觉；`request_is_pointless` 同步镜像（体力满时「问了也白问」，跳过模型调用），等价性由 `ALLOWED_ACTIVITIES` 穷举对拍测试守住。**④ 素材保鲜相位（G2，`[events] material_best_ratio`/`material_decay_floor`，默认 0.5/0.25）**：TTL 的前半是全额权重，之后线性衰减到下限、到过期触底——衰减而非清零，放旧的念头在主动开口候选里自然排到队尾（借鉴 astrbot_plugin_private_companion 的三段式时效思想，仅思想层）；素材加成从按条数改为按**有效条数**折算，`/生活 频率` 拆解与状态卡同步口径；旧状态里的素材条目无 `best_until` 视为全额新鲜（零迁移）。**⑤ 未回应降温度（G1，`[proactive] unanswered_backoff_factor`/`unanswered_backoff_max_streak`，默认 2.0/4）**：私聊里对方连续不回应时，主动开口最小间隔按 ×2^连击 拉长（封顶 ×16 = 48 小时），对方一回话立即归零；群聊与判不出类型的会话维持现有硬闸；连击记进会话记录（`unanswered_streak`，`state_version` 不变）。**连击上限默认取 4 而不是 3 是实测出来的**：硬闸顺序里 `daily_max` 在 `interval` 之前，默认 `daily_max=1` 时封顶 24h 的退避永远不是约束条件（8 天模拟的间隔序列与不开退避**逐位相同**，全是 24h），而且刚好卡在 `elapsed < interval` 边界上、行为取决于当天开口的钟点；封顶 48h 才让「连续 3 天不回应 → 隔天一次」成为确定性结果（每小时一个 tick、连跑 10 天、对方始终不回应，实测间隔序列 `[23, 24, 24, 48, 48, 48]`：前三天每天一次，之后稳定隔天一次）。退避档位写进 `ProactiveDecision.backoff` 并按 `interval×N` 复合键记入沉默台账，`/生活 为什么` 能答出「距上次主动太近 ×4：N 次」而不是笼统一个原因——否则退避是静默生效的，用户无从判断她在正常冷却还是已被降温。另：素材加成说明改为「按有效条数计」、`iter_material_texts` 补齐 `floor` 参数（G2 的口径一致性）。另：`recent_events_keep` 版本号 1.4.0 → 1.5.0 |
-| 1.4.0 | **① 分层经历换挑法（P0）**：`recent_event_tiers` 新增 `pick` 参数，默认 `smart` = 层内按情绪/体力的**变化量**排序（让「她此刻状态的成因」优先于「刚刚发生的小事」）+ 同标签**每层内**去重（`recent_max_per_label`，默认 1）+ 空层配额回收给有货的层；`pick="recent"` 一字不差回退旧行为。实测（14 个生活日、336 次观测、真实事件库）：**最强情绪成因命中率 26% → 98%**、最强 3 条覆盖 17% → 63%、情绪捕获 18% → 31%、不同标签 5.35 → 7.24、填满位置 5.81 → 7.79（旧写法下「远」层恒空 —— 留存 40 条 ÷ 18.9 条/日 ≈ 2.1 天，永远够不到 3 天）。**② 社交经历（`[social]`，默认关闭）**：把 `better-diary` 新增的只读 API `get_day_digest`（选材事件：谁 / 做了什么 / 原话）与入站消息钩子的**无原文**信号（「有人找我」）接成她的经历。新增 `life_social.py`（纯模块：契约解析、信号提取、聚合、每日情绪额度、去重、睡眠规则）与 `LifeState.social_seen` / `social_daily`（新增字段，**`state_version` 不变**）。三条闸：按会话/条数收敛（一个活跃群几百条消息 → 至多一条「有人找我」；摘要每天至多 3 条）、每生活日情绪总额度（`daily_emotion_cap`）、**睡眠中照常记录但不产生情绪增量**。区分「对方按契约答了但没内容」（正常，不告警不退避）与「答的不是这个契约」（故障，退避 + 只告警一次 + 卡片显示「未取到」）。状态卡新增「社交经历」两行。契约由 `tests/test_better_diary_contract.py` 直接加载对方源码调真 API 钉住。另修两处 latent 缺陷：`plugin.py` 的**平铺兜底分支是死代码**（一个 `try` 配了两个 `except ImportError`，第二个 `except` 永远不会执行 ⇒ 脚本直跑/平铺加载时 `life_factors`/`life_sim` 等根本没被导入）；`life_social` 的去重表净化会把 `"abc"` 当成 `0.0` 收下（改为只认真正的数字）。另把 WebUI 配置页做成能看的：可视化模式原本**不渲染字段说明**（`FieldRenderer` 只输出 label/hint/placeholder），现把全部字段说明补进 hint、三个默认关闭的功能节（主动开口/班表/社交经历）默认收起、成句的自由文本字段（岗位/在岗场景/生日素材）改多行输入、给枚举型与格式敏感字段补了 placeholder（`recent_pick_mode` 里 SDK 不认的死元数据 `options` 一并清掉）。另新增 `[activity] factors_mode`（默认 `merge`，存量配置零影响）：`replace` 模式下活动因子表以配置为准、**不再按内置补齐**——删掉的内置因子保持删除（该活动按 1.0），内置有而列表缺的键告警提醒一次（防未来版本新增活动静默失效），`sleep` 缺失单独点名（那是「睡觉即静音」的硬闸）；空表在 replace 下尊重为全部中性，merge 下仍整体回退内置表。顺带修正 README 配置表里 `reseed_after_hours` 的默认值（1.3.2 已改 8，文档还写着 24） |
-| 1.3.2 | **熬夜判据换成「最近 24 小时滑动窗口」**（`[health] sleep_debt_threshold_minutes` 的语义随之变为「最近 24 小时累计睡眠低于它就算没睡够的一夜」）。旧判据看「本生活日累计睡眠」，而生活日边界默认在 12:00：一段跨边界的睡眠会被两个生活日各记一半，于是边界那次结算会把**没睡完的觉**当成一整夜。真机 2026-10-02 实拍：她 08:00 睡下、睡到 16:00（整段 8 小时，明明睡够了），12:00 边界只看到 08:00→12:00 这 4 小时，于是判了「连熬 1 天」并写进卡片与提示词。新判据改为**睡醒时**用 `sleep_started_at → now` 的整段时长结算，累加「最近 24 小时窗口**内实际发生**的睡眠」（按每段与窗口的**交集**求和——不能按「结束时间落在窗口内」相加，否则相邻两夜相隔约 24 小时会把上一整夜吃进来，每天只睡 4 小时的人也会显示 8 小时、熬夜永远攒不出来）。新增 `LifeState.sleep_ledger` 滚动账本（条目级净化，坏条目丢弃；`state_version` 未变，旧状态文件照旧加载，部署后第一觉从空账本开始）。顺带修掉「拆成两段睡要看边界脸色」：3 小时 + 3 小时现在必然合起来算。另：`[activity] reseed_after_hours` 默认 **24 → 8**（时段表槽位只有 1~3 小时宽，24 小时能让她在同一个活动里跨过全部 9 个槽位），并把**停机时间排除在「多久没交作业」之外**——原锚点是 `last_tick_at`，而它在每 tick 末尾都会被刷成 `now`，以致 `llm_last_success_at == 0` 的旧状态下兜底永不触发，现退到 `activity_since`。另清理两处残留：`should_reseed` 的死参数 `config`、`LifeState.activity_seed_at`（只写不读，与 `llm_last_success_at` 重复；旧 `life_state.json` 里的同名键会被 `from_dict` 忽略，`state_version` 不变、状态不清零）。另新增 `[activity.llm] persona_max_chars`（默认 **600**）：喂给活动决策的人设字数上限，超出部分**静默丢弃**——原先这个 600 是写死的，人设长了既没有提示也调不了；现在可配，且**改完立刻生效**（读取人设时不再截断，只在拼提示词时按上限截），填 0 = 不带人设省 token。活动决策是高频调用（默认每 10 分钟一轮），所以人设调大要留意每轮输入 token。另新增 `[activity.llm] skip_when_forced`（默认**开**）：当「无论模型答什么都只会保持当前活动」时（活动未满最短停留时间**且**此刻不会睡，或睡眠未满最短时长）就不再问模型。裁定结果与问了**完全一致**（`tests/test_activity.py` 里有一条对 `ALLOWED_ACTIVITIES` 穷举对拍的用例守着这个等价性），只少刷新一句场景文字；状态来源单独标成「本轮未问模型（问了也只能保持）」，**不会伪装成模型故障**。按默认作息估算约省一半调用 |
-| 1.3.1 | **真机事故（2026-10-02）修复**，四条：① **确定性层只会否决、不会发起睡眠** —— `enforce` 在「模型没有有效输出」时提前返回「保持当前活动」，于是模型连续失败时她会一直卡在当前活动里（只能等 `reseed_after_hours`，默认 24 小时）；现在这里会先判一次入睡条件，够格就由硬约束送她入睡（与「睡太久强制唤醒」对称）。② **`timeout_ms` 的语义写对了**：它被 SDK 转成 `cap.call` 的 RPC 超时，覆盖宿主侧整条模型回退链的总耗时，不是单个模型的超时 —— 默认值 20000 → 120000，配置说明改写，并在超时失败时给一次性可操作提示（旧默认 20 秒在真机上连续 8 次 `[E_TIMEOUT]`，而同期一次成功调用实测 19 秒）。③ **停机间隙不再记账**：新增 `[simulation] offline_gap_minutes`（默认 30 分钟，写 0 关闭），超过它就不逐 tick 补算 —— 补算会把停机时间整段算成当前活动的时长（真机上一次 10.6 小时的停机把 `awake_minutes_today` 从 216 顶到 859，凭空打开了「每日清醒下限」），还会在非边界时刻触发 `_settle_day` 清零计数器、反过来锁死睡眠资格；现在只推进生活日、跨边界时重置计数器且不判熬夜，并留一条 warning 说明过了多久。④ **健康优先**：生病或体力低于入睡阈值时，睡眠不再被「每日清醒下限」拦住（该取向本就写在 `life_activity.py` 的模块说明里，只是实现把下限放在了前面）。另：状态卡补「模型状态：连续失败 / 冷却剩余 / 最近一次原始输出」（仅异常时出现）、`今日已睡/清醒` 标注「本生活日已记账」 |
-| 1.3.0 | **作息班表（`[schedule]`，默认关闭）+ 工作表活动 + 近期经历三层**。① 班表：把「工作日 / 上下班时段 / 午休 / 岗位职责」写进活动提示词，强制层按「相位 × 活动」矩阵守住作息（在岗不该在通勤/午休/睡，路上不该在工位上），冷启动与 `mode=rules` 在班表相位改用作息表；② **工作表活动**：活动枚举从 9 项扩到 15 项（`commute` 0.85 / `work` 0.75 / `meeting` 0.5 / `overtime` 0.45 / `lunch` 1.1 / `off_work` 1.0），修掉「有固定工作的角色只能靠场景文字假装在上班、倍率按错的活动算」；老 `config.toml` 缺这些键时**按内置默认补齐并告警一次**（此前会静默按 1.0）；③ **近期经历改为近/中/远三层**（12 小时 / 3 天 / 14 天，共 8 条按 4/2/2 分配），并把经历时间戳从 UTC 改为本地时区渲染。另修 WebUI 配置页的 `[object Object]`：覆写 `get_webui_config_schema`，把嵌套节提升成「点号路径分组」（`activity.llm`、`emotion_energy.curves.frequency`…），**配置键路径不变**，并加了两条回归守卫（页面不再出现任何 object 字段 + 每个字段按页面写法写回都必须落到真实配置键） |
-| 1.2.0 | **经济维度：把 `budget-pacer` 的真实月度预算接成她的生活费**（新增 `life_economy.py` 与 `[economy]`）：生活费 = 月预算（每月 1 日到账）、每天开销 = 当日真实模型花费、余额 = 生活费 − 本月已花；按余额占比分「宽裕 / 正常 / 紧张 / 见底」，手头紧时把「省着花、犹豫、吃泡面、不主动哭穷」写进活动决策提示词，并显示在 `/生活`。**刻意不参与倍率**——宿主只有一个频率标量，`budget-pacer` 已按预算在压它，再乘一次就是同一原因双重压制。取数走对方 1.1.0 新增的只读 API `get_budget_status`（`api.call`，manifest 已声明），失败/超时/未安装一律降级为「未接入」并只告警一次；契约由 `tests/test_budget_pacer_contract.py` 直接跑对方源码钉住。另修：节奏比只在「花费进度已达 `pacing_from_spend_ratio`」时才升级档位——否则月初时间进度被 `p_floor_days` 兜在 1 天上，「花了 2% 的钱」就能算出节奏比 19，她整个月初都在吃泡面（真机契约测试发现的） |
-| 1.1.3 | 私聊频率显示修正：宿主的基础频率按会话类型取键（`utils_config.py:601-608`，私聊用 `chat.reply_timing.private_talk_value`），v1.1.2 及以前一律按群聊的 `talk_value` 算，私聊卡上的「生效频率」与「纯闲聊要几条」都是错的。现在按会话类型取基础频率，并优先用宿主实测值反推显示（基础频率由宿主实测反推，避免群/私聊取错键） |
-| 1.1.2 | **真机反馈驱动的改动**：真机上 `chat.get_all_streams` 返回 41 个历史会话，加载后第一轮巡检对它们逐个写入，宿主各回一条「无法调整频率，未找到 session_id=… 的聊天流」（静默 no-op），插件要等到第二轮才发现并进退避 —— 既有日志噪音也是空转 RPC。新增 `[apply].only_active_sessions`（默认 `true`）：只干预「见过消息（`state.sessions`）或本来就在管（`applied`/`unbacked`）」的会话，冷启动不再对纯历史会话写入；会话一有消息就在下一轮（≤ `apply.interval_seconds`）被纳入。⚠ 代价：一个从未在本插件运行期间发过消息的会话，它的**第一条**消息会用未调整的宿主频率评估（睡眠/静默因此可能漏过那一两条）。想恢复旧行为把它设成 `false`。另：`/生活 状态` 与 `/生活 频率` 现在显示「写不进去（退避中）：N 个会话（最早约 X 分钟后重试）」，频率卡在「宿主侧实测倍率 ≠ 下发倍率」时给出明确诊断；「死会话退避」日志降为 `info`，连续 3 轮重试都写不进去才升级成一次 `warning` |
-| 1.1.1 | **上线前全检修复**（详见本节末的清单）：① 真机启动路径不再丢掉对账记忆（v1.1.0 会让生活倍率被乘两次且永久留存）；② 连续睡眠上限跨「生活日边界」失效（12h 实际睡成 21h）；③ 状态文件里一个坏条目不再让 `settle`/倍率同步永久抛错（`from_dict` 条目级净化 + 不抛取数）；④ `/生活 频率` 的「纯闲聊要几条」改为按整批长度算内容分（v1.1.0 印错，说 0.58/0.45 不可达，其实 13/21 条）；⑤ `filter_mode` 写错值不再静默失效（告警 + `/生活` 显示命中会话数）；⑥ L3 的随机红修掉（退避用例改比窗口长度，不再是掷骰子）；⑦ `check_plugin.py` 的 `config_version` 与 `dependencies` 两项真空检查改成 AST/类型判定；⑧ `[date].date_factors` 死配置接上（按名称覆盖节日倍率）；⑨ 裁剪守卫改为看全部记忆表 + `state.sessions` 加上界（死会话不再无限增长）；⑩ `nan/inf` 配置不再被静默接受；⑪ 提示词净化补上 `【】「」`；⑫ 裸写「生活 好累」不再被换成用法卡；⑬ `max_adjust` 不再被 `min_adjust`/`silence_floor` 击穿；⑭ 生日格式错/`sleep_window` 解析失败会告警；`*_keep=0` 语义修正、`last_tick_at` 在未来时重新锚定 |
-| 1.1.0 | 与桌面插件集做适配：与 `budget-pacer` 的倍率**乘性合成**（卸载/暂停时归还外部基数而不是写 1.0）、对账记忆单独落盘（`adjust_memory.json`）、「写不进去」的会话自证 + 指数退避、`/生活 重锚` 覆盖离范围的已记忆会话、新增 `[frequency] silence_floor`、`/生活` 正则在两个方向上都不与别的插件互相截胡、`note_session` 改 `BLOCKING+EARLY`。附全部 20 个桌面插件的审计报告（COMPAT.md，该文件后已移出仓库） |
-| 1.0.0 | 首个版本：作息活动（LLM）/ 情绪体力 / 身体 / 日期节日四维 → 倍率 → `frequency.set_adjust`；两套触发模式的曲线自适应；52 条事件库；主动开口（默认关闭） |
+| 1.22.3 | **冷群话头改独占选材**：会话判定为冷时，话头越过权重比较直接进候选（0.55 拼不过事件 0.30–0.85 与关系维护 0.70，「冷了就抛一条」会退化成「几乎永远不抛」）；独占只改选材，静默时段/每日上限/最小间隔/退避/评分闸全部照旧 |
+| 1.22.2 | **冷群搭话 + 群聊退避**：群里安静超过 `cold_group_hours`（默认 2 小时）时，她抛一条**能被回答**的公共话题（吃/睡/追剧/作息），而不是汇报自己的生活；话头只出问句、不暴露「我在活跃气氛」、不 @ 人、同一天同群恒同一条。素材按会话即时生成、不入全局池。同时把未回应退避与连续未回应上限扩到群聊（`unanswered_backoff_group`，默认开）——否则她会在死群里每天准时抛一次、永远没人答 |
+| 1.22.1 | **主动开口分群聊/私聊两套口径**（真机两条实录驱动）：私聊保留「想自然地聊聊刚发生的一件事」，群聊换成「在群里随口说一句」+ 四条约束（一句话 ≤30 字、说态度不汇报事实、**结尾留一个别人能接的落子**、禁编造次数/时长与他人原话）；`decide()` 的 `private_chat` 一路传进 intent，判不出类型按群聊处理 |
+| 1.22.0 | **只读接入宿主长期记忆**（A_Memorix / `knowledge.search`，默认关闭）：记忆只进「主动开口素材 + 关系档案」两处，**不进活动提示词、不进回复摘要、不写回全局素材池**；按 `person_id` + `respect_filter=True` 圈定、串行检索、6 小时懒刷新缓存（失败不缓存）。新增 `life_memory.py` 与 16 条契约测试；`check_plugin` 教会识别 `call_capability("…")` 字面量能力名（此前会把正确声明误报成「多余」） |
+| 1.21.0 | **配置层出仓 + 默认视图治理**：配置模型与 WebUI 元数据搬到 `life_config.py`（plugin.py 9,384 → **7,010** 行）；配置页默认视图 28 张卡片 / 251 字段 → **7 张 / 35 字段**；README 1,728 → **1,074** 行（`docs/config.md` / `interop.md` / `gates.md` 三节外移）。只有展示元数据与文件位置变化，**配置键一个都没动** |
 
 ## 许可
 

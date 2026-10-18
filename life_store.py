@@ -30,12 +30,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 #: schema 版本。改表结构时 +1，并在 ``_migrate`` 里补迁移步骤。
-SCHEMA_VERSION = 1
+#: v2（2026-10-16，Y4）：``relationships`` 主键由 ``user_id`` 改为 ``person_id``。
+SCHEMA_VERSION = 2
+
+#: 默认平台。载荷没给 ``platform`` 时用它，也是 v1 关系数据的迁移假设。
+DEFAULT_PLATFORM = "qq"
 
 #: ``routine_daily.fired`` 的三态：0 当日未定论 / 1 已命中 / 2 当日已放弃（权重未中）。
 #: 「已放弃」必须与「已命中」分开存，否则权重没中的那一行会在窗口内被反复重掷，
@@ -49,7 +54,9 @@ _DEFAULT_CONNECT_TIMEOUT = 5.0
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS relationships (
-      user_id TEXT PRIMARY KEY,
+      person_id TEXT PRIMARY KEY,
+      platform TEXT NOT NULL DEFAULT 'qq',
+      user_id TEXT NOT NULL DEFAULT '',
       first_seen_at REAL NOT NULL,
       last_interaction_at REAL NOT NULL,
       interaction_count INTEGER NOT NULL DEFAULT 0,
@@ -70,6 +77,8 @@ _SCHEMA_STATEMENTS = (
 )
 
 _RELATIONSHIP_FIELDS = (
+    "person_id",
+    "platform",
     "user_id",
     "first_seen_at",
     "last_interaction_at",
@@ -79,21 +88,72 @@ _RELATIONSHIP_FIELDS = (
     "shared_events",
 )
 
+#: ``_RELATIONSHIP_FIELDS`` 对应的默认值（``put_relationship`` 与 MemoryStore 共用）。
+_RELATIONSHIP_DEFAULTS: tuple[tuple[str, Any], ...] = (
+    ("person_id", ""),
+    ("platform", DEFAULT_PLATFORM),
+    ("user_id", ""),
+    ("first_seen_at", 0.0),
+    ("last_interaction_at", 0.0),
+    ("interaction_count", 0),
+    ("familiarity", 0.0),
+    ("relation_hint", ""),
+    ("shared_events", 0),
+)
+
+
+def person_id_for(platform: object, user_id: object) -> str:
+    """``(platform, user_id)`` → ``person_id``（v1.20.0，Y4）。
+
+    复刻宿主 ``src/person_info/person_info.py::get_person_id``：
+
+    ```
+    platform 形如 "webchat-abc" 时取 "-" 后半段
+    person_id = md5(f"{platform}_{user_id}")
+    ```
+
+    **为什么要对齐宿主算法**：对齐之后本表与宿主的人物画像（A_Memorix 等）用的是
+    同一个 ``person_id``，两边可以直接 join，不需要额外的映射表。
+    代价是**与宿主算法耦合**——宿主若更换该算法，本表历史数据会对不上
+    （这条代价写在 README「已知限制」里，升级宿主大版本时要核对）。
+
+    认不出人（``user_id`` 为空）返回空串：调用方据此跳过建档，宁可不记也不记错人。
+
+    放在 ``life_store`` 而不是 ``life_relations``：v1→v2 的关系表迁移要在这一层
+    算 ``person_id``，而 SQLite 没有 md5；反过来放会让 ``life_store`` 反向
+    import ``life_relations``，构成循环。
+    """
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        return ""
+    name = str(platform or DEFAULT_PLATFORM).strip() or DEFAULT_PLATFORM
+    if "-" in name:
+        name = name.split("-")[1]
+    return hashlib.md5(f"{name}_{uid}".encode("utf-8")).hexdigest()
+
 
 def new_relationship(
-    user_id: str,
+    person_id: str,
     *,
     now: float,
+    platform: str = DEFAULT_PLATFORM,
+    user_id: str = "",
     familiarity: float = 0.0,
     relation_hint: str = "",
 ) -> dict[str, Any]:
     """一条新的关系档案（字段与 ``relationships`` 表一一对应）。
 
     步 5（关系模型）消费；本模块只负责把它存进去、取出来。
+
+    v1.20.0（Y4）：主键是 ``person_id``；``platform`` / ``user_id`` 是展示与排障
+    用的普通字段（``user_id`` 供脱敏显示，见 ``life_relations.mask_user_id``）。
     """
 
     return {
-        "user_id": str(user_id or "").strip(),
+        "person_id": str(person_id or "").strip(),
+        "platform": str(platform or DEFAULT_PLATFORM).strip()[:32] or DEFAULT_PLATFORM,
+        "user_id": str(user_id or "").strip()[:64],
         "first_seen_at": float(now),
         "last_interaction_at": float(now),
         "interaction_count": 0,
@@ -101,6 +161,66 @@ def new_relationship(
         "relation_hint": str(relation_hint or "")[:64],
         "shared_events": 0,
     }
+
+
+def _migrate_relationships_to_v2(conn: sqlite3.Connection) -> int:
+    """v1 → v2：``relationships`` 主键 ``user_id`` → ``person_id``。
+
+    **为什么要重建表**：SQLite 改不了主键，只能「改名旧表 → 建新表 → 搬数据 →
+    删备份」。整段跑在 ``_init_schema`` 的同一个事务里——调用方只在全部成功后才
+    ``commit``，中途抛异常会整体回滚，不会留下半张表。
+
+    **SQLite 没有 md5** ⇒ 行必须读进 Python 算完 ``person_id`` 再写回。
+
+    **老行的平台无从得知**（v1 不存 ``platform``）：一律按 ``DEFAULT_PLATFORM``
+    处理。本插件实际部署是单平台（QQ），这个假设与现状一致；万一不是，该行
+    下一次互动就会被 ``life_relations.touch`` 按真实 ``platform`` 刷新。
+
+    返回搬迁的行数（供日志）。表不存在、或已是 v2 结构时返回 0（幂等）。
+    """
+
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if "relationships" not in tables:
+        return 0
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(relationships)")}
+    if "person_id" in columns:
+        return 0  # 已经是 v2 结构（例如用户手动降过 user_version）
+
+    rows = conn.execute(
+        "SELECT user_id, first_seen_at, last_interaction_at, interaction_count, "
+        "familiarity, relation_hint, shared_events FROM relationships"
+    ).fetchall()
+
+    conn.execute("ALTER TABLE relationships RENAME TO relationships_v1_backup")
+    conn.execute(_SCHEMA_STATEMENTS[0])
+    migrated = 0
+    for row in rows:
+        uid = str(row[0] or "").strip()
+        pid = person_id_for(DEFAULT_PLATFORM, uid)
+        if not pid:
+            continue  # 认不出人的历史行直接丢弃（本来就无法归属）
+        conn.execute(
+            "INSERT OR REPLACE INTO relationships (person_id, platform, user_id, "
+            "first_seen_at, last_interaction_at, interaction_count, familiarity, "
+            "relation_hint, shared_events) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                pid,
+                DEFAULT_PLATFORM,
+                uid[:64],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                str(row[5] or "")[:64],
+                row[6],
+            ),
+        )
+        migrated += 1
+    conn.execute("DROP TABLE relationships_v1_backup")
+    return migrated
 
 
 class MemoryStore:
@@ -150,28 +270,26 @@ class MemoryStore:
 
     # ---- 关系档案 ----
 
-    def get_relationship(self, user_id: str) -> dict[str, Any] | None:
+    def get_relationship(self, person_id: str) -> dict[str, Any] | None:
         with self._lock:
-            record = self._people.get(str(user_id or "").strip())
+            record = self._people.get(str(person_id or "").strip())
         return dict(record) if record else None
 
     def put_relationship(self, record: Mapping[str, Any]) -> bool:
-        user_id = str(record.get("user_id") or "").strip()
-        if not user_id:
+        pid = str(record.get("person_id") or "").strip()
+        if not pid:
+            # 与 ``LifeStore.put_relationship`` 同口径：能从 (platform, user_id)
+            # 推导就不该静默丢（两个后端的接口语义必须一致，否则「换后端行为不同」）。
+            pid = person_id_for(record.get("platform"), record.get("user_id"))
+        if not pid:
             return False
         with self._lock:
-            self._people[user_id] = {
-                field: record.get(field, default)
-                for field, default in (
-                    ("first_seen_at", 0.0),
-                    ("last_interaction_at", 0.0),
-                    ("interaction_count", 0),
-                    ("familiarity", 0.0),
-                    ("relation_hint", ""),
-                    ("shared_events", 0),
-                )
-            }
-            self._people[user_id]["user_id"] = user_id
+            row = {field: record.get(field, default) for field, default in _RELATIONSHIP_DEFAULTS}
+            row["person_id"] = pid
+            row["user_id"] = str(row.get("user_id") or "")[:64]
+            row["platform"] = str(row.get("platform") or DEFAULT_PLATFORM)[:32] or DEFAULT_PLATFORM
+            row["relation_hint"] = str(row.get("relation_hint") or "")[:64]
+            self._people[pid] = row
         return True
 
     def top_relationships(self, limit: int = 3) -> list[dict[str, Any]]:
@@ -199,9 +317,9 @@ class MemoryStore:
                 self._people.pop(key, None)
         return len(victims)
 
-    def delete_relationship(self, user_id: str) -> bool:
+    def delete_relationship(self, person_id: str) -> bool:
         with self._lock:
-            return self._people.pop(str(user_id or "").strip(), None) is not None
+            return self._people.pop(str(person_id or "").strip(), None) is not None
 
     # ---- 生命周期 ----
 
@@ -243,13 +361,33 @@ class LifeStore:
 
     # ---- 内部 ----
 
-    def _fail(self, message: str) -> None:
-        self._broken = True
+    def _fail(self, message: str, *, fatal: bool = True) -> None:
+        """记录一次失败。
+
+        ``fatal=False`` 用于**瞬时**故障（等锁超时、库被别的连接锁住、连接暂时开不出来）：
+        这类失败只该丢掉当前这一次操作（fail-open，调用方本来就容忍 ``None``），
+        不该把整个存储标成 ``broken``。
+
+        为什么这条必须区分（v1.21.0）：``_broken`` 一旦置位，``_run`` 就直接返回
+        ``None``——**此后所有落盘都静默失效**（生活状态、习惯日态、关系档案全部不再
+        持久化，直到进程重启）。Windows 上 8 个线程同时开 WAL 库写会撞
+        ``database is locked``，把它当致命错误等于「一次并发冲突 = 整个进程不再记忆」。
+        """
+
+        if fatal:
+            self._broken = True
         if self._on_error is not None:
             try:
                 self._on_error(message)
             except Exception:  # noqa: BLE001 —— 回调不许反过来炸掉调用方
                 pass
+
+    @staticmethod
+    def _is_transient(error: BaseException) -> bool:
+        """SQLite 的锁竞争是**可重试**的瞬时错误，不是库坏了。"""
+
+        text = str(error).lower()
+        return "locked" in text or "busy" in text
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=_DEFAULT_CONNECT_TIMEOUT)
@@ -277,7 +415,11 @@ class LifeStore:
                 current = conn.execute("PRAGMA user_version").fetchone()
                 version = int(current[0]) if current else 0
                 if version < SCHEMA_VERSION:
-                    # 迁移钩子：目前只有 v1（建表），后续版本在这里按 version 逐级升级
+                    # 迁移钩子：按 version **逐级**升级。注意 ``CREATE TABLE IF NOT
+                    # EXISTS`` 对已存在的表是 no-op ⇒ 老库靠这里的迁移改结构，
+                    # 光靠上面那轮建表语句升级不了。
+                    if version < 2:
+                        _migrate_relationships_to_v2(conn)
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
             finally:
@@ -290,20 +432,25 @@ class LifeStore:
         # 慢盘上的写事务会让等待方（哪怕已经挪进 to_thread）挂死到磁盘恢复——
         # 宁可丢这一次记账（fail-open，调用方本来就要处理 None），不拖垮调用方。
         if not self._lock.acquire(timeout=2.0):
-            self._fail(f"{operation}：等存储锁超时（2s），本次操作丢弃")
+            # 瞬时：等不到锁只丢这一次，不把库标成 broken（见 ``_fail`` 的说明）
+            self._fail(f"{operation}：等存储锁超时（2s），本次操作丢弃", fatal=False)
             return None
         try:
             try:
                 conn = self._connect()
             except (sqlite3.Error, OSError) as exc:
-                self._fail(f"{operation}：连不上库（{exc}）")
+                self._fail(
+                    f"{operation}：连不上库（{exc}）", fatal=not self._is_transient(exc)
+                )
                 return None
             try:
                 result = work(conn)
                 conn.commit()
                 return result
             except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
-                self._fail(f"{operation} 失败：{exc}")
+                self._fail(
+                    f"{operation} 失败：{exc}", fatal=not self._is_transient(exc)
+                )
                 return None
             finally:
                 try:
@@ -378,8 +525,7 @@ class LifeStore:
 
         def work(conn: sqlite3.Connection) -> dict[str, Any] | None:
             row = conn.execute(
-                "SELECT user_id, first_seen_at, last_interaction_at, interaction_count, "
-                "familiarity, relation_hint, shared_events FROM relationships WHERE user_id = ?",
+                f"SELECT {', '.join(_RELATIONSHIP_FIELDS)} FROM relationships WHERE person_id = ?",
                 (key,),
             ).fetchone()
             if row is None:
@@ -390,39 +536,35 @@ class LifeStore:
         return result if isinstance(result, dict) else None
 
     def put_relationship(self, record: Mapping[str, Any]) -> bool:
-        # v1.13.1（F-008/F-009，安全审计）：入库前统一截断——user_id 与 relation_hint
-        # 都不该无上界（实测 10 万字符 user_id 可入库）。64 与 new_relationship /
-        # relationship_rows 两处的既有上限对齐。
-        user_id = str(record.get("user_id") or "").strip()[:64]
-        if not user_id:
+        # v1.13.1（F-008/F-009，安全审计）：入库前统一截断——各类文本字段都不该
+        # 无上界（实测 10 万字符 user_id 可入库）。上限与 new_relationship 对齐。
+        pid = str(record.get("person_id") or "").strip()[:64]
+        if not pid:
+            # 来源只给了 (platform, user_id) 时**现算一次**（与 relationship_rows 同口径）。
+            # 「主键缺了就静默不存」是最坏的失败形态——升级后关系看起来全没了；
+            # 而 person_id 本来就是这两个字段的确定性函数，没有理由不推导。
+            pid = person_id_for(record.get("platform"), record.get("user_id"))
+        if not pid:
             return False
         values = tuple(
-            user_id if field == "user_id"
-            else str(record.get(field, default))[:64] if field == "relation_hint"
+            pid if field == "person_id"
+            else str(record.get(field) or "")[:64] if field in ("user_id", "relation_hint")
+            else str(record.get(field) or "")[:32] if field == "platform"
             else record.get(field, default)
-            for field, default in (
-                ("user_id", ""),
-                ("first_seen_at", 0.0),
-                ("last_interaction_at", 0.0),
-                ("interaction_count", 0),
-                ("familiarity", 0.0),
-                ("relation_hint", ""),
-                ("shared_events", 0),
-            )
+            for field, default in _RELATIONSHIP_DEFAULTS
+        )
+        columns = ", ".join(_RELATIONSHIP_FIELDS)
+        placeholders = ", ".join("?" * len(_RELATIONSHIP_FIELDS))
+        updates = ", ".join(
+            f"{field} = excluded.{field}"
+            for field in _RELATIONSHIP_FIELDS
+            if field != "person_id"
         )
 
         def work(conn: sqlite3.Connection) -> bool:
             conn.execute(
-                "INSERT INTO relationships (user_id, first_seen_at, last_interaction_at, "
-                "interaction_count, familiarity, relation_hint, shared_events) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(user_id) DO UPDATE SET "
-                "first_seen_at = excluded.first_seen_at, "
-                "last_interaction_at = excluded.last_interaction_at, "
-                "interaction_count = excluded.interaction_count, "
-                "familiarity = excluded.familiarity, "
-                "relation_hint = excluded.relation_hint, "
-                "shared_events = excluded.shared_events",
+                f"INSERT INTO relationships ({columns}) VALUES ({placeholders}) "
+                f"ON CONFLICT(person_id) DO UPDATE SET {updates}",
                 values,
             )
             return True
@@ -436,8 +578,7 @@ class LifeStore:
 
         def work(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             rows = conn.execute(
-                "SELECT user_id, first_seen_at, last_interaction_at, interaction_count, "
-                "familiarity, relation_hint, shared_events FROM relationships "
+                f"SELECT {', '.join(_RELATIONSHIP_FIELDS)} FROM relationships "
                 "ORDER BY familiarity DESC, last_interaction_at DESC LIMIT ?",
                 (count,),
             ).fetchall()
@@ -457,8 +598,8 @@ class LifeStore:
             if count <= limit:
                 return 0
             cursor = conn.execute(
-                "DELETE FROM relationships WHERE user_id IN ("
-                "  SELECT user_id FROM relationships "
+                "DELETE FROM relationships WHERE person_id IN ("
+                "  SELECT person_id FROM relationships "
                 "  ORDER BY last_interaction_at ASC LIMIT ?"
                 ")",
                 (count - limit,),
@@ -467,14 +608,14 @@ class LifeStore:
 
         return int(self._run("淘汰关系档案", work) or 0)
 
-    def delete_relationship(self, user_id: str) -> bool:
-        key = str(user_id or "").strip()
+    def delete_relationship(self, person_id: str) -> bool:
+        key = str(person_id or "").strip()
         if not key:
             return False
 
         def work(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute(
-                "DELETE FROM relationships WHERE user_id = ?", (key,)
+                "DELETE FROM relationships WHERE person_id = ?", (key,)
             )
             return int(cursor.rowcount or 0) > 0
 
@@ -531,18 +672,29 @@ def relationship_rows(records: Iterable[Mapping[str, Any]]) -> list[dict[str, An
 
     落库前的最后一道闸：SQLite 的列是固定的，脏键直接进 ``put_relationship``
     会被忽略（静默），不如在这里显式归一化。
+
+    v1.20.0（Y4）：主键是 ``person_id``。来源没给 ``person_id`` 时按
+    ``(platform, user_id)`` 现算一次——老数据与外部写入都能被接住，
+    而不是被静默丢掉（「升级后关系全没了」是最不能接受的那种静默）。
     """
 
     cleaned: list[dict[str, Any]] = []
     for record in records:
         if not isinstance(record, Mapping):
             continue
-        user_id = str(record.get("user_id") or "").strip()
-        if not user_id:
+        pid = str(record.get("person_id") or "").strip()[:64]
+        if not pid:
+            pid = person_id_for(record.get("platform"), record.get("user_id"))
+        if not pid:
             continue
+        platform = (
+            str(record.get("platform") or DEFAULT_PLATFORM).strip()[:32] or DEFAULT_PLATFORM
+        )
         cleaned.append(
             {
-                "user_id": user_id,
+                "person_id": pid,
+                "platform": platform,
+                "user_id": str(record.get("user_id") or "").strip()[:64],
                 "first_seen_at": float(record.get("first_seen_at") or 0.0),
                 "last_interaction_at": float(record.get("last_interaction_at") or 0.0),
                 "interaction_count": int(record.get("interaction_count") or 0),

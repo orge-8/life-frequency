@@ -55,8 +55,11 @@ class MoodPolicy:
     stress_relief_per_sleep_tick: float = 0.08
     #: 每 tick 无互动时 loneliness 上升（10 分钟一 tick ⇒ 一小时 +0.3）
     loneliness_per_quiet_tick: float = 0.05
-    #: 被找（live_signal / 提及）时 loneliness 的回落
-    loneliness_relief_per_contact: float = 0.3
+    #: 被找（live_signal / 提及）时 loneliness 的回落——**每 tick 至多一次**（v1.19.2 D8-2）
+    #: （旧名 ``loneliness_relief_per_contact`` 是每条消息一扣，活跃群下与上涨通道
+    #: 结构性失衡：永远只降不涨。钩子层的每条消息即时回落随本版移除，回落统一下沉
+    #: 到 tick 层有界结算。）
+    loneliness_relief_per_tick: float = 0.3
     #: 社交电量：入站普通消息 -0.05 / 被 @ -0.15 / 主动开口 -0.3
     battery_per_message: float = 0.05
     battery_per_mention: float = 0.15
@@ -67,6 +70,19 @@ class MoodPolicy:
     battery_recover_per_sleep_hour: float = 1.0
     stress_baseline: float = 3.0
     loneliness_baseline: float = 4.0
+    #: 孤独只认「**有人跟她说话**」才算接触（v1.20.1 #6，默认开）。
+    #:
+    #: **为什么必须收窄**：真机 283 样本（23.5 小时、v1.19.2）里 ``loneliness``
+    #: **283/283 恒为 0.0000**。根因不在 6 小时窗口，而在**主闸**——``had_contact``
+    #: 是「这个 tick 房间里有没有人说话」，而它由**任何**入站群消息刷新
+    #: （``last_contact_at`` 不管有没有对她说话），于是活跃群里她清醒时几乎每个
+    #: tick 都走回落分支（每 tick −0.3、无下限），**增长分支连进都进不去**。
+    #: 语义上「别人互相刷屏」不该消除她的孤独：孤独该看的是"有没有人跟我说话"。
+    #: 置 ``false`` 精确回到 v1.19.2 行为（回退开关，按库里对默认行为变更的惯例留）。
+    #:
+    #: ⚠ 电量**不受这项影响**：群体闲聊仍算「在场社交」、照常耗电
+    #: （``had_contact`` 在电量分支保持原口径）——两个维度问的不是同一个问题。
+    loneliness_requires_addressed: bool = True
     battery_baseline: float = 7.0
     #: 高压崩溃的判据阈值（v1.16.2 M3a）：``stress`` 达到它**并持续** ``hours`` 才算
     #: 「绷不住」。阈值与开关由 ``life_sim.stress_breakdown_*`` 消费，这里只负责计时。
@@ -98,12 +114,20 @@ def evolve(
     policy: MoodPolicy,
     last_contact_at: float,
     now: float,
+    had_addressed: bool = False,
+    last_addressed_at: float = 0.0,
 ) -> None:
     """结算一段时间的内心维度（每 tick 调一次；``minutes`` 通常 ≈ tick_seconds/60）。
+
+    ``had_contact`` / ``last_contact_at`` = 「**房间里**有没有人说话」（电量用）；
+    ``had_addressed`` / ``last_addressed_at`` = 「**有没有人跟她说话**」（孤独用，
+    v1.20.1 #6）。两者刻意分开——见 ``MoodPolicy.loneliness_requires_addressed``。
 
     ⚠ 只在 ``state`` 上原地修改；睡眠/小睡中 stress 下调、电量回血，但**孤独不涨**
     （她睡着，不会感到孤单）。v1.15.0（PR-R1）起「在睡」统一走
     ``life_activity.is_asleep``（sleep + nap），不再写字面 ``== "sleep"``。
+    v1.18.1（D9）起，睡着/小睡中普通消息也不扣电量（钩子层同步豁免），
+    否则活跃群夜间流量会吃光睡眠回充——真机实测电量整夜贴 0。
     """
 
     if not policy.enabled:
@@ -138,11 +162,29 @@ def evolve(
         state.stress_high_since = 0.0
 
     # ---- loneliness（睡着不涨）----
+    # v1.19.2（D8-2）：**回落有界化**——原来每条消息 -0.3 而上涨唯一通道是
+    # 「无互动满 6 小时后 +0.05/tick」，活跃群（消息间隔中位 0.17h）下 quiet≥6h
+    # 永不成立 ⇒ 孤独只能降不能涨，结构性钉 0（真机 2026-10-15 实测 18h 恒 0.0）。
+    # 现在两条路都走 **每 tick 至多一次** 的有界结算。
+    #
+    # v1.20.1（#6）：**主闸的口径收窄**。v1.19.2 只修了回落侧，真机下一轮 283 样本
+    # （23.5 小时）里孤独仍然 283/283 恒 0.0000——因为 ``had_contact`` 由**任何**入站
+    # 群消息刷新的 ``last_contact_at`` 满足，活跃群里她清醒时几乎每个 tick 都走回落
+    # 分支、**增长分支连进都进不去**（6 小时窗口只是"就算进去了也到不了"的第二道）。
+    # 孤独该问的是「有没有人**跟我**说话」，不是「房间里有没有人说话」：
+    # ``loneliness_requires_addressed`` 开着时改用 ``had_addressed`` / ``last_addressed_at``。
+    # ⚠ 电量分支**不动**（群体闲聊仍算在场社交、照常耗电）。
     if not is_asleep(activity):
-        if had_mention or had_contact:
-            state.loneliness = max(0.0, state.loneliness - policy.loneliness_relief_per_contact)
+        if policy.loneliness_requires_addressed:
+            contact_now = bool(had_mention or had_addressed)
+            anchor = float(last_addressed_at or 0.0)
         else:
-            quiet_hours = max(0.0, (float(now) - float(last_contact_at)) / 3600.0) if last_contact_at > 0 else hours
+            contact_now = bool(had_mention or had_contact)
+            anchor = float(last_contact_at or 0.0)
+        if contact_now:
+            state.loneliness = max(0.0, state.loneliness - policy.loneliness_relief_per_tick)
+        else:
+            quiet_hours = max(0.0, (float(now) - anchor) / 3600.0) if anchor > 0 else hours
             if quiet_hours >= LONELY_AFTER_HOURS:
                 state.loneliness = min(
                     LONELINESS_MAX,
@@ -150,9 +192,14 @@ def evolve(
                 )
 
     # ---- social battery ----
+    # v1.18.1（D9）：睡着/小睡中普通消息不扣电量——真机 18h 实测：夜间群流量把
+    # 睡眠回充（+1.0/h）全部吃光，电量整夜贴 0、主动开口被硬闸永久挡住。
+    # tick 侧 ``had_contact`` 走 ``last_contact_at`` 兜底判据，睡眠中同样会命中，
+    # 所以这里也要门（与钩子层豁免配对，缺一处夜间照旧双扣）。
+    # 被 @ 不豁免（唤醒机制在，mention 是「真叫醒」）。
     if had_mention:
         state.social_battery = max(0.0, state.social_battery - policy.battery_per_mention)
-    elif had_contact:
+    elif had_contact and not is_asleep(activity):
         state.social_battery = max(0.0, state.social_battery - policy.battery_per_message)
     if is_asleep(activity):
         state.social_battery = min(BATTERY_MAX, state.social_battery + policy.battery_recover_per_sleep_hour * hours)

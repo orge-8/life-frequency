@@ -365,16 +365,37 @@ def test_real_world_problems_are_all_reported(tmp_path):
     now = time.time()
     data = _write_real_world(tmp_path, now)
     code, report, _name = _run(tmp_path, data)
-    assert code == 1, report[-1500:]
+    # v1.19.0（PR-AF-1 配套）起，全天睡眠窗与「没写倍率」在该设计目标下是**预期配置**，
+    # 不再算 FAIL ⇒ 这里不再要求 code == 1，而是要求「真问题一条不少地在报告里」，
+    # 同时**不许**再出现全天睡眠窗的 FAIL。
+    assert "总判定" in report
+    assert "sleep_window 覆盖一天中的 24.0 小时（≈ 全天）" not in report
+    assert code in (0, 1)
 
     for needle in (
-        "sleep_window 覆盖一天中的 24.0 小时",      # 全天睡眠窗 ⇒ FAIL
         "主动开口被硬闸挡住",                       # 电量 0 + proactive 开着
         "所有人都是「陌生」档",                     # 关系系数恒 1.0（M7 等价没开）
-        "与 [simulation] dry_run = true 互相印证",  # 没写过倍率的原因说清楚了
-        "演算模式开着",
+        "演算模式开着",                             # dry_run 仍在（没设 expect_dry_run）
     ):
         assert needle in report, needle
+
+    # v1.19.0（PR-AF-1 配套）：全天睡眠窗与「没写倍率」不再被当成故障——
+    # 当设计目标是「状态驱动、不看钟点」时，24h 覆盖等价于取消时间限制；
+    # dry_run 是有意的观测阶段选择，「没写倍率」是它的必然后果。它们改报 OK，
+    # 并给出「怎么切回旧口径」的开关。
+    for needle in (
+        "sleep_window 覆盖 24.0 小时（钟点作息未启用，按设计放过）",
+        "演算模式下不写宿主（符合预期）",
+    ):
+        assert needle in report, needle
+
+    # 反过来：明确要钟点作息时，旧判据必须回来（否则切回旧口径没有验证）。
+    clocky = _write_real_world(tmp_path, now)
+    text = (clocky / "config.toml").read_text(encoding="utf-8")
+    text += "\n[diagnostics]\nclock_aware = true\n"
+    (clocky / "config.toml").write_text(text, encoding="utf-8")
+    _code2, report2, _n2 = _run(tmp_path, clocky)
+    assert "sleep_window 覆盖一天中的 24.0 小时（≈ 全天）" in report2
 
 
 def test_no_runtime_data_never_claims_normal_operation(tmp_path):
@@ -430,3 +451,240 @@ def test_state_and_store_signature_helpers(tmp_path):
     store = STORE.open_store(mine)
     store.close()
     assert module.looks_like_store(mine) is True
+
+
+# ---------------------------------------------------------------- v1.2.0（D10）：签名命中原文
+
+
+def test_log_tailer_captures_signature_excerpts_with_stack(tmp_path):
+    """增量采样必须把命中**原文**收走（Traceback 栈后文跟着进），且第二轮不重复计数。"""
+
+    module = _load_diagnostics()
+    log_file = tmp_path / "app.log"
+    log_file.write_text(
+        "2026-10-13 08:46:30 INFO some normal line\n"
+        "2026-10-13 08:46:31 WARNING plugin.org.orge-8.life-frequency: Traceback (most recent call last)\n"
+        '  File "plugin.py", line 42, in tick\n'
+        "RuntimeError: 宿主能力调用超时\n"
+        "2026-10-13 08:47:00 INFO nobody tagged me at all\n",
+        encoding="utf-8",
+    )
+    tailer = module.LogTailer()
+    result = tailer.poll([log_file])
+    assert result["fail_hits"].get("Traceback") == 1
+    excerpts = result["signature_excerpts"]
+    assert excerpts and "[Traceback]" in excerpts[0], "命中原文必须落进 excerpts"
+    assert "RuntimeError" in excerpts[0], "异常栈后文必须跟着进原文，否则归因还是没有证据"
+    assert "nobody tagged me at all" in excerpts[0], "FAIL 命中带 4 行后文（栈在这里结束）"
+    # 第二轮：offset 已推进，不许重复计数或重复收原文
+    again = tailer.poll([log_file])
+    assert again["fail_hits"] == {} and again["signature_excerpts"] == []
+
+
+def test_signature_excerpts_cover_lines_without_plugin_tag():
+    """D10 根因回归：宿主日志里**不带插件标签**的 Traceback/E_TIMEOUT 也要收到原文。
+
+    一次性报告旧版只统计「本插件的行」，于是 FAIL 告警说「daily/ 里有原文」、
+    原文却永远不在那里（18h 真机窗口实际踩中）。
+    """
+
+    module = _load_diagnostics()
+    lines = [
+        "2026-10-13 09:22:09 [ERROR] maisaka planner: something failed",
+        "Traceback (most recent call last):",
+        '  File "runtime.py", line 7, in run',
+        "TimeoutError: E_TIMEOUT after 30s",
+    ]
+    blocks = module._signature_excerpts(lines, source_name="app.jsonl")
+    assert blocks, "不带插件标签的命中行必须收到原文"
+    assert "E_TIMEOUT" in blocks[0] and "TimeoutError" in blocks[0]
+    # WARN 签名只收命中行本身
+    warn_lines = ["2026-10-13 09:26:30 INFO 写不进去 group-1"]
+    warn_blocks = module._signature_excerpts(warn_lines, source_name="app.jsonl")
+    assert len(warn_blocks) == 1 and "写不进去" in warn_blocks[0]
+
+
+def test_append_log_excerpts_rotates_when_too_big(tmp_path):
+    """环形文件：超过上限时旧文件让位（.old.jsonl），新条目照常追加。"""
+
+    module = _load_diagnostics()
+    paths = module.WatchPaths.of(tmp_path)
+    paths.ensure()
+    paths.log_excerpts.write_text("x" * (module.LOG_EXCERPTS_MAX_BYTES + 1), encoding="utf-8")
+    module.append_log_excerpts(paths, ["[Traceback] app.log:1\nboom"],
+                               now=1_700_000_000.0, tz=0)
+    assert paths.log_excerpts.exists()
+    assert paths.log_excerpts.read_text(encoding="utf-8").count("[Traceback]") == 1
+    assert (tmp_path / "log_excerpts.old.jsonl").exists(), "超限的旧文件要让位"
+
+
+# ---------------------------------------------------------------- 签名判据（v1.20.1）
+
+
+def _sig(line):
+    import collect_diagnostics as CD
+
+    return CD.match_signatures(line)
+
+
+def test_signature_ignores_other_plugins_info_startup_lines():
+    """误报 1：别的插件的**正常 INFO 启动日志**里带「冷却」二字（真机 42 条）。"""
+
+    for line in (
+        '{"event": "已恢复限频状态快照（冷却/每日上限/每分钟反应窗口）", '
+        '"logger": "plugin.TAIY2020.smart_poke_plugin", "level": "info"}',
+        '{"event": "复读机与自主撤回已加载（复读=True 阈值=5 冷却=3600s；撤回=True 自评=True）", '
+        '"logger": "plugin.org.mai-mai.repeater-recall", "level": "info"}',
+    ):
+        assert _sig(line) == (None, None), line
+
+
+def test_signature_ignores_our_own_status_card_body():
+    """误报 2：本插件**自己发出去的 `/生活 状态` 卡片正文**里含「写不进去」（真机 12 条）。
+
+    卡面里本来就有「写不进去（退避中）：N 个会话」这一行——那是**诊断措辞**，
+    不是故障。它出现在 JSON 的 ``event`` 字段里、且在换行之后。
+    """
+
+    line = (
+        '{"logger_name": "chat", "event": "命令处理完成，跳过后续消息处理: 🌙 生活频率 · 状态\\n'
+        '活动：听歌\\n　来源：模型决定 · 已持续 6 分钟\\n'
+        '写不进去（退避中）：1 个会话（最早约 3 分钟后重试）", "level": "info"}'
+    )
+    assert _sig(line) == (None, None)
+
+
+def test_signature_ignores_model_reasoning_text():
+    """误报 3：**模型自己的推理文本**里出现「冷却」（无关命中）。"""
+
+    line = '{"text": "**分析：**\\n\\n当前场景：她社交电量低，先冷却一会儿再开口。", "msg_id": "1"}'
+    assert _sig(line) == (None, None)
+
+
+def test_signature_still_catches_a_real_warn_from_our_plugin():
+    """真信号不能丢：本插件的 economy 降级（warning 级，单行）。"""
+
+    line = (
+        '{"event": "经济维度：读取预算失败（api_error：未找到 API 提供方插件: '
+        'org.orge-8.budget-pacer）；已降级为「未接入」，30 分钟后重试", '
+        '"logger": "plugin.org.orge-8.life-frequency", "level": "warning"}'
+    )
+    assert _sig(line) == (None, "已降级")
+
+
+def test_signature_keeps_failures_whose_stack_lives_in_the_exception_field():
+    """**FAIL 扫整行**：真故障的栈常常只挂在 ``exception`` 字段里（level=error）。
+
+    这一条是漏报守卫——第一版判据为了消误报做了「按行截断」，
+    结果把这类真实错误（如宿主「适配器名单禁止创建聊天运行实例」）一起截掉了。
+    漏报比误报更糟，所以 FAIL 类签名不截断，只滤 debug/info。
+    """
+
+    line = (
+        '{"logger_name": "heartflow", "event": "创建心流聊天 e82ef538 失败: '
+        '适配器名单禁止创建聊天运行实例: e82ef538", "level": "error", "lineno": 55, '
+        '"exception": "Traceback (most recent call last):\\n  File \\"x.py\\", line 1"}'
+    )
+    assert _sig(line) == ("Traceback", None)
+
+    # 裸的 Python traceback 头（没有 level 字段）同样要留住
+    assert _sig("Traceback (most recent call last):") == ("Traceback", None)
+
+    # 关机超时（warning 级、单行）也要留住
+    assert _sig(
+        '{"event": "Runner shutdown 请求失败: reason=host_stop '
+        'error=[E_TIMEOUT] 请求 plugin.shutdown 超时 (5000ms)", "level": "warning"}'
+    ) == ("E_TIMEOUT", None)
+
+
+def test_signature_skips_debug_and_info_entirely():
+    """debug/info 级整行不参与判据——正常轮次不是故障。"""
+
+    assert _sig('{"event": "Traceback 处理完成（重试成功）", "level": "info"}') == (None, None)
+    assert _sig('{"event": "E_TIMEOUT 已恢复", "level": "debug"}') == (None, None)
+
+
+# ---------------------------------------------------------------- 签名判据（v1.20.1）
+
+
+def _sig(line):
+    import collect_diagnostics as CD
+
+    return CD.match_signatures(line)
+
+
+def test_signature_ignores_other_plugins_info_startup_lines():
+    """误报 1：别的插件的**正常 INFO 启动日志**里带「冷却」二字（真机 42 条）。"""
+
+    for line in (
+        '{"event": "已恢复限频状态快照（冷却/每日上限/每分钟反应窗口）", '
+        '"logger": "plugin.TAIY2020.smart_poke_plugin", "level": "info"}',
+        '{"event": "复读机与自主撤回已加载（复读=True 阈值=5 冷却=3600s；撤回=True 自评=True）", '
+        '"logger": "plugin.org.mai-mai.repeater-recall", "level": "info"}',
+    ):
+        assert _sig(line) == (None, None), line
+
+
+def test_signature_ignores_our_own_status_card_body():
+    """误报 2：本插件**自己发出去的 `/生活 状态` 卡片正文**里含「写不进去」（真机 12 条）。
+
+    卡面里本来就有「写不进去（退避中）：N 个会话」这一行——那是**诊断措辞**，
+    不是故障。它出现在 JSON 的 ``event`` 字段里、且在换行之后。
+    """
+
+    line = (
+        '{"logger_name": "chat", "event": "命令处理完成，跳过后续消息处理: 🌙 生活频率 · 状态\n'
+        '活动：听歌\n　来源：模型决定 · 已持续 6 分钟\n'
+        '写不进去（退避中）：1 个会话（最早约 3 分钟后重试）", "level": "info"}'
+    )
+    assert _sig(line) == (None, None)
+
+
+def test_signature_ignores_model_reasoning_text():
+    """误报 3：**模型自己的推理文本**里出现「冷却」（无关命中）。"""
+
+    line = '{"text": "**分析：**\n\n当前场景：她社交电量低，先冷却一会儿再开口。", "msg_id": "1"}'
+    assert _sig(line) == (None, None)
+
+
+def test_signature_still_catches_a_real_warn_from_our_plugin():
+    """真信号不能丢：本插件的 economy 降级（warning 级，单行）。"""
+
+    line = (
+        '{"event": "经济维度：读取预算失败（api_error：未找到 API 提供方插件: '
+        'org.orge-8.budget-pacer）；已降级为「未接入」，30 分钟后重试", '
+        '"logger": "plugin.org.orge-8.life-frequency", "level": "warning"}'
+    )
+    assert _sig(line) == (None, "已降级")
+
+
+def test_signature_keeps_failures_whose_stack_lives_in_the_exception_field():
+    """**FAIL 扫整行**：真故障的栈常常只挂在 ``exception`` 字段里（level=error）。
+
+    这一条是漏报守卫——第一版判据为了消误报做了「按行截断」，
+    结果把这类真实错误（如宿主「适配器名单禁止创建聊天运行实例」）一起截掉了。
+    漏报比误报更糟，所以 FAIL 类签名不截断，只滤 debug/info。
+    """
+
+    line = (
+        '{"logger_name": "heartflow", "event": "创建心流聊天 e82ef538 失败: '
+        '适配器名单禁止创建聊天运行实例: e82ef538", "level": "error", "lineno": 55, '
+        '"exception": "Traceback (most recent call last):\n  File \\"x.py\\", line 1"}'
+    )
+    assert _sig(line) == ("Traceback", None)
+
+    # 裸的 Python traceback 头（没有 level 字段）同样要留住
+    assert _sig("Traceback (most recent call last):") == ("Traceback", None)
+
+    # 关机超时（warning 级、单行）也要留住
+    assert _sig(
+        '{"event": "Runner shutdown 请求失败: reason=host_stop '
+        'error=[E_TIMEOUT] 请求 plugin.shutdown 超时 (5000ms)", "level": "warning"}'
+    ) == ("E_TIMEOUT", None)
+
+
+def test_signature_skips_debug_and_info_entirely():
+    """debug/info 级整行不参与判据——正常轮次不是故障。"""
+
+    assert _sig('{"event": "Traceback 处理完成（重试成功）", "level": "info"}') == (None, None)
+    assert _sig('{"event": "E_TIMEOUT 已恢复", "level": "debug"}') == (None, None)

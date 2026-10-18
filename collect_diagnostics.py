@@ -16,6 +16,19 @@
 输出：``<插件目录>/diagnostics/life-frequency-诊断-<时间戳>.md``（外加同名 ``.json``）。
 ``--bundle`` 再产出一个 zip，便于把现场数据带到另一台机器上读。
 
+**长期监控（至少一周）**：一次性报告只回答「此刻正常吗」，看不出卡顿、停机、模型连续失败
+这类**过程性**问题。watch 模式在同一个程序里做时序采集：
+
+    python collect_diagnostics.py --watch                   # 常驻监控：默认 5 分钟一采样、跑 7 天
+    python collect_diagnostics.py --watch --duration-hours 0 # 一直跑（重启后重挂即可）
+    python collect_diagnostics.py --once                    # 只采一个样本（手动看 / 计划任务）
+    python collect_diagnostics.py --summary-only            # 只用已有样本重算汇总报告
+
+输出到 ``<插件目录>/diagnostics/watch/``：``samples.jsonl`` + ``samples.csv``（时序证据）、
+``alerts.log`` + ``alerts.md``（去重后的告警流水）、``daily/``（每天一份完整诊断报告）、
+``watch_summary.md``（随时可读的汇总：覆盖缺口、卡顿、模型趋势、逐日数值走势）。
+watch 模式只往这个目录写，**只读承诺不变**。
+
 **只读承诺**：本程序不改动插件目录与运行时数据（只往输出目录写报告）。读 SQLite 走
 只读连接，连不上时**复制**一份到临时目录再读，绝不碰原库。
 
@@ -27,6 +40,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -34,7 +48,9 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -44,7 +60,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
-PROGRAM_VERSION = "1.0.0"
+PROGRAM_VERSION = "1.3.0"
 PLUGIN_ID = "org.orge-8.life-frequency"
 PLUGIN_NAME = "生活频率"
 #: runtime 数据文件名与插件 manifest 名
@@ -269,8 +285,9 @@ def looks_like_state(payload: object) -> bool:
 
 
 def looks_like_store(path: pathlib.Path) -> bool:
-    conn, _note, _used = _open_readonly(path)
+    conn, _note, _used, temp_dir = _open_readonly(path)
     if conn is None:
+        _cleanup_temp(temp_dir)
         return False
     try:
         tables = {row[0] for row in conn.execute(
@@ -280,6 +297,7 @@ def looks_like_store(path: pathlib.Path) -> bool:
         return False
     finally:
         conn.close()
+        _cleanup_temp(temp_dir)
     return bool(STORE_SIGNATURE_TABLES.intersection(tables))
 
 
@@ -740,6 +758,10 @@ def collect_config(report: Report, path: pathlib.Path | None, pure: "PurePlugin"
     frequency = _section(config, "frequency")
     apply_section = _section(config, "apply")
     simulation = _section(config, "simulation")
+    # v1.19.0（PR-AF-1 配套）：诊断侧的「目标口径」。默认值刻意与 v1.18.1 相反——
+    # 24h 睡眠窗口本身不是故障，当设计目标是「状态驱动、不看钟点」时，
+    # 24h 覆盖等价于「取消时间限制」，是自洽的。
+    diagnostics = _section(config, "diagnostics")
 
     if bool(frequency.get("paused", False)):
         report.add("FAIL", "插件处于暂停状态（[frequency] paused = true）",
@@ -761,15 +783,35 @@ def collect_config(report: Report, path: pathlib.Path | None, pure: "PurePlugin"
                 report.add("WARN", "sleep_window 是零长度窗口（等于没有睡眠时段）",
                            evidence=raw_window, fix='例如 "03:00-11:00"', scope="配置")
             elif span >= 20 * 60:
-                report.add("FAIL", f"sleep_window 覆盖一天中的 {span / 60:.1f} 小时"
-                                   "（≈ 全天）",
-                           evidence=f"{raw_window}：她几乎**随时**都有资格入睡，"
-                                    "清醒时段会被睡眠吃掉（真机实测：活动长期是 sleep）",
-                           fix='改成真实作息，例如 "03:00-11:00"', scope="配置")
+                # v1.19.0（PR-AF-1 配套）：24h/长窗口本身**不是**故障。当设计目标是
+                # 「状态驱动、不看钟点」时，24h 覆盖等价于「取消时间限制」，是自洽的；
+                # 只有当你确实想要钟点作息时它才是问题。默认按前者放过，
+                # ``[diagnostics] clock_aware = true`` 切回旧判据。
+                if diagnostics.get("clock_aware", False):
+                    report.add("FAIL", f"sleep_window 覆盖一天中的 {span / 60:.1f} 小时"
+                                       "（≈ 全天）",
+                               evidence=f"{raw_window}：她几乎**随时**都有资格入睡，"
+                                        "清醒时段会被睡眠吃掉（真机实测：活动长期是 sleep）",
+                               fix='改成真实作息，例如 "03:00-11:00"', scope="配置")
+                else:
+                    report.add("OK", f"sleep_window 覆盖 {span / 60:.1f} 小时"
+                                     "（钟点作息未启用，按设计放过）",
+                               evidence=f"{raw_window}：当前设计目标是不看钟点、由状态决定，"
+                                        "全天覆盖等价于取消时间限制，属预期配置。"
+                                        "真要按钟点作息：把它收窄，或把 "
+                                        "[diagnostics] clock_aware 打开恢复旧告警",
+                               scope="配置")
             elif span >= 16 * 60:
-                report.add("WARN", f"sleep_window 覆盖一天中的 {span / 60:.1f} 小时",
-                           evidence=f"{raw_window}（她在窗口内会被判定为「该睡」）",
-                           fix="确认这是有意的（过长会把大部分活动挤成睡眠）", scope="配置")
+                if diagnostics.get("clock_aware", False):
+                    report.add("WARN", f"sleep_window 覆盖一天中的 {span / 60:.1f} 小时",
+                               evidence=f"{raw_window}（她在窗口内会被判定为「该睡」）",
+                               fix="确认这是有意的（过长会把大部分活动挤成睡眠）", scope="配置")
+                else:
+                    report.add("OK", f"sleep_window 覆盖 {span / 60:.1f} 小时"
+                                     "（钟点作息未启用，按设计放过）",
+                               evidence=f"{raw_window}；若要恢复旧告警，"
+                                        "打开 [diagnostics] clock_aware",
+                               scope="配置")
 
     quiet = frequency.get("quiet_hours")
     if isinstance(quiet, list) and quiet:
@@ -795,9 +837,19 @@ def collect_config(report: Report, path: pathlib.Path | None, pure: "PurePlugin"
                    scope="配置")
 
     if bool(simulation.get("dry_run", False)):
-        report.add("WARN", "演算模式开着（dry_run = true）",
-                   evidence="只算不写：宿主上的倍率不会被改",
-                   fix="确认这是调试用；正常运转要关掉", scope="配置")
+        # v1.19.0（PR-AF-1 配套）：dry_run 是**有意的阶段选择**（先看数值、再放手），
+        # 不再是每轮重复 152 次的告警噪音。只有当你明确说「本该写却没写」时才报。
+        if diagnostics.get("expect_dry_run", False):
+            report.add("OK", "演算模式开着（dry_run = true，符合 [diagnostics] expect_dry_run）",
+                       evidence="只算不写：宿主上的倍率不会被改。这是有意的观测阶段选择，"
+                                "关闭它才会改变宿主上的发言频率——那是生产行为变更",
+                       scope="配置")
+        else:
+            report.add("WARN", "演算模式开着（dry_run = true）",
+                       evidence="只算不写：宿主上的倍率不会被改",
+                       fix="确认这是调试用；正常运转要关掉。"
+                           "若这是有意的观测阶段，请在 [diagnostics] 设 expect_dry_run = true",
+                       scope="配置")
 
     factors_mode = str(_section(config, "activity").get("factors_mode") or "merge")
     if factors_mode == "replace":
@@ -922,7 +974,12 @@ def _state_checks(report: Report, state: Mapping[str, Any], *, tz: int, now: flo
                    "sleep_debt_nights": as_int(state.get("sleep_debt_nights")),
                    "stress": as_float(state.get("stress")),
                    "loneliness": as_float(state.get("loneliness")),
-                   "social_battery": as_float(state.get("social_battery"))})
+                   "social_battery": as_float(state.get("social_battery")),
+                   # v1.20.1（#4）：孤独的**增长锚点**——「有没有人跟我说话」的时刻。
+                   # 没有它，「孤独为什么恒 0」只能靠推断：真机 283 样本那一轮的报告
+                   # 只能写「推测」，没法证实「清醒时段 6 小时安静到底有没有成立过」。
+                   # 有了它 + ``continuous_awake_minutes``，离线就能算清楚。
+                   "last_addressed_at": as_float(state.get("last_addressed_at"))})
     if energy > cap + 1e-6:
         report.add("WARN", f"{label}：体力超过上限", evidence=f"{energy:.2f} > {cap:.2f}",
                    fix="正常不会发生（settle 会钳）；确认状态文件没被手改", scope="状态")
@@ -1015,15 +1072,20 @@ def _state_checks(report: Report, state: Mapping[str, Any], *, tz: int, now: flo
                    evidence=f"其中 {len(foreign)} 个认到外部基数（与别的插件乘性合成）",
                    scope="状态")
     elif not simulated:
+        # v1.19.0（PR-AF-1 配套）：dry_run 下「没写倍率」是**必然后果**，不是问题——
+        # 它每轮重复 152 次，把真正有价值的告警挤掉了。只有非 dry_run 时才算异常。
         dry_run = bool(_section(config, "simulation").get("dry_run", False))
-        report.add("WARN", f"{label}：还没有在任何会话上写过倍率",
-                   evidence=("与 [simulation] dry_run = true 互相印证：演算模式从不写宿主"
-                             if dry_run else
-                             "可能是没命中会话（filter_mode / only_active_sessions），"
-                             "或一直处于静默/睡眠"),
-                   fix="用 `/生活 状态` 看「本轮命中几个会话」"
-                       + ("；确认演算模式是不是调试用" if dry_run else ""),
-                   scope="状态")
+        if dry_run:
+            report.add("OK", f"{label}：演算模式下不写宿主（符合预期）",
+                       evidence="[simulation] dry_run = true 时倍率只算不落；"
+                                "要看是否命中会话，用 `/生活 状态` 的「本轮命中几个会话」",
+                       scope="状态")
+        else:
+            report.add("WARN", f"{label}：还没有在任何会话上写过倍率",
+                       evidence="可能是没命中会话（filter_mode / only_active_sessions），"
+                                "或一直处于静默/睡眠",
+                       fix="用 `/生活 状态` 看「本轮命中几个会话」",
+                       scope="状态")
 
     # ---- 内心维度 × 主动开口（v1.16.2 的真机教训：配置说允许，硬闸却一直挡着）----
     battery = as_float(state.get("social_battery"))
@@ -1159,13 +1221,31 @@ def collect_memory(report: Report, path: pathlib.Path | None, *, now: float) -> 
 # ================================================================ 库侧采集
 
 
-def _open_readonly(db_path: pathlib.Path) -> tuple[sqlite3.Connection | None, str, pathlib.Path]:
-    """只读打开 SQLite；直连失败（例如 WAL 需要恢复）时**复制一份**再读。"""
+def _cleanup_temp(temp_dir: pathlib.Path | None) -> None:
+    """删掉 ``_open_readonly`` 复制出来的临时副本目录（没有副本时是 no-op）。"""
+
+    if temp_dir is None:
+        return
+    try:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _open_readonly(db_path: pathlib.Path
+                   ) -> tuple[sqlite3.Connection | None, str, pathlib.Path,
+                              pathlib.Path | None]:
+    """只读打开 SQLite；直连失败（例如 WAL 需要恢复）时**复制一份**再读。
+
+    ⚠ 第四个返回值是**临时副本目录**，调用方读完必须 ``_cleanup_temp``。
+    一次性诊断漏删一次不痛不痒，但 watch 模式每天都要跑完整报告，
+    一周下来会在系统 temp 里堆几十个库副本（每个可能几十 MB）——那是「看不见的磁盘占用」。
+    """
 
     try:
         conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
         conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-        return conn, "", db_path
+        return conn, "", db_path, None
     except sqlite3.Error as first:
         temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="life-diagnostics-"))
         for suffix in ("", "-wal", "-shm"):
@@ -1179,9 +1259,9 @@ def _open_readonly(db_path: pathlib.Path) -> tuple[sqlite3.Connection | None, st
         try:
             conn = sqlite3.connect(str(copy_path), timeout=5)
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-            return conn, f"直连只读失败（{first}），已复制到临时目录读取", copy_path
+            return conn, f"直连只读失败（{first}），已复制到临时目录读取", copy_path, temp_dir
         except sqlite3.Error as second:
-            return None, f"只读与复制读取都失败：{first} / {second}", copy_path
+            return None, f"只读与复制读取都失败：{first} / {second}", copy_path, temp_dir
 
 
 def collect_store(report: Report, path: pathlib.Path | None, *, now: float,
@@ -1191,7 +1271,7 @@ def collect_store(report: Report, path: pathlib.Path | None, *, now: float,
                    evidence="没有它不影响生活循环（会降级成内存态），但看不出关系/习惯在不在跑",
                    fix="用 --data-dir 指向插件的 data 目录", scope="库")
         return {}
-    conn, note, used_path = _open_readonly(path)
+    conn, note, _used_path, temp_dir = _open_readonly(path)
     detail: dict[str, Any] = {
         "path": str(path), "size_bytes": path.stat().st_size,
         "sha256": sha256_of(path)[:16], "note": note,
@@ -1201,6 +1281,7 @@ def collect_store(report: Report, path: pathlib.Path | None, *, now: float,
         report.add("FAIL", "life_store.db 读不出来", evidence=note,
                    fix="库损坏时插件会降级成内存态（习惯每天会重复命中）；备份后删除重建",
                    scope="库")
+        _cleanup_temp(temp_dir)
         return detail
     try:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()
@@ -1283,6 +1364,7 @@ def collect_store(report: Report, path: pathlib.Path | None, *, now: float,
             ]
     finally:
         conn.close()
+        _cleanup_temp(temp_dir)
     if note:
         report.add("WARN", "读库走了复制路径", evidence=note,
                    fix="通常没问题（只读保护）；若频繁发生，检查宿主是否在写库时锁住",
@@ -1312,6 +1394,11 @@ LOG_FAIL_SIGNATURES: tuple[tuple[str, str], ...] = (
     ("状态文件损坏", "状态文件不可解析（已按空状态继续）"),
     ("Traceback", "有一次未捕获的异常栈"),
     ("E_TIMEOUT", "宿主能力调用超时（默认 30s 上限）"),
+    # v1.20.1：宿主 RPC **单帧超限**。真机实测四个插件在 replyer 链上同时
+    # `[E_UNKNOWN] 帧大小 17065957 超过最大限制 16777216`——**插件侧零反馈**
+    # （hook 正常返回，`modified_kwargs` 却整帧发不出去），所以插件自己永远告不了警，
+    # 只能靠这一条在宿主日志里被发现。看到它要连着看：谁的 hook、载荷从哪来。
+    ("帧大小", "宿主 RPC 单帧超限：这个 hook 的改动整帧没送达（插件侧看不见）"),
     ("没有权限", "能力授权缺失（manifest 声明与调用不一致）"),
     ("不允许的能力", "能力授权缺失（manifest 声明与调用不一致）"),
 )
@@ -1328,6 +1415,74 @@ LOG_WARN_SIGNATURES: tuple[tuple[str, str], ...] = (
     ("写不进去", "会话没有 heartflow chat 对象，写入被宿主静默吃掉"),
     ("冷却", "模型进入冷却（连续失败后）"),
 )
+
+#: 行内 JSON 的 ``"level"`` 字段（真机日志是 ``{"event": …, "level": "warning"}`` 形状）。
+_LEVEL_FIELD_RE = re.compile(r'"level"\s*:\s*"([a-z]+)"', re.I)
+#: 行内 JSON 的 logger 名（``logger_name`` 是宿主风格、``logger`` 是插件 runner 风格）。
+LOGGER_FIELD_RE = re.compile(r'"(?:logger_name|logger)"\s*:\s*"([^"]{1,120})"')
+#: 扫描时**不参与匹配**的级别：签名描述的是「某件事没做成」，这些级别是正常轮次。
+_SIGNATURE_SKIP_LEVELS = frozenset({"debug", "info"})
+
+
+def _signature_line_is_noise(line: str) -> bool:
+    """行内 **JSON 的** ``"level"`` 是 debug/info ⇒ 正常轮次，不参与签名匹配。
+
+    ⚠ 只认 ``"level": "info"`` 这种**字段形式**，不用 ``LOG_LEVEL_RE`` 裸词匹配——
+    后者会把正文里出现 "INFO" 字样的行误判成 info 级。
+    """
+
+    match = _LEVEL_FIELD_RE.search(str(line or ""))
+    return bool(match) and match.group(1).lower() in _SIGNATURE_SKIP_LEVELS
+
+
+def first_log_line(line: str) -> str:
+    """日志**自己的那一行**：在第一个换行处截断（真换行，或 JSON 里的 ``\\n`` 转义）。
+
+    带换行的部分是**嵌入内容**（状态卡正文 / 模型输出 / 消息原文），不是这条日志想说的话。
+    """
+
+    text = str(line or "")
+    cut = len(text)
+    for sep in ("\n", "\\n"):
+        idx = text.find(sep)
+        if idx >= 0:
+            cut = min(cut, idx)
+    return text[:cut]
+
+
+def match_signatures(line: str) -> tuple[str | None, str | None]:
+    """一行日志命中的 ``(FAIL 签名, WARN 签名)``；两个都可能是 ``None``。
+
+    **v1.20.1 真机修（2026-10-16，283 样本窗口实测 54 条误报）**。三个扫描点
+    （一次性报告 / 增量日志 / 原文摘录）共用这一处判据——分散写三次就会出现
+    「报告说不算、原文摘录却还在收」这种自相矛盾。
+
+    两类签名**用不同的判据**，因为误报与漏报的代价不对称：
+
+    * **FAIL 签名扫整行**，只滤 ``debug``/``info`` 级。理由：真故障的说明常常挂在
+      ``exception``/``message`` 字段里（如 level=error 的
+      「创建心流聊天 … 失败: 适配器名单禁止创建聊天运行实例」，它只有 ``exception``
+      字段里带 "Traceback"）。为了消误报而截断，会把这类真实错误一起截掉——
+      **漏报比误报更糟**。
+    * **WARN 签名先截到日志自己的那一行，再要求不是 debug/info**。理由：``冷却`` /
+      ``写不进去`` 这类短词会被**正常日志与正文**命中——实测命中的是别的插件的
+      INFO 启动日志（``smart_poke_plugin``「冷却/每日上限…」）、**本插件自己发出去的
+      ``/生活 状态`` 卡片正文**（卡面里本来就有「写不进去（退避中）」这一行）
+      以及模型自己的推理文本。误报的代价是把真告警挤掉（同窗口 52 个 FAIL 样本
+      全部来自这类命中）。
+    """
+
+    text = str(line or "")
+    if not text.strip() or _signature_line_is_noise(text):
+        return None, None
+    fail_hit = next((needle for needle, _why in LOG_FAIL_SIGNATURES if needle in text), None)
+    if fail_hit:
+        return fail_hit, None
+    head = first_log_line(text)
+    if not head.strip():
+        return None, None
+    warn_hit = next((needle for needle, _why in LOG_WARN_SIGNATURES if needle in head), None)
+    return None, warn_hit
 
 
 def find_log_candidates(roots: Sequence[pathlib.Path], *, max_seconds: float = 12.0) -> list[pathlib.Path]:
@@ -1395,6 +1550,54 @@ def _rank_logs(found: Sequence[pathlib.Path]) -> list[pathlib.Path]:
     return sorted(set(found), key=mtime, reverse=True)[:8]
 
 
+def _logger_suffix(line: str) -> str:
+    """摘录头尾附的 ``｜来源 logger``（v1.20.1 #4）。
+
+    **为什么必须带上**：真机那一轮里 ``maisaka.context.append`` / ``proactive.trigger``
+    失败 213 次，全部集中在**一个不属于本插件的 session** 上——但能力名与本插件的
+    manifest 重叠，光看能力名极易算成"本插件在报错"。带上 logger 之后一眼能看出
+    是 ``plugin_runtime.integration`` 还是 ``plugin.<别人的 id>``。
+    认不出来返回空串（不编造）。
+    """
+
+    try:
+        text = first_log_line(line)
+        match = LOGGER_FIELD_RE.search(text)
+        if not match:
+            return ""
+        name = match.group(1).strip()
+        return f"｜{name}" if name else ""
+    except Exception:  # noqa: BLE001 —— 摘录头不许因为取 logger 失败而不出
+        return ""
+
+
+def _signature_excerpts(lines: Sequence[str], *, source_name: str, max_blocks: int = 12,
+                        stack_lines: int = 4) -> list[str]:
+    """从（增量或全量的）日志行里收签名命中原文。
+
+    v1.2.0（D10）：一次性报告的签名统计此前只看「本插件的行」，而 Traceback /
+    E_TIMEOUT 的命中大多来自宿主日志里**不带插件标签**的行 ⇒ 报告的 FAIL 说
+    「daily/ 里有原文」，原文却永远不在那里。现在全文扫描收原文（已脱敏）：
+    FAIL 签名多带 ``stack_lines`` 行后文（异常栈紧跟 Traceback 头），WARN 只收
+    命中行本身。每处命中前缀来源与签名名，方便归因。
+    """
+
+    blocks: list[str] = []
+    for idx, line in enumerate(lines):
+        if len(blocks) >= max_blocks:
+            break
+        fail_hit, warn_hit = match_signatures(line)
+        if fail_hit:
+            body = lines[idx:idx + 1 + stack_lines]
+        elif warn_hit:
+            body = [line]
+        else:
+            continue
+        head = f"[{fail_hit or warn_hit}] {source_name}:{idx + 1}{_logger_suffix(line)}"
+        blocks.append(head + "\n" + "\n".join(redact(item, limit=240) for item in body))
+    return blocks
+
+
 def collect_logs(report: Report, paths: Sequence[pathlib.Path], *, now: float,
                  max_lines: int = 200000) -> dict[str, Any]:
     if not paths:
@@ -1427,12 +1630,11 @@ def collect_logs(report: Report, paths: Sequence[pathlib.Path], *, now: float,
             stamp = LOG_TS_RE.search(line)
             if stamp:
                 newest_stamp = stamp.group(1)
-            for needle, _why in LOG_FAIL_SIGNATURES:
-                if needle in line:
-                    fail_hits[needle] = fail_hits.get(needle, 0) + 1
-            for needle, _why in LOG_WARN_SIGNATURES:
-                if needle in line:
-                    warn_hits[needle] = warn_hits.get(needle, 0) + 1
+            fail_hit, warn_hit = match_signatures(line)
+            if fail_hit:
+                fail_hits[fail_hit] = fail_hits.get(fail_hit, 0) + 1
+            if warn_hit:
+                warn_hits[warn_hit] = warn_hits.get(warn_hit, 0) + 1
             if level_match and key in ("ERROR", "CRITICAL") and len(recent_errors) < 8:
                 recent_errors.append(redact(line, limit=240))
         entry = {
@@ -1440,6 +1642,7 @@ def collect_logs(report: Report, paths: Sequence[pathlib.Path], *, now: float,
             "total_lines": len(lines), "plugin_lines": len(mine),
             "levels": levels, "fail_signatures": fail_hits, "warn_signatures": warn_hits,
             "recent_errors": recent_errors, "newest_stamp": newest_stamp,
+            "signature_excerpts": _signature_excerpts(lines, source_name=path.name),
             "sha256": sha256_of(path)[:16],
         }
         detail_files.append(entry)
@@ -1463,7 +1666,8 @@ def collect_logs(report: Report, paths: Sequence[pathlib.Path], *, now: float,
         if warn_hits:
             report.add("WARN", "日志里有可疑签名（可能是正常降级，也可能在持续失败）",
                        evidence="；".join(f"{k}×{v}" for k, v in warn_hits.items()),
-                       fix="看「最近错误」与状态卡（`/生活 状态`、`/生活 为什么`）",
+                       fix="看下面的「签名命中原文」「最近错误」与状态卡"
+                           "（`/生活 状态`、`/生活 为什么`）",
                        scope="日志")
     if missing:
         report.add("UNKNOWN", f"指定的日志文件不存在（{len(missing)} 个）",
@@ -2076,6 +2280,16 @@ def render_markdown(report: Report, *, now: float, tz: int, code: Mapping[str, A
         if entry.get("warn_signatures"):
             lines.append("- 可疑签名：" + "；".join(
                 f"`{k}`×{v}" for k, v in entry["warn_signatures"].items()))
+        if entry.get("signature_excerpts"):
+            # v1.2.0（D10）：签名命中的**原文**（全文扫描，不限本插件行——
+            # 命中可能来自宿主或其它插件；已脱敏）。
+            lines.append("- 签名命中原文（全文扫描，不限本插件行；已脱敏）：")
+            lines.append("")
+            lines.append("```text")
+            for block in entry["signature_excerpts"]:
+                lines.extend(block.splitlines())
+                lines.append("· · ·")
+            lines.append("```")
         if entry.get("recent_errors"):
             lines.append("- 最近错误（已脱敏）：")
             lines.append("")
@@ -2145,6 +2359,2265 @@ def render_markdown(report: Report, *, now: float, tz: int, code: Mapping[str, A
     report.section("REPORT", "\n".join(lines))
 
 
+# ================================================================ 长期监控（watch）
+#
+# 一次性报告回答「此刻正常吗」；一周以上的观察要回答的是另一个问题：
+# **「她是不是一直正常」**。卡顿、停机、模型连续失败、状态表格膨胀、日志里的一次异常栈，
+# 都不是某一刻的快照能看出来的——必须靠**时序样本**。
+#
+# 所以 watch 模式做四件事，且只做这四件：
+#   ① 每 ``--interval`` 秒采一个**轻量样本**（状态/配置/库计数 + 增量扫日志尾部），
+#      写成 ``samples.jsonl`` 与 ``samples.csv``（时序证据，能直接导入 Excel 画图）；
+#   ② 用**与一次性报告完全相同**的判定逻辑（``_state_checks``）逐样本判定，把 FAIL/WARN
+#      送进告警状态机（开始/升级/降级/恢复）——同一问题只在**变化**时落一条，
+#      一周 2016 个样本也不会刷出噪音（告警疲劳会让人再也不看告警）；
+#   ③ 每天（``--report-every-hours``）落一份**完整诊断报告**（复用 ``build_report``），
+#      新出现的 FAIL 也立刻补一份完整报告（有节流），把现场证据固定下来；
+#   ④ 随时可读的 ``watch_summary.md``：覆盖缺口、卡顿、模型趋势、逐日数值走势、未恢复告警。
+#
+# ⚠ 两个刻意的设计取舍：
+#   * **不另写一套阈值**。样本判定直接调一次性报告的 `_state_checks`，否则「诊断说 FAIL、
+#     监控说 OK」这种自相矛盾迟早会出现（两套判据迟早漂移）。
+#   * **不做复制式读库**。`_open_readonly` 在直连失败时会**复制**一份库——一次性诊断可以，
+#     但每 5 分钟跑一次会在 temp 里堆一周的副本。样本只走直连，读不到就记一条 note，
+#     留给每日的完整报告去覆盖（它允许复制，且副本用完即删，见 `_cleanup_temp`）。
+
+WATCH_SCHEMA_VERSION = 1
+#: 采样间隔（秒）。插件 tick 默认 600s，5 分钟采样已足够看出卡顿与停机
+DEFAULT_WATCH_INTERVAL = 300.0
+#: 默认监控时长：7 天（用户要求「至少持续一周」）
+DEFAULT_WATCH_HOURS = 168.0
+#: 样本保留期：8 周（比监控窗口长，便于「上周和这周对比」）
+DEFAULT_RETAIN_DAYS = 56.0
+WATCH_SUBDIR = "watch"
+#: 第一次见到某份日志时只读末尾这么多字节（一周的日志可能上百 MB，
+#: 第一次就全读等于每挂一个监视器给磁盘来一次压力测试）
+LOG_TAIL_FIRST_BYTES = 1 << 20
+#: 单轮最多读多少新增日志字节（避免某轮被几百 MB 的新增拖住，采样本该是秒级的）
+LOG_TAIL_MAX_BYTES_PER_POLL = 4 << 20
+#: alerts.log 超阈值就裁到保留行数（一周不裁会到几十万行）
+ALERT_LOG_TRIM_THRESHOLD = 20000
+ALERT_LOG_KEEP_LINES = 5000
+#: watch.log（运行器自己的日志，每样本一行）轮转阈值
+WATCH_LOG_MAX_BYTES = 2 << 20
+#: 状态文件超过这个体积就报 WARN（去重表膨胀会把它撑大，最终拖慢每次 tick）
+STATE_SIZE_WARN_BYTES = 4 << 20
+
+#: 样本表的列（CSV 与 JSONL 共用同一批键；JSONL 另带 ``findings`` 明细）。
+#: 顺序就是 CSV 的列序——**只许在末尾追加**，否则已导出的历史表会错列。
+SAMPLE_CSV_COLUMNS: tuple[str, ...] = (
+    "sample_index", "ts", "iso", "uptime_seconds", "gap_seconds", "run_starts",
+    "data_dir", "data_dir_source",
+    "state_present", "state_size", "state_age_seconds", "state_unchanged_samples",
+    "state_sha16", "last_tick_at", "tick_age_seconds", "tick_seconds",
+    "activity", "activity_label", "scene", "minutes_in_activity",
+    "emotion", "energy", "energy_cap", "afterglow", "stress", "loneliness",
+    "social_battery", "last_addressed_at", "sleep_minutes_today", "sleep_debt_nights",
+    "continuous_awake_minutes", "sanitized_key_count",
+    "llm_fail_streak", "llm_cooldown_seconds_left", "llm_success_age_seconds",
+    "applied_sessions", "foreign_sessions", "observed_sessions",
+    "unbacked_sessions", "unbacked_worst_seconds", "table_bloated",
+    "mem_applied", "mem_foreign",
+    "store_present", "store_size", "store_table_count", "store_relationships",
+    "store_routine_daily", "store_note",
+    "cfg_enabled", "cfg_paused", "cfg_dry_run", "cfg_filter_mode",
+    "cfg_config_version", "cfg_sleep_window",
+    "log_files", "log_new_lines", "log_new_errors", "log_new_fail_hits", "log_new_warn_hits",
+    "findings_fail", "findings_warn", "check_status", "note",
+)
+
+def local_stamp(epoch: float, tz_offset_minutes: int) -> str:
+    """epoch → 本地「YYYY-MM-DD HH:MM:SS」（带配置里的时区偏移，不用机器本地时区）。"""
+
+    try:
+        local = datetime.fromtimestamp(float(epoch) + tz_offset_minutes * 60, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return "—"
+    return local.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _atomic_write_text(path: pathlib.Path, text: str) -> None:
+    """原子替换写入：**监控器随时可能被杀**（重启/断电），半截文件会毒化下次启动。
+
+    失败时**必须删掉 .tmp**：watch 每 5 分钟就要写几个文件（样本/状态/汇总/告警），
+    盘满或文件被占用时残留的 .tmp 会在目录里越堆越多，最后变成没人看得懂的垃圾。
+    """
+
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _append_text(path: pathlib.Path, text: str) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _trim_lines(path: pathlib.Path, *, keep: int) -> bool:
+    """把文件裁到保留最后 ``keep`` 行（用于告警流水，避免无限增长）。"""
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    if len(lines) <= keep:
+        return False
+    body = "\n".join(lines[-keep:]) + "\n"
+    _atomic_write_text(path, body)
+    return True
+
+
+class RunLog:
+    """监控器自己的日志：每样本一行 + 每件大事一行，超阈值轮转一次。
+
+    ⚠ 它**不替代**告警流水：告警流水是给人看的「发生了什么」，这里是「运行器干了什么」
+    （启动、接管过期锁、采了多少样本、生成报告、裁剪、退出原因）。
+    """
+
+    def __init__(self, path: pathlib.Path, *, echo: bool = True) -> None:
+        self.path = path
+        self.echo = echo
+
+    def write(self, message: str) -> None:
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}"
+        try:
+            if self.path.exists() and self.path.stat().st_size > WATCH_LOG_MAX_BYTES:
+                backup = self.path.with_name(self.path.name + ".1")
+                try:
+                    if backup.exists():
+                        backup.unlink()
+                    os.replace(self.path, backup)
+                except OSError:
+                    pass
+            _append_text(self.path, line + "\n")
+        except OSError:
+            pass
+        if self.echo:
+            try:
+                print(line)
+            except Exception:  # noqa: BLE001 —— 控制台编码/重定向问题不该影响监控
+                pass
+
+
+def clean_finding_title(title: str) -> str:
+    """去掉「真机状态：」这类标签前缀（告警表里每条都带前缀，读者会看不见重点）。"""
+
+    text = str(title or "").strip()
+    if "：" in text:
+        head, tail = text.split("：", 1)
+        if len(head) <= 8 and tail.strip():
+            return tail.strip()
+    return text
+
+
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def canonical_finding_key(scope: str, title: str) -> str:
+    """把带数字/附带说明的标题归一成**稳定 id**，告警才能「只在新变化时落一条」。
+
+    ⚠ 必须归一，两处都会让 id 漂移：
+      * 标题里有动态数字（「模型连续失败 5 次」「连续清醒 40.0 小时」「3 个坏值被净化」）；
+      * 同一问题在状态变化时会多带一段括号说明——最典型的是模型侧：
+        冷却中会写成「模型连续失败 8 次（冷却还剩 1.0 分钟）」，冷却过去后括号消失。
+        不削掉括号就会「开始一条新告警 + 恢复一条旧告警」，一周下来 alerts.log 里
+        全是同一个问题的不同副本——正是最典型的告警疲劳。
+
+    显示用的标题仍取当轮原文（见 ``AlertTracker.update``），这里只影响 id。
+    """
+
+    text = clean_finding_title(title)
+    text = re.sub(r"[（(][^（）()]*[）)]", "", text)
+    text = _NUMBER_RE.sub("#", text)
+    text = re.sub(r"\s+", " ", text).strip(" 　。；;,")
+    return f"{scope or '综合'}|{text}"
+
+
+ALERT_LEVEL_ORDER = {"OK": 0, "WARN": 1, "FAIL": 2}
+
+
+@dataclass
+class Alert:
+    """一条（可能仍在持续的）告警。``first_seen``/``hits`` 用来判断「一直坏着」还是「刚坏」。"""
+
+    id: str
+    level: str
+    title: str
+    scope: str = ""
+    evidence: str = ""
+    fix: str = ""
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+    hits: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "level": self.level, "title": self.title, "scope": self.scope,
+                "evidence": self.evidence, "fix": self.fix, "first_seen": self.first_seen,
+                "last_seen": self.last_seen, "hits": self.hits}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "Alert":
+        return cls(
+            id=str(payload.get("id") or ""),
+            level=str(payload.get("level") or "WARN").upper(),
+            title=str(payload.get("title") or ""),
+            scope=str(payload.get("scope") or ""),
+            evidence=redact(payload.get("evidence"), limit=300),
+            fix=redact(payload.get("fix"), limit=300),
+            first_seen=as_float(payload.get("first_seen"), 0.0) or 0.0,
+            last_seen=as_float(payload.get("last_seen"), 0.0) or 0.0,
+            hits=as_int(payload.get("hits"), 0),
+        )
+
+
+class AlertTracker:
+    """告警状态机：只在**等级变化**时产生事件（开始 / 升级 / 降级 / 恢复）。
+
+    状态存在 ``watch_state.json`` 里，所以「重启监控器」不会把长期问题重新报一遍
+    （否则每天重挂一次就多一轮重复告警，正是要避免的噪音）。
+    """
+
+    def __init__(self, active: Mapping[str, Any] | None = None) -> None:
+        self.active: dict[str, Alert] = {}
+        for key, value in (active or {}).items():
+            if isinstance(value, Mapping) and value.get("level"):
+                alert = Alert.from_dict(value)
+                alert.id = alert.id or str(key)
+                self.active[str(key)] = alert
+
+    def update(self, findings: Sequence[Finding], *, now: float) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for finding in findings:
+            level = finding.level.upper()
+            if level not in ("FAIL", "WARN"):
+                continue
+            key = canonical_finding_key(finding.scope, finding.title)
+            seen.add(key)
+            title = clean_finding_title(finding.title)
+            evidence = redact(finding.evidence, limit=300)
+            fix = redact(finding.fix, limit=300)
+            current = self.active.get(key)
+            if current is None:
+                self.active[key] = Alert(key, level, title, finding.scope, evidence, fix,
+                                         first_seen=now, last_seen=now, hits=1)
+                events.append(self._event(now, "开始", key, level, "", title, evidence, fix))
+                continue
+            previous = current.level
+            current.last_seen = now
+            current.hits += 1
+            current.title = title
+            current.evidence = evidence
+            current.fix = fix
+            if ALERT_LEVEL_ORDER.get(level, 0) > ALERT_LEVEL_ORDER.get(previous, 0):
+                current.level = level
+                events.append(self._event(now, "升级", key, level, previous, title, evidence, fix))
+            elif ALERT_LEVEL_ORDER.get(level, 0) < ALERT_LEVEL_ORDER.get(previous, 0):
+                current.level = level
+                events.append(self._event(now, "降级", key, level, previous, title, evidence, fix))
+        for key in list(self.active):
+            if key in seen:
+                continue
+            gone = self.active.pop(key)
+            events.append(self._event(now, "恢复", key, "OK", gone.level, gone.title,
+                                      "本轮检查未再命中", ""))
+        return events
+
+    @staticmethod
+    def _event(now: float, kind: str, key: str, level: str, previous: str,
+               title: str, evidence: str, fix: str) -> dict[str, Any]:
+        return {"ts": now, "kind": kind, "id": key, "level": level, "prev_level": previous,
+                "title": title, "evidence": evidence, "fix": fix}
+
+    def active_alerts(self) -> list[Alert]:
+        order = {"FAIL": 0, "WARN": 1}
+        return sorted(self.active.values(),
+                      key=lambda item: (order.get(item.level, 2), item.first_seen))
+
+    def to_state(self) -> dict[str, Any]:
+        return {key: alert.to_dict() for key, alert in self.active.items()}
+
+
+class StopFlag:
+    """停止标志。信号处理器与主循环共享它（处理器里只允许做赋值这类异步信号安全的事）。"""
+
+    def __init__(self) -> None:
+        self.stopped = False
+        self.reason = ""
+
+    def request(self, reason: str) -> None:
+        self.stopped = True
+        self.reason = self.reason or reason
+
+
+def install_signal_handlers(flag: StopFlag) -> list[tuple[int, Any]]:
+    """Ctrl+C / 关窗 / SIGTERM / SIGBREAK 都走**优雅停止**：写完汇总、放掉锁再退。
+
+    ⚠ 不装处理器的话，Ctrl+C 会在随机时刻打断写盘，留下一份半截的汇总或锁文件；
+    下次启动还要处理过期锁——「优雅停止」在这里是可用性的一部分。
+    返回被替换掉的旧处理器，退出时恢复（本程序被别的程序 import 时不该改它的信号行为）。
+    """
+
+    def handler(signum, _frame):  # type: ignore[no-untyped-def]
+        flag.request(f"收到信号 {signum}")
+
+    saved: list[tuple[int, Any]] = []
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            saved.append((int(sig), signal.signal(sig, handler)))
+        except (ValueError, OSError, RuntimeError):  # 非主线程 / 平台不支持：静默跳过
+            continue
+    return saved
+
+
+def restore_signal_handlers(saved: Sequence[tuple[int, Any]]) -> None:
+    for sig, previous in saved:
+        try:
+            signal.signal(sig, previous)
+        except (ValueError, OSError, RuntimeError, TypeError):
+            continue
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否还活着（**只申请只读查询权限**，绝不带终止权限）。
+
+    ⚠ Windows 上不能图省事用 ``os.kill(pid, 0)`` 探活：CPython 在 Windows 把任何非
+    CTRL_* 的信号直接翻译成 ``TerminateProcess``——``os.kill(pid, 0)`` 会**真的杀掉**
+    那个进程（退出码 0）。用它探活等于「问一句对面还在不在，顺手把它毙了」。
+    所以 Windows 走 ``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)``：能拿到句柄 = 进程在，
+    拿不到 = 已死（或权限不足，那就当它死了，让 ``--force-lock`` 做人工兜底）。
+    """
+
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes  # noqa: PLC0415 —— 只在 Windows 上需要
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        except Exception:  # noqa: BLE001 —— 判定不了就当「不存活」，由心跳兜底
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class WatchLock:
+    """单实例锁：**心跳 + 进程存活双判据**（两个监控器同时写一批文件会毁掉整周的样本）。
+
+    判据：锁文件里的 ``heartbeat_at``（每次采样刷新）距现在不超过 ``max(3×interval, 600s)``，
+    **或者** 锁里记的 pid 仍然存活（Windows 走只读的 ``OpenProcess``，见 ``_pid_alive``），
+    就认为「另一个监控器还活着」，拒绝启动；否则视为过期锁（进程被强杀/机器断电留下），
+    接管并如实记一条日志——这样「重启机器后重挂监控」不需要手动删锁。
+
+    ⚠ 只靠心跳年龄会在两个场景下误判：报告生成耗时导致心跳晚于阈值（已在 ``run_watch`` 里
+    提前打点解决）、系统时间被前后跳（NTP 校正 / 改表）。pid 存活判据不吃时钟，
+    是这两条的最省事兜底；pid 复用的极小概率由 ``--force-lock`` 人工兜底。
+    """
+
+    def __init__(self, path: pathlib.Path, *, interval: float, force: bool = False,
+                 disabled: bool = False) -> None:
+        self.path = path
+        self.interval = interval
+        self.force = force
+        self.disabled = disabled
+        self.acquired = False
+        self.note = ""
+
+    def _payload(self) -> str:
+        return json.dumps({
+            "schema": WATCH_SCHEMA_VERSION, "pid": os.getpid(),
+            "python": sys.executable, "started_at": time.time(),
+            "started_iso": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "heartbeat_at": time.time(),
+        }, ensure_ascii=False, indent=2)
+
+    def acquire(self) -> tuple[bool, str]:
+        if self.disabled:
+            self.acquired = True
+            self.note = "已按 --no-lock 跳过单实例锁"
+            return True, self.note
+        stale_note = ""
+        if self.path.exists():
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            heartbeat = as_float(payload.get("heartbeat_at"), 0.0) or 0.0
+            age = time.time() - heartbeat if heartbeat > 0 else float("inf")
+            limit = max(self.interval * 3, 600.0)
+            pid = as_int(payload.get("pid"), 0)
+            alive = _pid_alive(pid)
+            if not self.force and (age <= limit or alive):
+                why = ("进程仍存活" if alive else f"心跳距今 {human_span(age)}")
+                return False, (f"已有监控进程在跑（pid={pid}，{why}，"
+                               f"心跳阈值 {human_span(limit)}）")
+            stale_note = (f"接管过期锁：原 pid={pid}（{'仍存活' if alive else '已不存活'}），"
+                          f"心跳距今 {human_span(age) if heartbeat else '未知'}")
+        try:
+            fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # 走的是「过期锁」路径：原子覆盖
+            _atomic_write_text(self.path, self._payload())
+        except OSError as exc:
+            return False, f"锁文件写不进去：{exc.__class__.__name__}: {exc}"
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(self._payload())
+        self.acquired = True
+        self.note = stale_note
+        return True, stale_note
+
+    def heartbeat(self) -> bool:
+        """续命（每次采样前后都要打点）。返回 False = 心跳写不进去，调用方应记一条日志。"""
+
+        if not self.acquired or self.disabled:
+            return True
+        try:
+            _atomic_write_text(self.path, self._payload())
+        except OSError:
+            return False
+        return True
+
+    def release(self) -> None:
+        if not self.acquired or self.disabled:
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if int(payload.get("pid", -1)) == os.getpid():
+                self.path.unlink()
+        except (OSError, ValueError, json.JSONDecodeError):
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        self.acquired = False
+
+
+class LogTailer:
+    """增量扫日志尾部：只读**新增**字节（一周也不会把日志读爆，也不会重复计数）。
+
+    三条必须处理的现实：
+      * 轮转/截断：文件比记的 offset 还小 ⇒ 从 0 重读（否则会永远读不到新内容）；
+      * 首次见面：只读末尾 ``LOG_TAIL_FIRST_BYTES``（不重演历史）；
+      * **只处理完整行**：末尾没有换行的那段留到下次。写入方随时可能只写到一半，
+        故障签名正好被截断 ⇒ 漏报；更糟的是把半行当完整行统计 ⇒ 假报。
+        （判据是「读到的不以换行结尾」而不是「没读到文件末尾」——后者在
+        「文件本来就没有末尾换行」时会把半行当完整行。）
+    """
+
+    def __init__(self, offsets: Mapping[str, Any] | None = None) -> None:
+        self.offsets: dict[str, dict[str, int]] = {}
+        for path, value in (offsets or {}).items():
+            if isinstance(value, Mapping):
+                self.offsets[str(path)] = {"offset": as_int(value.get("offset")),
+                                           "size": as_int(value.get("size"))}
+
+    def to_state(self) -> dict[str, Any]:
+        return {path: dict(value) for path, value in self.offsets.items()}
+
+    def poll(self, paths: Sequence[pathlib.Path]) -> dict[str, Any]:
+        result: dict[str, Any] = {"files": 0, "lines": 0, "errors": 0, "rotated": 0,
+                                  "oversized": 0, "fail_hits": {}, "warn_hits": {},
+                                  "recent_errors": [], "signature_excerpts": []}
+        for path in paths:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            info = self.offsets.setdefault(str(path), {"offset": 0, "size": 0})
+            offset = info.get("offset", 0)
+            if size < offset:
+                offset = 0
+                result["rotated"] += 1
+            if offset == 0 and size > LOG_TAIL_FIRST_BYTES:
+                offset = size - LOG_TAIL_FIRST_BYTES
+            if size <= offset:
+                info["size"] = size
+                continue
+            want = min(size - offset, LOG_TAIL_MAX_BYTES_PER_POLL)
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(offset)
+                    chunk = handle.read(want)
+            except OSError:
+                continue
+            consumed = offset + len(chunk)
+            if not chunk.endswith(b"\n"):
+                cut = chunk.rfind(b"\n")
+                if cut < 0:
+                    if size - offset >= LOG_TAIL_MAX_BYTES_PER_POLL:
+                        # 单行比单轮读取上限还长（巨大 JSON/参数 dump）：**必须前进**，
+                        # 否则每个采样周期都重读同一段，不但白费力气，还永远读不到后面的新内容。
+                        # 代价是这一行的开头被跳过——所以把它记进 oversized，让 WARN 说出来。
+                        info["offset"] = consumed
+                        info["size"] = size
+                        result["oversized"] = as_int(result.get("oversized")) + 1
+                    continue  # 行还没写完（写入方只写了一半）：下一轮再读
+                chunk = chunk[: cut + 1]
+                consumed = offset + cut + 1
+            text = chunk.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+            result["files"] += 1
+            result["lines"] += len(lines)
+            for line in lines:
+                level_match = LOG_LEVEL_RE.search(line)
+                if level_match and level_match.group(1).upper() in ("ERROR", "CRITICAL"):
+                    result["errors"] += 1
+                    if len(result["recent_errors"]) < 5:
+                        result["recent_errors"].append(redact(line, limit=200))
+                fail_hit, warn_hit = match_signatures(line)
+                if fail_hit:
+                    result["fail_hits"][fail_hit] = result["fail_hits"].get(fail_hit, 0) + 1
+                if warn_hit:
+                    result["warn_hits"][warn_hit] = result["warn_hits"].get(warn_hit, 0) + 1
+            # v1.2.0（D10）：命中**原文**随增量一起收走——告警只计数的话，
+            # 归因永远要人肉上真机翻日志（18h 真机窗口就是这么废掉的）。
+            for block in _signature_excerpts(lines, source_name=path.name):
+                if len(result["signature_excerpts"]) >= 12:
+                    break
+                result["signature_excerpts"].append(block)
+            info["offset"] = consumed
+            info["size"] = size
+        return result
+
+
+@dataclass
+class WatchSources:
+    """监控目标：数据目录 / 配置 / 日志。数据目录未找到时会**周期重试**（部署是逐步的）。"""
+
+    data_dir: pathlib.Path | None = None
+    data_dir_source: str = "未找到"
+    config_path: pathlib.Path | None = None
+    log_paths: list[pathlib.Path] = field(default_factory=list)
+
+
+def _auto_data_dir(plugin_dir: pathlib.Path, search_roots: Sequence[pathlib.Path]
+                   ) -> tuple[pathlib.Path | None, str]:
+    """自动定位数据目录（复用一次性报告的归属校验：签名匹配才算本插件的数据）。"""
+
+    discovered = discover_data_dirs(list(search_roots) + [plugin_dir])
+    best: pathlib.Path | None = None
+    best_score = -1
+    best_notes: list[str] = []
+    for candidate in discovered:
+        score, notes = score_data_dir(candidate)
+        if score > best_score:
+            best, best_score, best_notes = candidate, score, notes
+    if best is not None and best_score >= 8:
+        return best.resolve(), f"自动发现（{('；'.join(best_notes))[:80]}，得分 {best_score}）"
+    if best is not None and best_score >= 4:
+        return best.resolve(), f"自动发现（{('；'.join(best_notes))[:80]}，得分 {best_score}）"
+    return None, "未找到（自动搜索没有命中 life_state.json / life_store.db 签名）"
+
+
+def resolve_watch_sources(*, plugin_dir: pathlib.Path, search_roots: Sequence[pathlib.Path],
+                          data_dir: pathlib.Path | None, config_path: pathlib.Path | None,
+                          log_paths: Sequence[pathlib.Path]) -> WatchSources:
+    sources = WatchSources()
+    if data_dir is not None:
+        sources.data_dir = data_dir.resolve()
+        sources.data_dir_source = "由 --data-dir 指定"
+    else:
+        sources.data_dir, sources.data_dir_source = _auto_data_dir(plugin_dir, search_roots)
+    if config_path is not None:
+        sources.config_path = config_path.resolve()
+    else:
+        candidates: list[pathlib.Path] = []
+        if sources.data_dir is not None:
+            candidates.append(sources.data_dir / CONFIG_FILE)
+        candidates.append(plugin_dir / CONFIG_FILE)
+        candidates.extend(root / CONFIG_FILE for root in search_roots)
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            payload, _error = _load_toml(candidate)
+            if looks_like_config(payload):
+                sources.config_path = candidate.resolve()
+                break
+    if log_paths:
+        sources.log_paths = [path.resolve() for path in log_paths]
+    else:
+        roots = list(search_roots) + [plugin_dir]
+        if sources.data_dir is not None:
+            roots.insert(0, sources.data_dir)
+        sources.log_paths = find_log_candidates(roots)
+    return sources
+
+
+def _read_store_counts_ro(path: pathlib.Path) -> tuple[dict[str, Any], str]:
+    """直连只读读表计数（**不复制**——见本节开头的取舍说明）。"""
+
+    detail: dict[str, Any] = {"present": False, "size": 0, "tables": "", "relationships": "",
+                              "routine_daily": ""}
+    if not path.exists():
+        return detail, "文件不存在（关系档案与习惯会降级成内存态）"
+    try:
+        detail["size"] = path.stat().st_size
+    except OSError:
+        pass
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=3)
+    except sqlite3.Error as exc:
+        return detail, f"只读打开失败：{exc.__class__.__name__}"
+    note = ""
+    try:
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        detail["present"] = True
+        detail["tables"] = len(tables)
+        for table in ("relationships", "routine_daily"):
+            if table not in tables:
+                continue
+            try:
+                detail[table] = int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            except sqlite3.Error as exc:
+                note = f"{table} 计数失败：{exc}"
+    except sqlite3.Error as exc:
+        note = f"库读不出来（{exc}）；每日完整报告会走复制路径再试"
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    return detail, note
+
+
+def _findings_for_log(result: Mapping[str, Any]) -> list[Finding]:
+    findings: list[Finding] = []
+    fail_hits = result.get("fail_hits") or {}
+    warn_hits = result.get("warn_hits") or {}
+    if fail_hits:
+        findings.append(Finding(
+            "FAIL", "日志里有确定性故障签名（新增）",
+            evidence="；".join(f"{key}×{value}" for key, value in list(fail_hits.items())[:6]),
+            fix="按签名逐条定位；命中原文已落盘 watch/log_excerpts.jsonl，"
+                "完整报告（daily/）第 7 节也有",
+            scope="日志"))
+    if warn_hits:
+        findings.append(Finding(
+            "WARN", "日志里有可疑签名（新增）",
+            evidence="；".join(f"{key}×{value}" for key, value in list(warn_hits.items())[:6]),
+            fix="可能是正常降级，也可能在持续失败；命中原文见 watch/log_excerpts.jsonl "
+                "与 daily/ 报告",
+            scope="日志"))
+    if result.get("oversized"):
+        findings.append(Finding(
+            "WARN", "日志里有超长行（超过单轮读取上限，已跳过该段开头）",
+            evidence=f"跳过 {result['oversized']} 段（单行 > "
+                     f"{human_size(LOG_TAIL_MAX_BYTES_PER_POLL)} 且中间没有换行可切）",
+            fix="确认日志里是不是被塞进了巨大的 JSON/参数 dump；"
+                "被跳过的那一段不计入签名统计",
+            scope="日志"))
+    return findings
+
+
+@dataclass
+class WatchPaths:
+    """监控目录里的全部文件（都在 ``<插件目录>/diagnostics/watch/`` 下，均不进 git）。"""
+
+    root: pathlib.Path
+    lock: pathlib.Path
+    state: pathlib.Path
+    log: pathlib.Path
+    samples_jsonl: pathlib.Path
+    samples_csv: pathlib.Path
+    alerts_log: pathlib.Path
+    alerts_md: pathlib.Path
+    summary: pathlib.Path
+    daily: pathlib.Path
+    stop: pathlib.Path
+    log_excerpts: pathlib.Path
+    marks: pathlib.Path
+
+    @classmethod
+    def of(cls, root: pathlib.Path) -> "WatchPaths":
+        return cls(
+            root=root, lock=root / "watch.lock", state=root / "watch_state.json",
+            log=root / "watch.log", samples_jsonl=root / "samples.jsonl",
+            samples_csv=root / "samples.csv", alerts_log=root / "alerts.log",
+            alerts_md=root / "alerts.md", summary=root / "watch_summary.md",
+            daily=root / "daily", stop=root / "watch.stop",
+            log_excerpts=root / "log_excerpts.jsonl",
+            marks=root / "watch_marks.jsonl",
+        )
+
+    def ensure(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.daily.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class WatchContext:
+    """一次监控会话的固定上下文（采样函数只依赖它，便于单测直接构造）。"""
+
+    plugin_dir: pathlib.Path
+    search_roots: list[pathlib.Path]
+    sources: WatchSources
+    tailer: LogTailer
+    interval: float
+
+
+def load_watch_state(paths: WatchPaths) -> dict[str, Any]:
+    payload, _error = read_json(paths.state)
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_watch_state(paths: WatchPaths, state: Mapping[str, Any]) -> None:
+    try:
+        _atomic_write_text(paths.state,
+                           json.dumps(state, ensure_ascii=False, indent=2, default=str))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- 改动分段标记（v1.19.0 PR-AF-1）
+
+
+def append_mark(paths: WatchPaths, label: str, *, now: float, tz: int) -> bool:
+    """v1.19.0（PR-AF-1 配套）：给长期监控打一个「改动时点」标记。
+
+    为什么用**独立追加文件**而不是写进 ``watch_state.json``：标记是在部署重启那一刻
+    由人补的，而 watch 主循环每一轮都在整份重写 ``watch_state.json``——两个进程同时写
+    同一份 JSON 会把整周数据写乱。``watch_marks.jsonl`` 走 O_APPEND 追加，天然无锁。
+
+    用法（部署并完整重启之后）：
+
+        python collect_diagnostics.py --mark "改清醒侧判据" --watch-dir <监控目录>
+    """
+
+    text = str(label or "").strip()
+    if not text:
+        return False
+    try:
+        paths.root.mkdir(parents=True, exist_ok=True)
+        with paths.marks.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"at": now, "iso": human_stamp(now, tz), "label": text},
+                                    ensure_ascii=False) + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def load_marks(paths: WatchPaths) -> list[dict[str, Any]]:
+    """读回所有标记（按时间排序；坏行跳过）。文件不存在 = 没有任何分段。"""
+
+    if not paths.marks.exists():
+        return []
+    marks: list[dict[str, Any]] = []
+    try:
+        with paths.marks.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and as_float(payload.get("at"), 0.0) > 0:
+                    marks.append(payload)
+    except OSError:
+        return []
+    marks.sort(key=lambda item: as_float(item.get("at"), 0.0) or 0.0)
+    return marks
+
+
+#: 签名原文环形文件的上限：超过就把旧文件让位（原文是现场证据，但没必要无限留）
+LOG_EXCERPTS_MAX_BYTES = 1 << 20
+
+
+def append_log_excerpts(paths: WatchPaths, excerpts: Sequence[str], *,
+                        now: float, tz: int) -> None:
+    """v1.2.0（D10）：把本轮采到的签名命中原文追加进 ``log_excerpts.jsonl``（环形）。"""
+
+    if not excerpts:
+        return
+    try:
+        if (paths.log_excerpts.exists()
+                and paths.log_excerpts.stat().st_size > LOG_EXCERPTS_MAX_BYTES):
+            old = paths.log_excerpts.with_name("log_excerpts.old.jsonl")
+            try:
+                old.unlink()
+            except FileNotFoundError:
+                pass
+            paths.log_excerpts.rename(old)
+        payload = {"ts": round(now, 3), "iso": local_stamp(now, tz),
+                   "excerpts": list(excerpts)}
+        _append_text(paths.log_excerpts, json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def load_recent_log_excerpts(paths: WatchPaths, *, limit: int = 6) -> list[dict[str, Any]]:
+    """读回最近的若干条签名原文（汇总报告渲染用；文件坏了当没有，不拦报告）。"""
+
+    try:
+        text = paths.log_excerpts.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("excerpts"):
+            rows.append(payload)
+    return rows[-limit:]
+
+
+def append_sample(paths: WatchPaths, row: Mapping[str, Any]) -> None:
+    """一行样本同时落 JSONL（保真、带 findings 明细）与 CSV（能直接导入 Excel）。"""
+
+    try:
+        _append_text(paths.samples_jsonl,
+                     json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass
+    try:
+        fresh = not paths.samples_csv.exists() or paths.samples_csv.stat().st_size == 0
+        with paths.samples_csv.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(SAMPLE_CSV_COLUMNS),
+                                    extrasaction="ignore")
+            if fresh:
+                writer.writeheader()
+            writer.writerow(row)
+    except OSError:
+        pass
+
+
+def load_samples(paths: WatchPaths) -> tuple[list[dict[str, Any]], int]:
+    """读回全部样本（外加坏行计数——坏行只能来自被杀在半截的写入，必须如实统计）。"""
+
+    rows: list[dict[str, Any]] = []
+    broken = 0
+    try:
+        text = paths.samples_jsonl.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return rows, 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            broken += 1
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows, broken
+
+
+def take_sample(ctx: WatchContext, *, now: float, sample_index: int, uptime: float,
+                gap: float, run_starts: int, prev_sha: str, prev_unchanged: int
+                ) -> tuple[dict[str, Any], list[Finding]]:
+    """采一个样本 →（一行时序数据, 一组结论）。
+
+    ⚠ 判定**不另写阈值**：状态侧直接调 ``_state_checks``、配置侧直接调 ``collect_config``
+    ——都是一次性报告用的同一个函数。两套判据迟早漂移，然后就会出现
+    「诊断报告说 FAIL、监控说 OK」这种自相矛盾的现场。
+    """
+
+    sources = ctx.sources
+    row: dict[str, Any] = {
+        "sample_index": sample_index,
+        "ts": round(now, 3),
+        "uptime_seconds": round(uptime, 1),
+        "gap_seconds": round(gap, 1) if gap >= 0 else "",
+        "run_starts": run_starts,
+        "data_dir": str(sources.data_dir) if sources.data_dir else "",
+        "data_dir_source": sources.data_dir_source,
+        "state_present": False,
+    }
+    check = Report()
+    config_payload: dict[str, Any] = {}
+    if sources.config_path is not None and sources.config_path.exists():
+        config_payload, config_error = _load_toml(sources.config_path)
+        if config_error:
+            check.add("WARN", "监控：config.toml 读不出来", evidence=config_error,
+                      fix="宿主读不出配置会退回默认值：先修 TOML 语法", scope="配置")
+    else:
+        check.add("WARN", "监控：未找到 config.toml",
+                  evidence="判定退回内置默认值（tick 600s / sleep_window 03:00-11:00 …），"
+                           "阈值可能与真机不一致",
+                  fix="用 --config 指定宿主落盘的配置", scope="配置")
+    tz = as_int(_section(config_payload, "simulation").get("tz_offset_minutes"), 480)
+    row["iso"] = local_stamp(now, tz)
+    simulation = _section(config_payload, "simulation")
+    tick_seconds = max(60, as_int(simulation.get("tick_seconds"), 600))
+    frequency = _section(config_payload, "frequency")
+    apply_section = _section(config_payload, "apply")
+    plugin_section = _section(config_payload, "plugin")
+    row.update({
+        "tick_seconds": tick_seconds,
+        "cfg_enabled": bool(plugin_section.get("enabled", True)),
+        "cfg_paused": bool(frequency.get("paused", False)),
+        "cfg_dry_run": bool(simulation.get("dry_run", False)),
+        "cfg_filter_mode": str(apply_section.get("filter_mode") or ""),
+        "cfg_config_version": str(plugin_section.get("config_version") or ""),
+        "cfg_sleep_window": str(simulation.get("sleep_window") or ""),
+    })
+    # 配置侧复用一次性报告的判定（paused / dry_run / filter_mode / sleep_window / 曲线坏行 …）
+    if config_payload and sources.config_path is not None:
+        try:
+            collect_config(check, sources.config_path, PURE, ctx.plugin_dir)
+        except Exception as exc:  # noqa: BLE001 —— 配置判定失败不许拖垮采样
+            check.add("WARN", "监控：配置侧判定抛异常",
+                      evidence=f"{exc.__class__.__name__}: {exc}",
+                      fix="修配置判定；或先跑一次 collect_diagnostics.py 看完整报告",
+                      scope="配置")
+
+    # ---- 状态侧 ----
+    payload: dict[str, Any] | None = None
+    detail: dict[str, Any] = {}
+    state_path = (sources.data_dir / STATE_FILES[0]) if sources.data_dir else None
+    if state_path is not None and state_path.exists():
+        row["state_present"] = True
+        loaded, error = read_json(state_path)
+        if isinstance(loaded, dict):
+            payload = loaded
+            detail = _state_checks(check, payload, tz=tz, now=now, config=config_payload,
+                                   label="真机状态", simulated=False)
+        else:
+            check.add("FAIL", "真机状态：状态文件不可用", evidence=error or "顶层不是 JSON 对象",
+                      fix="备份后删除让它重建（会丢生活状态，但对账记忆另存文件）",
+                      scope="状态")
+        try:
+            stat = state_path.stat()
+            row["state_size"] = stat.st_size
+            row["state_age_seconds"] = round(max(0.0, now - stat.st_mtime), 1)
+            if stat.st_size > STATE_SIZE_WARN_BYTES:
+                check.add("WARN", "监控：状态文件体积异常",
+                          evidence=f"{human_size(stat.st_size)}（阈值 "
+                                   f"{human_size(STATE_SIZE_WARN_BYTES)}）",
+                          fix="去重表/历史账本膨胀会拖慢每次 tick：看表规模那一列，"
+                              "确认 TTL 清理路径在跑", scope="状态")
+        except OSError:
+            pass
+        row["state_sha16"] = sha256_of(state_path)[:16]
+    elif sources.data_dir is None:
+        check.add("WARN", "监控：还没有找到本插件的运行时数据目录",
+                  evidence=sources.data_dir_source,
+                  fix="用 --data-dir 指向数据目录（或 --search-root 指向 MaiBot 根）；"
+                      "插件尚未部署时这条会一直是当前告警", scope="监控")
+    else:
+        check.add("WARN", "监控：数据目录里没有 life_state.json",
+                  evidence=f"数据目录 {sources.data_dir}",
+                  fix="确认插件已被宿主加载并跑过至少一个 tick；若是刚部署，"
+                      "看日志里有没有加载失败", scope="监控")
+
+    sha = str(row.get("state_sha16") or "")
+    unchanged = (prev_unchanged + 1) if (sha and sha == prev_sha) else (1 if sha else 0)
+    row["state_unchanged_samples"] = unchanged
+
+    def put(target: str, value: Any) -> None:
+        row[target] = "" if value is None else value
+
+    put("last_tick_at", (payload or {}).get("last_tick_at"))
+    put("tick_age_seconds", detail.get("last_tick_age_seconds"))
+    put("activity", detail.get("activity"))
+    put("activity_label", detail.get("activity_label"))
+    put("scene", detail.get("scene"))
+    put("minutes_in_activity", detail.get("minutes_in_activity"))
+    for key in ("emotion", "energy", "energy_cap", "afterglow", "stress", "loneliness",
+                "social_battery", "last_addressed_at", "sleep_minutes_today",
+                "sleep_debt_nights",
+                "continuous_awake_minutes", "llm_fail_streak", "llm_cooldown_seconds_left",
+                "applied_sessions", "foreign_sessions", "observed_sessions",
+                "unbacked_sessions"):
+        put(key, detail.get(key))
+    last_success = as_float(detail.get("llm_last_success"), 0.0) or 0.0
+    put("llm_success_age_seconds", round(now - last_success, 1) if last_success > 0 else "")
+    put("unbacked_worst_seconds", round(as_float(detail.get("unbacked_worst_seconds"), 0.0) or 0.0, 1)
+        if detail.get("unbacked_worst_seconds") is not None else "")
+    put("sanitized_key_count", len(detail.get("sanitized_keys") or []))
+    tables = detail.get("table_sizes") or {}
+    put("table_bloated", sum(1 for size in tables.values() if as_int(size) > 5000))
+    # 「锚点在推进、文件却很久没落盘」是另一种故障：状态说自己活着，磁盘上没有证据
+    state_age = as_float(row.get("state_age_seconds"))
+    tick_age = as_float(row.get("tick_age_seconds"))
+    if (state_age is not None and tick_age is not None
+            and state_age > max(tick_seconds * 3, 3600) and tick_age <= tick_seconds * 1.5):
+        check.add("WARN", "监控：状态锚点在推进但状态文件长时间没有落盘",
+                  evidence=f"文件 {human_span(state_age)} 未更新，而 last_tick_at 只差 "
+                           f"{human_span(tick_age)}",
+                  fix="确认磁盘/权限；或宿主在写状态时被别的进程锁住", scope="状态")
+
+    # ---- 对账记忆 ----
+    memory_path = (sources.data_dir / STATE_FILES[1]) if sources.data_dir else None
+    if memory_path is not None and memory_path.exists():
+        memory, _error = read_json(memory_path)
+        if isinstance(memory, dict):
+            put("mem_applied", len(memory.get("applied") or {}))
+            put("mem_foreign", len(memory.get("foreign") or {}))
+
+    # ---- 库侧（只读直连，不复制）----
+    store_path = (sources.data_dir / STORE_FILE) if sources.data_dir else None
+    if store_path is not None:
+        store, store_note = _read_store_counts_ro(store_path)
+        row["store_present"] = bool(store.get("present"))
+        row["store_size"] = store.get("size") or ""
+        row["store_table_count"] = store.get("tables") if store.get("tables") != "" else ""
+        row["store_relationships"] = store.get("relationships")
+        row["store_routine_daily"] = store.get("routine_daily")
+        row["store_note"] = store_note
+        if not store_path.exists():
+            check.add("WARN", "监控：life_store.db 还没生成",
+                      evidence="关系档案与习惯日态会降级成内存态",
+                      fix="插件写过关系/习惯后会自动建库；一直不出现要看日志里有没有写库异常",
+                      scope="库")
+        elif not store.get("present"):
+            # 与 collect_store 同判据：库存在但读不出来 = FAIL（一次性报告也是这么判的）
+            check.add("FAIL", "监控：life_store.db 读不出来", evidence=store_note,
+                      fix="库坏了插件会降级成内存态（习惯会每天重复命中）；备份后删除重建",
+                      scope="库")
+        elif store_note:
+            # 库能打开、但某张签名表计数失败：不许当成「库正常」——那会把一条真问题
+            # 变成样本里的空值（check_status 还是 ok），属于最坏的静默失败
+            check.add("WARN", "监控：库表计数失败", evidence=store_note,
+                      fix="看 daily/ 里的完整报告（它允许复制库再读，能看到更具体的原因）",
+                      scope="库")
+
+    # ---- 日志侧（增量尾部）----
+    log_result = ctx.tailer.poll(sources.log_paths) if sources.log_paths else {}
+    row["log_files"] = log_result.get("files", 0)
+    row["log_new_lines"] = log_result.get("lines", 0)
+    row["log_new_errors"] = log_result.get("errors", 0)
+    row["log_new_fail_hits"] = sum((log_result.get("fail_hits") or {}).values())
+    row["log_new_warn_hits"] = sum((log_result.get("warn_hits") or {}).values())
+    # v1.2.0（D10）：签名原文不进样本行（会把 JSONL/CSV 撑爆），单独走环形文件。
+    # 挂在 row 上带出去，由主循环 pop 出来落盘。
+    row["log_excerpts"] = list(log_result.get("signature_excerpts") or [])
+    if sources.log_paths:
+        missing_logs = [path for path in sources.log_paths if not path.exists()]
+        if len(missing_logs) == len(sources.log_paths):
+            # 路径写错时**必须报**：否则监控照常跑、日志侧永远 0 命中，看起来「没故障」
+            check.add("WARN", "监控：日志文件不存在（本次无法从日志取证）",
+                      evidence="；".join(str(path) for path in missing_logs[:3]),
+                      fix="核对 --log 路径；日志轮转后旧文件名会失效，"
+                          "不传 --log 让程序自动找也行", scope="日志")
+        check.findings.extend(_findings_for_log(log_result))
+    else:
+        check.add("WARN", "监控：没找到宿主日志", evidence="日志是判断「哪一步失败」最直接的证据",
+                  fix="用 --log 指定 MaiBot 日志（或 --search-root 指向 MaiBot 根目录）",
+                  scope="日志")
+
+    findings = [finding for finding in check.findings if finding.level in ("FAIL", "WARN")]
+    row["findings_fail"] = sum(1 for finding in findings if finding.level == "FAIL")
+    row["findings_warn"] = sum(1 for finding in findings if finding.level == "WARN")
+    if row["findings_fail"]:
+        row["check_status"] = "fail"
+    elif row["findings_warn"]:
+        row["check_status"] = "warn"
+    elif not row["state_present"]:
+        row["check_status"] = "unknown"
+    else:
+        row["check_status"] = "ok"
+    row["note"] = (clean_finding_title(findings[0].title) if findings else "")
+    # findings 存成结构化三元组：id 本身含分隔符，用字符串拼接会在汇总时被切错
+    row["findings"] = [{"level": finding.level, "id": canonical_finding_key(finding.scope,
+                                                                           finding.title),
+                        "title": clean_finding_title(finding.title)} for finding in findings]
+    for key in SAMPLE_CSV_COLUMNS:
+        row.setdefault(key, "")
+    return row, findings
+
+
+#: 新 FAIL 触发完整报告的最小间隔 / 每日上限（现场证据要固定，但也不能刷爆目录）
+CAPTURE_MIN_GAP_SECONDS = 600.0
+CAPTURE_MAX_PER_DAY = 8
+
+
+def capture_full_report(paths: WatchPaths, *, plugin_dir: pathlib.Path, sources: WatchSources,
+                        search_roots: Sequence[pathlib.Path], now: float, reason: str,
+                        log: RunLog | None = None) -> pathlib.Path | None:
+    """在监控过程中落一份**完整诊断报告**（复用 ``build_report``，与手动跑完全一致）。"""
+
+    try:
+        report = build_report(
+            plugin_dir, data_dir=sources.data_dir, config_path=sources.config_path,
+            log_paths=[path for path in sources.log_paths if path],
+            search_roots=list(search_roots), simulate_hours=0.0, run_gates=False,
+            now=now, out_dir=paths.daily,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 完整报告失败不该中断监控
+        if log:
+            log.write(f"完整报告生成失败（{reason}）：{exc.__class__.__name__}: {exc}")
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"life-frequency-诊断-{stamp}"
+    md_path = paths.daily / f"{base}.md"
+    # 同一秒可能触发两次抓取（新 FAIL + --once）：加序号，别让后一份盖掉前一份
+    counter = 1
+    while md_path.exists() and counter < 100:
+        counter += 1
+        md_path = paths.daily / f"{base}-{counter}.md"
+    json_path = md_path.with_suffix(".json")
+    body = dict(report.sections).get("REPORT", "")
+    body += f"\n---\n\n> 本报告由 watch 模式自动生成（触发原因：{reason}）。\n"
+    try:
+        _atomic_write_text(md_path, body)
+        _atomic_write_text(json_path, json.dumps({
+            "machine": report.machine,
+            "counts": report.counts(),
+            "findings": [item.to_dict() for item in report.findings],
+            "watch_reason": reason,
+        }, ensure_ascii=False, indent=2, default=str))
+    except OSError as exc:
+        if log:
+            log.write(f"完整报告写盘失败：{exc.__class__.__name__}: {exc}")
+        return None
+    if log:
+        counts = report.counts()
+        log.write(f"完整报告：{md_path.name}（{reason}；FAIL {counts['FAIL']} / "
+                  f"WARN {counts['WARN']}）")
+    return md_path
+
+
+def _last_report_age(paths: WatchPaths, *, now: float) -> float | None:
+    """最近一份完整报告距今多少秒（None = 一份都没有）。
+
+    用它给「周期报告」续期：崩溃-重启循环里每次启动都补一份报告的话，
+    一天下来 `daily/` 会被报告塞满（报告本身有 100+ KB）。
+    """
+
+    newest = 0.0
+    for item in paths.daily.glob("life-frequency-诊断-*"):
+        try:
+            newest = max(newest, item.stat().st_mtime)
+        except OSError:
+            continue
+    return (now - newest) if newest > 0 else None
+
+
+def prune_watch_dir(paths: WatchPaths, *, retain_days: float, now: float,
+                    log: RunLog | None = None) -> dict[str, int]:
+    """按保留期裁剪样本与历史报告（**只动 watch 目录自己的文件**）。"""
+
+    stats = {"samples_dropped": 0, "reports_dropped": 0, "alerts_trimmed": 0,
+             "tmp_removed": 0, "logs_removed": 0}
+    if retain_days <= 0:
+        return stats
+    cutoff = now - retain_days * 86400.0
+    rows, _broken = load_samples(paths)
+    kept = [row for row in rows
+            if (as_float(row.get("ts"), 0.0) or 0.0) >= cutoff]
+    dropped = len(rows) - len(kept)
+    if dropped > 0:
+        try:
+            _atomic_write_text(paths.samples_jsonl, "".join(
+                json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in kept))
+            with paths.samples_csv.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(SAMPLE_CSV_COLUMNS),
+                                        extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(kept)
+            stats["samples_dropped"] = dropped
+        except OSError:
+            pass
+    try:
+        for item in sorted(paths.daily.glob("life-frequency-诊断-*")):
+            try:
+                if item.stat().st_mtime < cutoff:
+                    item.unlink()
+                    stats["reports_dropped"] += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    try:
+        if paths.alerts_log.exists():
+            lines = paths.alerts_log.read_text(encoding="utf-8", errors="replace").splitlines()
+            if len(lines) > ALERT_LOG_TRIM_THRESHOLD:
+                _atomic_write_text(paths.alerts_log,
+                                   "\n".join(lines[-ALERT_LOG_KEEP_LINES:]) + "\n")
+                stats["alerts_trimmed"] = len(lines) - ALERT_LOG_KEEP_LINES
+    except OSError:
+        pass
+    # 原子写的 .tmp 残留与轮转出来的 watch.log.1：都不该长期活在这个目录里
+    try:
+        for item in paths.root.glob("*.tmp"):
+            try:
+                if now - item.stat().st_mtime > 3600:
+                    item.unlink()
+                    stats["tmp_removed"] += 1
+            except OSError:
+                continue
+        for item in paths.root.glob(f"{paths.log.name}.*"):
+            try:
+                if now - item.stat().st_mtime > retain_days * 86400:
+                    item.unlink()
+                    stats["logs_removed"] += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    if log and any(stats.values()):
+        log.write(f"保留期裁剪（{retain_days:g} 天）：样本 -{stats['samples_dropped']}、"
+                  f"报告 -{stats['reports_dropped']}、告警流水 -{stats['alerts_trimmed']}、"
+                  f"临时残留 -{stats['tmp_removed']}、旧运行日志 -{stats['logs_removed']}")
+    return stats
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, quantile)) * (len(ordered) - 1)
+    low = int(math.floor(position))
+    high = int(math.ceil(position))
+    if low == high:
+        return ordered[low]
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def _mean(values: Sequence[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _fmt(value: Any, digits: int = 2) -> str:
+    if value is None or value == "":
+        return "—"
+    number = as_float(value)
+    if number is None:
+        return str(value)
+    return f"{number:.{digits}f}"
+
+
+def summarize_rows(rows: Sequence[Mapping[str, Any]], *, interval: float) -> dict[str, Any]:
+    """把一周的样本压成可读的统计量（覆盖缺口 / 卡顿 / 模型 / 数值 / 逐日走势）。"""
+
+    summary: dict[str, Any] = {"count": len(rows), "interval": interval}
+    if not rows:
+        return summary
+    ordered = sorted(rows, key=lambda row: as_float(row.get("ts"), 0.0) or 0.0)
+    stamps = [as_float(row.get("ts"), 0.0) or 0.0 for row in ordered]
+    start, end = stamps[0], stamps[-1]
+    summary.update({"start": start, "end": end, "span_seconds": max(0.0, end - start)})
+    # 覆盖率用**实际中位间隔**算，而不是配置的 --interval：同一个 watch 目录可能被不同
+    # 间隔的几轮监控写过（调试时用 1 分钟、正式跑改成 5 分钟），用配置值会把覆盖率算废。
+    # 中位数对少量缺口（机器休眠一晚上）稳健，不会被几次大间隔带偏。
+    deltas = [later - earlier for earlier, later in zip(stamps, stamps[1:])]
+    positive = [delta for delta in deltas if delta > 0]
+    effective = (max(1.0, float(statistics.median(positive))) if positive
+                 else max(1.0, interval))
+    summary["configured_interval"] = interval
+    summary["effective_interval"] = effective
+    expected = max(1.0, (end - start) / effective + 1.0) if end > start else 1.0
+    summary["expected"] = expected
+    summary["coverage"] = min(1.0, len(ordered) / expected)
+    summary["missing_samples"] = max(0.0, expected - len(ordered))
+    # 缺口阈值取「两个采样周期」：缺一个点是调度抖动（报告生成/磁盘慢），
+    # 连丢两个点才是真的停机。再宽就会把「机器睡了 10 分钟」这种整段丢失算成正常。
+    threshold = max(effective * 2.0, effective + 120.0)
+    gaps: list[dict[str, float]] = []
+    for previous, current in zip(ordered, ordered[1:]):
+        prev_ts = as_float(previous.get("ts"), 0.0) or 0.0
+        cur_ts = as_float(current.get("ts"), 0.0) or 0.0
+        if cur_ts - prev_ts > threshold:
+            gaps.append({"from": prev_ts, "to": cur_ts, "span": cur_ts - prev_ts})
+    summary["gaps"] = gaps
+    summary["gap_total_seconds"] = sum(item["span"] for item in gaps)
+    summary["max_gap_seconds"] = max((item["span"] for item in gaps), default=0.0)
+
+    ages: list[float] = []
+    slow = stalled = no_age = 0
+    for row in ordered:
+        age = as_float(row.get("tick_age_seconds"))
+        tick = as_float(row.get("tick_seconds"), 600.0) or 600.0
+        if age is None:
+            no_age += 1
+            continue
+        ages.append(age)
+        if age > tick * 6:
+            stalled += 1
+        elif age > tick * 1.5:
+            slow += 1
+    summary["tick"] = {"samples": len(ages), "no_age": no_age,
+                       "min": min(ages) if ages else None,
+                       "median": statistics.median(ages) if ages else None,
+                       "p90": _percentile(ages, 0.9), "max": max(ages) if ages else None,
+                       "slow": slow, "stalled": stalled}
+
+    activity: dict[str, int] = {}
+    for row in ordered:
+        label = str(row.get("activity_label") or row.get("activity") or "未知")
+        activity[label] = activity.get(label, 0) + 1
+    summary["activity"] = activity
+
+    streaks = [as_int(row.get("llm_fail_streak")) for row in ordered]
+    cooldowns = [as_float(row.get("llm_cooldown_seconds_left"), 0.0) or 0.0 for row in ordered]
+    success_ages = [age for age in
+                    (as_float(row.get("llm_success_age_seconds")) for row in ordered)
+                    if age is not None]
+    summary["llm"] = {
+        "fail_samples": sum(1 for streak in streaks if streak > 0),
+        "max_streak": max(streaks, default=0),
+        "cooldown_samples": sum(1 for value in cooldowns if value > 0),
+        "max_cooldown": max(cooldowns, default=0.0),
+        "last_success_age": success_ages[-1] if success_ages else None,
+    }
+
+    def series(key: str) -> list[float]:
+        return [value for value in (as_float(row.get(key)) for row in ordered)
+                if value is not None]
+
+    applied = series("applied_sessions")
+    observed = series("observed_sessions")
+    unbacked = series("unbacked_worst_seconds")
+    sizes = series("state_size")
+    summary["apply"] = {
+        "applied_first": applied[0] if applied else None,
+        "applied_last": applied[-1] if applied else None,
+        "applied_max": max(applied) if applied else None,
+        "observed_max": max(observed) if observed else None,
+        "unbacked_max": max(unbacked) if unbacked else 0.0,
+        "never_applied_samples": sum(1 for value in applied if value <= 0),
+    }
+    summary["size"] = {"first": sizes[0] if sizes else None,
+                       "last": sizes[-1] if sizes else None,
+                       "max": max(sizes) if sizes else None}
+
+    status: dict[str, int] = {}
+    findings: dict[str, dict[str, Any]] = {}
+    for row in ordered:
+        key = str(row.get("check_status") or "unknown")
+        status[key] = status.get(key, 0) + 1
+        for entry in row.get("findings") or []:
+            if isinstance(entry, Mapping):
+                level = str(entry.get("level") or "")
+                ident = str(entry.get("id") or "")
+                title = str(entry.get("title") or "")
+            else:  # 兼容更早的 "LEVEL|id|title" 文本形态
+                parts = str(entry).split("|", 2)
+                if len(parts) < 3:
+                    continue
+                level, ident, title = parts
+            if not ident:
+                continue
+            item = findings.setdefault(ident, {"level": level, "title": title, "count": 0})
+            item["count"] += 1
+            if ALERT_LEVEL_ORDER.get(level, 0) > ALERT_LEVEL_ORDER.get(item["level"], 0):
+                item["level"] = level
+    summary["status"] = status
+    summary["findings"] = findings
+
+    days: dict[str, dict[str, Any]] = {}
+    for row in ordered:
+        day = str(row.get("iso") or "")[:10] or "未知"
+        bucket = days.setdefault(day, {"count": 0, "emotion": [], "energy": [], "stress": [],
+                                       "loneliness": [], "sleep": [], "activity": {},
+                                       "fail": 0, "warn": 0, "tick_max": 0.0})
+        bucket["count"] += 1
+        bucket["fail"] += as_int(row.get("findings_fail"))
+        bucket["warn"] += as_int(row.get("findings_warn"))
+        for key in ("emotion", "energy", "stress", "loneliness"):
+            value = as_float(row.get(key))
+            if value is not None:
+                bucket[key].append(value)
+        sleep_value = as_float(row.get("sleep_minutes_today"))
+        if sleep_value is not None:
+            bucket["sleep"].append(sleep_value)
+        label = str(row.get("activity_label") or row.get("activity") or "未知")
+        bucket["activity"][label] = bucket["activity"].get(label, 0) + 1
+        tick_age = as_float(row.get("tick_age_seconds"))
+        if tick_age is not None:
+            bucket["tick_max"] = max(bucket["tick_max"], tick_age)
+    summary["days"] = days
+    return summary
+
+
+def _markdown_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    lines = ["| " + " | ".join(str(item) for item in headers) + " |",
+             "|" + "|".join("---" for _ in headers) + "|"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(item) for item in row) + " |")
+    return "\n".join(lines)
+
+
+def _read_tail_lines(path: pathlib.Path, *, max_bytes: int = 32768,
+                     limit: int = 30) -> list[str]:
+    """只读文件末尾若干字节再切行（alerts.log 可能上万行，不该整份读进内存）。"""
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    try:
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            chunk = handle.read()
+    except OSError:
+        return []
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    return [line for line in lines if line.strip()][-limit:]
+
+
+def dynamics_findings(rows: Sequence[Mapping[str, Any]],
+                      *, config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """v1.19.0（PR-AF-1 配套）：**循环动力学**判据（跨样本，六条）。
+
+    配置侧判据只看得见表面的 ``sleep_window`` / ``dry_run``；真正决定「她过得好不好」
+    的是跨样本的循环形态——清醒能不能维持、内心维度是否在动、体力是否失去弹性。
+    真机 2026-10-13 的教训是：这三条全绿、配置看着正常，而她 82.8% 的时间在睡觉、
+    孤独 152/152 恒为 0、清醒只剩 1 个 tick。
+
+    六条阈值全部走 ``[diagnostics]`` 段可配——修完之后阈值必须跟着调，写死会立刻
+    变成新的误报源。
+
+    | 键 | 默认 | 含义 |
+    |---|---|---|
+    | ``dyn_sleep_share`` | 0.70 | 睡觉占比超过即 FAIL |
+    | ``dyn_awake_median_minutes`` | 30 | 连续清醒中位数低于即 WARN |
+    | ``dyn_loneliness_frozen_samples`` | 20 | 孤独恒定的样本数达到即 WARN |
+    | ``dyn_energy_capped_share`` | 0.80 | 体力贴顶占比超过即 WARN |
+    | ``dyn_battery_low`` | 2.0 | 社交电量低于此值算低 |
+    | ``dyn_battery_low_share`` | 0.50 | 低电量样本占比超过即 WARN |
+    | ``dyn_sleep_minutes_cap`` | 600 | 当日睡眠分钟数达到此值算贴上限 |
+    | ``dyn_sleep_capped_share`` | 0.50 | 贴上限样本占比超过即 WARN |
+    """
+
+    diag = _section(config, "diagnostics")
+    if not rows:
+        return []
+    total = len(rows)
+    findings: list[dict[str, Any]] = []
+
+    def add(level: str, title: str, evidence: str, fix: str) -> None:
+        findings.append({"level": level, "id": f"动力学|{title}", "title": title,
+                         "evidence": evidence, "fix": fix, "scope": "循环动力学"})
+
+    # 1) 睡觉占比——循环退化成单向泵的最直接信号
+    share_limit = as_float(diag.get("dyn_sleep_share"), 0.70)
+    if share_limit is None:
+        share_limit = 0.70
+    sleeping = sum(1 for row in rows if str(row.get("activity") or "") in ("sleep", "nap"))
+    share = sleeping / total
+    if share > share_limit:
+        add("FAIL", f"睡觉占比 {share * 100:.1f}%（阈值 {share_limit * 100:.0f}%）",
+            f"{sleeping}/{total} 个采样点在睡觉。真机实测 79.6% 时，"
+            "清醒时长中位只有 10 分钟——这不是「睡得偏多」，是循环的吸收态",
+            "看清醒侧判据：生病是否短路了每日清醒下限（[activity] cold_onset_awake_floor）")
+
+    # 2) 连续清醒时长中位——清醒能否作为一个状态存在
+    awake_floor = as_float(diag.get("dyn_awake_median_minutes"), 30.0)
+    if awake_floor is None:
+        awake_floor = 30.0
+    awake = [value for value in (as_float(row.get("continuous_awake_minutes")) for row in rows)
+             if value is not None]
+    if awake and statistics.median(awake) < awake_floor:
+        add("WARN", f"连续清醒中位 {statistics.median(awake):.0f} 分钟（阈值 {awake_floor:.0f}）",
+            "清醒几乎刚建立就被拉回睡眠。真机实测恒为 10 分钟 = 恰好 1 个 tick，"
+            "说明「醒 → 下一 tick 又睡」在结构上成立",
+            "排查入睡资格是否被无条件短路；睡眠侧有最短睡眠目标，清醒侧应有对等下限")
+
+    # 3) 孤独冻结——内心维度是否还在动
+    frozen_min = as_int(diag.get("dyn_loneliness_frozen_samples"), 20) or 20
+    lonely = [value for value in (as_float(row.get("loneliness")) for row in rows)
+              if value is not None]
+    if len(lonely) >= max(2, frozen_min) and len(set(lonely)) == 1:
+        add("WARN", f"孤独恒定 {lonely[0]:.2f} 跨 {len(lonely)} 个样本",
+            "孤独只在清醒且无互动时增长；清醒过短 ⇒ 只减不增 ⇒ 永久冻结。"
+            "它同时是主动开口的驱动输入，冻住了主动节奏也是死的",
+            "先修清醒时长；若仍冻结，再看 [mood] loneliness_per_quiet_tick / relief")
+
+    # 4) 体力长期贴顶——恢复侧失去弹性
+    cap_share_limit = as_float(diag.get("dyn_energy_capped_share"), 0.80)
+    if cap_share_limit is None:
+        cap_share_limit = 0.80
+    pairs = [(energy, cap) for energy, cap in
+             ((as_float(row.get("energy")), as_float(row.get("energy_cap"))) for row in rows)
+             if energy is not None and cap is not None and cap > 0]
+    if pairs:
+        capped = sum(1 for energy, cap in pairs if energy >= cap - 1e-9)
+        if capped / len(pairs) > cap_share_limit:
+            add("WARN", f"体力贴顶占比 {capped / len(pairs) * 100:.1f}%（阈值 "
+                        f"{cap_share_limit * 100:.0f}%）",
+                "体力长期满格 ⇒ 体力作为驱动输入失去调节作用，"
+                "「状态差就少说话」退化成常数倍率",
+                "看她是否根本没在消耗体力（清醒时长）；确认清醒侧消耗率是否生效")
+
+    # 5) 社交电量长期偏低——主动开口被硬闸持续挡住
+    low = as_float(diag.get("dyn_battery_low"), 2.0)
+    if low is None:
+        low = 2.0
+    low_share_limit = as_float(diag.get("dyn_battery_low_share"), 0.50)
+    if low_share_limit is None:
+        low_share_limit = 0.50
+    battery = [value for value in (as_float(row.get("social_battery")) for row in rows)
+               if value is not None]
+    if battery:
+        low_count = sum(1 for value in battery if value < low)
+        if low_count / len(battery) > low_share_limit:
+            add("WARN", f"社交电量 < {low:g} 占比 {low_count / len(battery) * 100:.1f}%"
+                        f"（阈值 {low_share_limit * 100:.0f}%）",
+                "主动开口的硬闸会持续拒绝——配置看起来开着，实际从不开口。"
+                "睡眠中电量会回充，所以这条常与「睡觉占比高」同时出现",
+                "确认 [proactive] enabled 是否真的要她主动；"
+                "低电量阈值见 /生活 为什么 里的 low_battery 计数")
+
+    # 6) 当日睡眠贴上限——睡眠时长失去调节
+    cap_minutes = as_float(diag.get("dyn_sleep_minutes_cap"), 600.0)
+    if cap_minutes is None:
+        cap_minutes = 600.0
+    sleep_share_limit = as_float(diag.get("dyn_sleep_capped_share"), 0.50)
+    if sleep_share_limit is None:
+        sleep_share_limit = 0.50
+    sleeps = [value for value in (as_float(row.get("sleep_minutes_today")) for row in rows)
+              if value is not None]
+    if sleeps:
+        capped = sum(1 for value in sleeps if value >= cap_minutes - 1e-9)
+        if capped / len(sleeps) > sleep_share_limit:
+            add("WARN", f"当日睡眠贴 {cap_minutes:.0f} 分钟占比 "
+                        f"{capped / len(sleeps) * 100:.1f}%（阈值 {sleep_share_limit * 100:.0f}%）",
+                "当日睡眠长时间顶在配置上限 ⇒ 睡眠时长不再由状态决定，而由上限决定",
+                "确认上限是否合理；看她是否始终睡到上限才醒（体力回满 + 最短睡眠目标）")
+    return findings
+
+
+def _segment_table(rows: Sequence[Mapping[str, Any]], marks: Sequence[Mapping[str, Any]],
+                   *, config: Mapping[str, Any]) -> list[str]:
+    """v1.19.0（PR-AF-1 配套）：按改动时点把样本分段，输出改前/改后对比表。
+
+    为什么必须分段：改动前后混在一起算均值，得到的数字既不代表改前也不代表改后，
+    却会被当成「修完了没有」的证据。
+    """
+
+    if not marks or not rows:
+        return []
+    ordered = sorted(rows, key=lambda row: as_float(row.get("ts"), 0.0) or 0.0)
+    stamps = sorted((as_float(mark.get("at"), 0.0) or 0.0 for mark in marks))
+    diag = _section(config, "diagnostics")
+
+    def bucket(predicate) -> list[Mapping[str, Any]]:
+        return [row for row in ordered if predicate(as_float(row.get("ts"), 0.0) or 0.0)]
+
+    segments: list[tuple[str, list[Mapping[str, Any]]]] = []
+    segments.append(("改前基线", bucket(lambda ts: ts < stamps[0])))
+    for index, start in enumerate(stamps):
+        end = stamps[index + 1] if index + 1 < len(stamps) else float("inf")
+        label = next((str(mark.get("label") or "") for mark in marks
+                      if (as_float(mark.get("at"), 0.0) or 0.0) == start), f"标记 {index + 1}")
+        segments.append((f"改后：{label}", bucket(lambda ts, s=start, e=end: s <= ts < e)))
+    segments.append(("改后（最新标记至今）", bucket(lambda ts: ts >= stamps[-1])))
+
+    def stats(items: Sequence[Mapping[str, Any]]) -> tuple[float, float, float, float, float]:
+        if not items:
+            return (0.0, 0.0, 0.0, 0.0, 0.0)
+        sleeping = sum(1 for row in items
+                       if str(row.get("activity") or "") in ("sleep", "nap")) / len(items)
+        awake = [value for value in (as_float(row.get("continuous_awake_minutes")) for row in items)
+                 if value is not None]
+        lonely = [value for value in (as_float(row.get("loneliness")) for row in items)
+                  if value is not None]
+        return (len(items), sleeping * 100.0,
+                statistics.median(awake) if awake else 0.0,
+                statistics.median(lonely) if lonely else 0.0,
+                statistics.mean([as_float(row.get("energy")) or 0.0 for row in items]))
+
+    header = ("| 段 | 样本 | 睡觉占比 | 连续清醒中位(分) | 孤独中位 | 体力均值 |",
+              "|---|---|---|---|---|---|")
+    body = []
+    for label, items in segments:
+        if not items:
+            continue
+        count, sleep_share, awake_median, lonely_median, energy = stats(items)
+        body.append(f"| {label} | {count} | {sleep_share:.1f}% | {awake_median:.0f} "
+                    f"| {lonely_median:.2f} | {energy:.2f} |")
+    if len(body) < 2:
+        return []
+    return list(header) + body
+
+
+def _watch_config_payload(state: Mapping[str, Any]) -> dict[str, Any]:
+    """v1.19.0（PR-AF-1 配套）：取监控判据用的配置原文。
+
+    优先用 ``watch_state.json`` 里缓存的（监控循环每轮刷新），退回按
+    ``config_path`` 现读——这样 ``--summary-only`` 与历史 state 也能判动力学。
+    """
+
+    cached = state.get("config")
+    if isinstance(cached, dict) and cached:
+        return cached
+    raw_path = state.get("config_path")
+    if not raw_path:
+        return {}
+    payload, _error = _load_toml(pathlib.Path(str(raw_path)))
+    return payload if isinstance(payload, dict) else {}
+
+
+def render_watch_summary(paths: WatchPaths, *, rows: Sequence[Mapping[str, Any]],
+                         summary: Mapping[str, Any], tracker: AlertTracker,
+                         state: Mapping[str, Any], tz: int, now: float,
+                         interval: float, broken_lines: int = 0) -> str:
+    """人读的汇总报告：先给结论，再给证据。随时可以重算（``--summary-only``）。"""
+
+    active = tracker.active_alerts()
+    fail_count = sum(1 for alert in active if alert.level == "FAIL")
+    warn_count = sum(1 for alert in active if alert.level == "WARN")
+    lines: list[str] = ["# life-frequency 长期监控汇总", ""]
+    start = as_float(summary.get("start"), 0.0) or 0.0
+    end = as_float(summary.get("end"), 0.0) or 0.0
+    lines += [
+        f"- 生成时间：{local_stamp(now, tz)}（UTC{tz / 60:+g}）",
+        f"- 监控窗口：{local_stamp(start, tz) if start else '—'} → "
+        f"{local_stamp(end, tz) if end else '—'}"
+        f"（跨度 {human_span(summary.get('span_seconds') or 0)}）",
+        f"- 样本：**{summary.get('count', 0)}** 个（采样间隔：配置 {human_span(interval)} / "
+        f"实际中位 {human_span(summary.get('effective_interval') or interval)}；"
+        f"覆盖率 {_fmt((summary.get('coverage') or 0) * 100, 1)}%"
+        + (f"；JSONL 里有 {broken_lines} 行坏数据（多为被杀在半截的写入）" if broken_lines else "")
+        + "）",
+        f"- 数据目录：`{state.get('data_dir') or '（未找到）'}`"
+        f"（{state.get('data_dir_source') or '—'}）",
+        f"- 配置：`{state.get('config_path') or '（未找到，按内置默认值判定）'}`",
+        f"- 运行器：启动 {state.get('run_starts', 1)} 次；样本采集缺口 "
+        f"{len(summary.get('gaps') or [])} 次（合计 {human_span(summary.get('gap_total_seconds') or 0)}）",
+        f"- 当前未恢复告警：**{len(active)}** 条（FAIL {fail_count} / WARN {warn_count}）",
+    ]
+    report_failures = as_int(state.get("report_failures"), 0)
+    if report_failures:
+        lines.append(f"- ⚠ 完整报告生成失败 **{report_failures}** 次（连续计数）："
+                     f"见 `{paths.log.name}` 里的「完整报告生成失败」")
+    lines.append("")
+
+    if fail_count:
+        lines += [f"> ⚠ 有 {fail_count} 条未恢复的**确定性故障（FAIL）**：见下表，"
+                  "每条都带证据与修法。", ""]
+    elif not summary.get("count"):
+        lines += ["> 还没有样本：先跑 `--watch`（或 `--once` 采一个）。", ""]
+    elif fail_count == 0 and (summary.get("coverage") or 0) > 0.98 and (
+            (summary.get("max_gap_seconds") or 0)
+            <= (summary.get("effective_interval") or interval) * 3):
+        lines += ["> 窗口内没有未恢复的 FAIL；采样覆盖完整（没有超过三个采样周期的缺口）。"
+                  "**注意**：这只说明「按现有判据没发现问题」，不等于每个 tick 都正常"
+                  "（判据是抽样，不是逐 tick 记录）。", ""]
+    else:
+        lines += ["> 没有未恢复的 FAIL，但采样覆盖不完整（见「覆盖与缺口」）——"
+                  "缺口时段的运行情况没有证据，不能算通过。", ""]
+
+    # ---- 未恢复告警 ----
+    lines += ["## 1. 当前未恢复告警", ""]
+    if not active:
+        lines += ["（无）", ""]
+    else:
+        table = [[alert.level, local_stamp(alert.first_seen, tz),
+                  local_stamp(alert.last_seen, tz), alert.hits,
+                  alert.scope or "—", alert.title] for alert in active]
+        lines += [_markdown_table(["级别", "首次出现", "最近出现", "命中次数", "范围", "问题"],
+                                  table), ""]
+        for alert in active:
+            if alert.evidence:
+                lines.append(f"- **{alert.title}**：{alert.evidence}")
+            if alert.fix:
+                lines.append(f"  - 修法：{alert.fix}")
+        lines.append("")
+
+        # ---- v1.2.0（D10）：签名命中原文——告警旁边直接给证据 ----
+        excerpt_rows = load_recent_log_excerpts(paths, limit=4)
+        if excerpt_rows:
+            lines += ["### 签名命中原文（最近几轮，全量见 `log_excerpts.jsonl`；"
+                      "全文扫描，不限本插件行；已脱敏）", ""]
+            for item in excerpt_rows:
+                lines.append(f"**{item.get('iso') or local_stamp(as_float(item.get('ts')), tz)}**")
+                lines.append("")
+                lines.append("```text")
+                for block in item.get("excerpts") or []:
+                    lines.extend(str(block).splitlines())
+                    lines.append("· · ·")
+                lines.append("```")
+
+    # ---- 覆盖与缺口 ----
+    gaps = list(summary.get("gaps") or [])
+    lines += ["## 2. 覆盖与缺口", "",
+              _markdown_table(["指标", "值"], [
+                  ["样本数", summary.get("count", 0)],
+                  ["按实际中位间隔推算的应有样本数", _fmt(summary.get("expected"), 1)],
+                  ["推算缺失的样本数", _fmt(summary.get("missing_samples"), 1)],
+                  ["覆盖率", f"{_fmt((summary.get('coverage') or 0) * 100, 1)}%"],
+                  ["采样缺口次数", len(gaps)],
+                  ["缺口合计", human_span(summary.get("gap_total_seconds") or 0)],
+                  ["最长一次缺口", human_span(summary.get("max_gap_seconds") or 0)],
+                  ["运行器启动次数", state.get("run_starts", 1)],
+              ]), ""]
+    if gaps:
+        lines += ["缺口明细（前 10 条；机器休眠/进程被杀/重启都会留下缺口）：", "",
+                  _markdown_table(["从上一点", "到下一点", "时长"], [
+                      [local_stamp(item["from"], tz), local_stamp(item["to"], tz),
+                       human_span(item["span"])] for item in gaps[:10]]), ""]
+
+    # ---- 生活循环推进 ----
+    tick = summary.get("tick") or {}
+    lines += ["## 3. 生活循环推进（最重要的一条）", "",
+              _markdown_table(["指标", "值"], [
+                  ["有效样本（有 last_tick_at）", tick.get("samples", 0)],
+                  ["缺失 last_tick_at 的样本", tick.get("no_age", 0)],
+                  ["最新推进距今 最小 / 中位", f"{human_span(tick.get('min') or 0)} / "
+                                              f"{human_span(tick.get('median') or 0)}"],
+                  ["最新推进距今 P90 / 最大", f"{human_span(tick.get('p90') or 0)} / "
+                                             f"{human_span(tick.get('max') or 0)}"],
+                  ["比配置慢（>1.5 tick）的样本", tick.get("slow", 0)],
+                  ["判定「没在跑」（>6 tick 或 停机间隙）的样本", tick.get("stalled", 0)],
+              ]), ""]
+
+    # ---- 模型侧 ----
+    llm = summary.get("llm") or {}
+    lines += ["## 4. 模型侧（活动决策）", "",
+              _markdown_table(["指标", "值"], [
+                  ["连续失败 > 0 的样本", llm.get("fail_samples", 0)],
+                  ["最大连续失败次数", llm.get("max_streak", 0)],
+                  ["处于冷却中的样本", llm.get("cooldown_samples", 0)],
+                  ["最长冷却剩余", human_span(llm.get("max_cooldown") or 0)],
+                  ["距上次成功决策（末样本）", human_span(llm.get("last_success_age") or 0)
+                   if llm.get("last_success_age") is not None else "从未成功"],
+              ]), ""]
+
+    # ---- 写宿主 ----
+    apply_info = summary.get("apply") or {}
+    lines += ["## 5. 写宿主（倍率是否真的落下去了）", "",
+              _markdown_table(["指标", "值"], [
+                  ["已写会话数（首 / 末样本）",
+                   f"{apply_info.get('applied_first', '—')} → {apply_info.get('applied_last', '—')}"],
+                  ["已写会话数（窗口内最大）", apply_info.get("applied_max", "—")],
+                  ["认到外部基数的会话（最大）", apply_info.get("observed_max", "—")],
+                  ["「写不进宿主」最长退避", human_span(apply_info.get("unbacked_max") or 0)],
+                  ["一次都没写过的样本数", apply_info.get("never_applied_samples", 0)],
+              ]), ""]
+
+    # ---- 逐日走势 ----
+    days = summary.get("days") or {}
+    if days:
+        table = []
+        for day in sorted(days):
+            bucket = days[day]
+            top = sorted(bucket["activity"].items(), key=lambda item: -item[1])[:3]
+            table.append([
+                day, bucket["count"],
+                _fmt(_mean(bucket["emotion"]), 2), _fmt(_mean(bucket["energy"]), 2),
+                _fmt(min(bucket["energy"]) if bucket["energy"] else None, 2),
+                _fmt(_mean(bucket["stress"]), 2), _fmt(_mean(bucket["loneliness"]), 2),
+                _fmt(_mean(bucket["sleep"]), 0),
+                "、".join(f"{name} {count}" for name, count in top),
+                bucket["fail"], bucket["warn"],
+            ])
+        lines += ["## 6. 逐日走势（均值；体力另给当日最低）", "",
+                  _markdown_table(["日期", "样本", "情绪", "体力", "体力最低", "压力",
+                                   "孤独", "当日睡眠(分)", "主要活动", "FAIL", "WARN"], table),
+                  ""]
+
+    # ---- 活动分布 ----
+    activity = summary.get("activity") or {}
+    if activity:
+        total = sum(activity.values()) or 1
+        table = [[name, count, f"{count / total * 100:.1f}%"]
+                 for name, count in sorted(activity.items(), key=lambda item: -item[1])]
+        lines += ["## 7. 活动分布（按采样点）", "",
+                  _markdown_table(["活动", "样本", "占比"], table), ""]
+
+    # ---- v1.19.0（PR-AF-1 配套）：循环动力学（跨样本判据）----
+    # 插在「活动分布」之后：那一条只告诉你她在这段时间做了什么，这一节告诉你
+    # 这套循环还健不健康——清醒能否维持、内心维度是否在动、体力是否失去弹性。
+    config_payload = _watch_config_payload(state)
+    dynamics = dynamics_findings(rows, config=config_payload)
+    if dynamics:
+        lines += ["## 7b. 循环动力学（跨样本判据；阈值见 [diagnostics]）", "",
+                  _markdown_table(
+                      ["级别", "问题", "证据", "修法"],
+                      [[item["level"], item["title"], item.get("evidence") or "—",
+                        item.get("fix") or "—"] for item in dynamics]), ""]
+    else:
+        lines += ["## 7b. 循环动力学（跨样本判据；阈值见 [diagnostics]）", "",
+                  "窗口内未命中任何动力学判据（六条全过）。", ""]
+
+    # ---- v1.19.0（PR-AF-1 配套）：改动时点分段 ----
+    segment_lines = _segment_table(rows, load_marks(paths), config=config_payload)
+    if segment_lines:
+        lines += ["## 7c. 改动时点分段（改前 / 改后对比）", "", *segment_lines, "",
+                  "> 打点方式：部署并完整重启后执行 "
+                  "`python collect_diagnostics.py --mark \"<标签>\" --watch-dir <监控目录>`。"
+                  "改前/改后混在一起算均值，得到的数字两边都不代表——所以必须分段。", ""]
+
+    # ---- 数据规模 ----
+    size = summary.get("size") or {}
+    lines += ["## 8. 数据规模与判定分布", "",
+              _markdown_table(["指标", "值"], [
+                  ["状态文件大小（首 / 末 / 最大）",
+                   f"{human_size(size['first']) if size.get('first') else '—'} → "
+                   f"{human_size(size['last']) if size.get('last') else '—'} / "
+                   f"{human_size(size['max']) if size.get('max') else '—'}"],
+                  ["样本判定 正常/可疑/故障/无数据",
+                   " / ".join(str((summary.get("status") or {}).get(key, 0))
+                              for key in ("ok", "warn", "fail", "unknown"))],
+              ]), ""]
+
+    # ---- 窗口内告警统计 ----
+    findings = summary.get("findings") or {}
+    if findings:
+        table = [[item["level"], item["count"], item["title"]]
+                 for item in sorted(findings.values(), key=lambda item: -item["count"])[:15]]
+        lines += ["## 9. 窗口内命中过的检查项（按样本数）", "",
+                  _markdown_table(["级别", "命中样本数", "检查项"], table), ""]
+
+    # ---- 最近事件 ----
+    recent = _read_tail_lines(paths.alerts_log, limit=20)
+    if recent:
+        lines += ["## 10. 最近告警事件（末 20 条，全文见 alerts.log）", "", "```",
+                  *recent, "```", ""]
+
+    # ---- 产物与口径 ----
+    lines += [
+        "## 11. 产物", "",
+        f"- 样本时序：`{paths.samples_jsonl.name}`（JSONL，含 findings 明细）/ "
+        f"`{paths.samples_csv.name}`（CSV，可直接导入 Excel 画图）",
+        f"- 告警流水：`{paths.alerts_log.name}`（全量事件）/ `{paths.alerts_md.name}`（当前状态）",
+        f"- 完整报告：`daily/` 下的 `life-frequency-诊断-<时间戳>.md`"
+        f"（每天一份 + 新 FAIL 时补一份）",
+        f"- 运行日志：`{paths.log.name}`；重新生成本汇总："
+        "`python collect_diagnostics.py --summary-only`",
+        "",
+        "## 12. 口径与局限（读之前请先看这一段）", "",
+        "- 判定阈值与一次性报告**完全同源**（`_state_checks` / `collect_config`），"
+        "所以两边不会自相矛盾。",
+        "- 样本是**快照**，不是逐 tick 记录：短暂抖动可能落在两次采样之间"
+        "（采样间隔见表头；插件默认 tick 600s，间隔远大于它时漏掉的细节更多）。",
+        "- 「没有 FAIL」= 按现有判据没发现问题，**不等于**每个 tick 都正常。",
+        "- 覆盖率按**实际中位间隔**推算（不是配置值），所以中途改过间隔也能算出合理结果；"
+        "但它只是推算——真的想知道有没有整段丢失，看「采样缺口」与「推算缺失的样本数」。",
+        "- 采样缺口（机器休眠/进程被杀）时段的运行情况**没有证据**，"
+        "不能算通过；缺口明细在「覆盖与缺口」一节。",
+        "- 凭据一律脱敏（`<redacted>`），带身份语境的号码写 `***`，"
+        "监控产物**不含消息正文**。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_alert_events(paths: WatchPaths, events: Sequence[Mapping[str, Any]], *, tz: int) -> None:
+    """告警事件流水：一行一个**变化**（不是一行一个样本）。"""
+
+    if not events:
+        return
+    lines: list[str] = []
+    for event in events:
+        stamp = local_stamp(as_float(event.get("ts"), 0.0) or 0.0, tz)
+        previous = str(event.get("prev_level") or "")
+        transition = f"{previous}→{event.get('level')}" if previous else str(event.get("level"))
+        line = (f"{stamp} {event.get('kind')} {transition} [{event.get('id')}] "
+                f"{event.get('title')}")
+        if event.get("evidence"):
+            line += f" —— {redact(event.get('evidence'), limit=240)}"
+        if event.get("fix") and event.get("kind") in ("开始", "升级"):
+            line += f" —— 修法：{redact(event.get('fix'), limit=240)}"
+        lines.append(line)
+    try:
+        _append_text(paths.alerts_log, "\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+def write_alerts_md(paths: WatchPaths, tracker: AlertTracker, *, now: float, tz: int,
+                    interval: float) -> None:
+    """当前告警状态（每次采样重写，体积有界）：值班的人先看这一份。"""
+
+    active = tracker.active_alerts()
+    lines = ["# life-frequency 监控告警（当前状态）", "",
+             f"- 生成时间：{local_stamp(now, tz)}（UTC{tz / 60:+g}）",
+             f"- 采样间隔：{human_span(interval)}",
+             f"- 当前未恢复：{len(active)} 条"
+             f"（FAIL {sum(1 for alert in active if alert.level == 'FAIL')} / "
+             f"WARN {sum(1 for alert in active if alert.level == 'WARN')}）",
+             "- 事件流水（含已恢复）：`alerts.log`；汇总：`watch_summary.md`", ""]
+    if not active:
+        lines += ["（当前没有未恢复的告警）", ""]
+    else:
+        lines += [_markdown_table(["级别", "首次出现", "最近出现", "命中", "范围", "问题"],
+                                  [[alert.level, local_stamp(alert.first_seen, tz),
+                                    local_stamp(alert.last_seen, tz), alert.hits,
+                                    alert.scope or "—", alert.title] for alert in active]), ""]
+        for alert in active:
+            if alert.evidence:
+                lines.append(f"- **{alert.title}**：{alert.evidence}")
+            if alert.fix:
+                lines.append(f"  - 修法：{alert.fix}")
+        lines.append("")
+    recent = _read_tail_lines(paths.alerts_log, limit=15)
+    if recent:
+        lines += ["## 最近事件（末 15 条）", "", "```", *recent, "```", ""]
+    try:
+        _atomic_write_text(paths.alerts_md, "\n".join(lines))
+    except OSError:
+        pass
+
+
+def run_watch(args: argparse.Namespace, *, plugin_dir: pathlib.Path,
+              search_roots: Sequence[pathlib.Path], base_output_dir: pathlib.Path) -> int:
+    """``--watch`` / ``--once`` / ``--summary-only`` 的统一入口。"""
+
+    watch_root = (pathlib.Path(args.watch_dir).resolve() if args.watch_dir
+                  else base_output_dir / WATCH_SUBDIR)
+    paths = WatchPaths.of(watch_root)
+    try:
+        paths.ensure()
+    except OSError as exc:
+        print(f"监控目录不可写：{watch_root}（{exc.__class__.__name__}: {exc}）", file=sys.stderr)
+        return 2
+    log = RunLog(paths.log, echo=not args.quiet)
+
+    interval = max(1.0, float(args.interval))
+    duration_hours = max(0.0, float(args.duration_hours))
+    retain_days = max(0.0, float(args.retain_days))
+    report_every = max(0.0, float(args.report_every_hours)) * 3600.0
+    summary_every = max(0.0, float(args.summary_every_minutes)) * 60.0
+    now = time.time()
+    state = load_watch_state(paths)
+
+    if args.mark:
+        # --mark 是**独立模式**：只追加一个改动时点标记，不启动监控循环、不抢锁。
+        # 标记走 O_APPEND 的 watch_marks.jsonl，与主循环整份重写 watch_state.json 无冲突。
+        # 时区只影响 iso 文案，取不到配置就按默认 UTC+8。
+        mark_cfg = pathlib.Path(args.config).resolve() if args.config else None
+        mark_tz = as_int(_section(_load_toml(mark_cfg)[0] if mark_cfg else {},
+                                  "simulation").get("tz_offset_minutes"), 480)
+        if append_mark(paths, args.mark, now=now, tz=mark_tz):
+            log.write(f"已打改动时点标记「{args.mark}」→ {paths.marks}")
+            return 0
+        print("--mark 标签为空或写入失败", file=sys.stderr)
+        return 2
+
+    tracker = AlertTracker(state.get("alerts") if isinstance(state.get("alerts"), dict) else {})
+    tailer = LogTailer(state.get("log_offsets") if isinstance(state.get("log_offsets"), dict) else {})
+    explicit_data = pathlib.Path(args.data_dir).resolve() if args.data_dir else None
+    explicit_config = pathlib.Path(args.config).resolve() if args.config else None
+    explicit_logs = [pathlib.Path(item).resolve() for item in args.log]
+
+    def resolve() -> WatchSources:
+        return resolve_watch_sources(plugin_dir=plugin_dir, search_roots=search_roots,
+                                     data_dir=explicit_data, config_path=explicit_config,
+                                     log_paths=explicit_logs)
+
+    sources = resolve()
+    tz = as_int(_section(_load_toml(sources.config_path)[0] if sources.config_path else {},
+                         "simulation").get("tz_offset_minutes"), 480)
+
+    if args.summary_only:
+        rows, broken = load_samples(paths)
+        # 覆盖率与「采样间隔」要按**记录下来的**间隔算：--summary-only 可能用默认值调用，
+        # 而样本是上一轮以别的间隔采的（否则覆盖率会算成一个毫无意义的数）
+        recorded = as_float(state.get("interval_seconds"), interval) or interval
+        text = render_watch_summary(paths, rows=rows,
+                                    summary=summarize_rows(rows, interval=recorded),
+                                    tracker=tracker, state=state, tz=tz, now=now,
+                                    interval=recorded, broken_lines=broken)
+        _atomic_write_text(paths.summary, text)
+        log.write(f"按现有 {len(rows)} 个样本重算汇总（坏行 {broken}）：{paths.summary}")
+        return 0
+
+    lock = WatchLock(paths.lock, interval=interval, force=bool(args.force_lock),
+                     disabled=bool(args.no_lock))
+    ok, note = lock.acquire()
+    if not ok:
+        log.write(f"拒绝启动：{note}（想强行接管用 --force-lock；只想重算汇总用 --summary-only）")
+        return 3
+    if note:
+        log.write(note)
+
+    stop = StopFlag()
+    saved_handlers = install_signal_handlers(stop)
+    global PURE
+    PURE = PurePlugin(plugin_dir)
+    if not PURE.available:
+        log.write(f"提示：未加载插件纯模块（{PURE.reason}），状态侧退回内置最小校验")
+
+    ctx = WatchContext(plugin_dir=plugin_dir, search_roots=list(search_roots),
+                       sources=sources, tailer=tailer, interval=interval)
+    max_samples = max(0, as_int(args.max_samples)) or (1 if args.once else 0)
+    process_start = time.time()
+    campaign_started = as_float(state.get("campaign_started_at"), 0.0) or now
+    index = as_int(state.get("samples_total"))
+    run_starts = as_int(state.get("run_starts")) + 1
+    prev_sha = str(state.get("last_state_sha") or "")
+    prev_unchanged = as_int(state.get("state_unchanged_samples"))
+    next_report_at = as_float(state.get("last_periodic_report_at"), 0.0) or 0.0
+    captured = [value for value in (as_float(item, 0.0) or 0.0
+                                    for item in (state.get("captures") or [])) if value > 0]
+    # 「多久该补一份周期报告」按**最后一份报告的 mtime** 续期，而不是只看状态文件：
+    # 崩溃-重启循环里每次启动都补一份的话，daily/ 一天就能被 100+ KB 的报告塞满
+    if report_every > 0 and next_report_at <= 0:
+        age = _last_report_age(paths, now=now)
+        next_report_at = (now - age) if age is not None else 0.0
+    # 数据目录还没找到时要**马上**重试（部署是逐步的）；已经找到了就 30 分钟后才刷新日志候选
+    last_discovery = as_float(state.get("last_discovery_at"), 0.0) or (
+        now - 1800 if sources.data_dir is None else now)
+    last_summary_at = 0.0
+    last_prune_at = as_float(state.get("last_prune_at"), 0.0) or 0.0
+    stopped_reason = ""
+    state.update({
+        "schema": WATCH_SCHEMA_VERSION, "run_starts": run_starts,
+        "campaign_started_at": campaign_started, "plugin_dir": str(plugin_dir),
+        "interval_seconds": interval, "duration_hours": duration_hours,
+        "started_at": state.get("started_at") or now,
+        "python": sys.executable, "program_version": PROGRAM_VERSION,
+    })
+    log.write(f"监控启动：插件目录 {plugin_dir}；数据目录 "
+              f"{sources.data_dir or '（未找到，稍后每 30 分钟重试）'}；"
+              f"配置 {sources.config_path or '（未找到）'}；日志 {len(sources.log_paths)} 份；"
+              f"间隔 {human_span(interval)}；"
+              + (f"目标时长 {duration_hours:g} 小时" if duration_hours > 0 else "不限时长")
+              + (f"；本次样本上限 {max_samples}" if max_samples else "")
+              + f"；已累计 {index} 个样本")
+
+    try:
+        while True:
+            # Ctrl+C / 停止文件可能落在上一轮的等待里（或启动前就已经放好）：先退出，别再多采一个样本
+            if not stop.stopped and paths.stop.exists():
+                stop.request(f"发现停止文件 {paths.stop.name}")
+            if stop.stopped:
+                stopped_reason = stop.reason or "收到停止请求"
+                break
+            cycle_wall = time.time()
+            now = time.time()
+            previous = as_float(state.get("last_sample_at"), 0.0) or 0.0
+            gap = now - previous if previous > 0 else -1.0
+            index += 1
+            if sources.data_dir is None and now - last_discovery >= 1800:
+                refreshed = resolve()
+                last_discovery = now
+                if refreshed.data_dir is not None:
+                    sources.data_dir = refreshed.data_dir
+                    sources.data_dir_source = refreshed.data_dir_source
+                    ctx.sources = sources
+                    log.write(f"已找到运行时数据目录：{sources.data_dir}（{sources.data_dir_source}）")
+                if not sources.config_path and refreshed.config_path:
+                    sources.config_path = refreshed.config_path
+                if refreshed.log_paths:
+                    sources.log_paths = refreshed.log_paths
+            elif not explicit_logs and now - last_discovery >= 1800:
+                # 只刷新日志候选：日志会轮转（maibot.log → maibot.log.1），
+                # 但没必要每 30 分钟重跑一次「找数据目录」的全盘扫描（那是有界的 25s 扫描）
+                last_discovery = now
+                candidates = find_log_candidates(
+                    [path for path in (sources.data_dir, *search_roots, plugin_dir) if path])
+                if candidates:
+                    sources.log_paths = candidates
+                if sources.config_path is None and sources.data_dir is not None:
+                    candidate = sources.data_dir / CONFIG_FILE
+                    if candidate.exists() and looks_like_config(_load_toml(candidate)[0]):
+                        sources.config_path = candidate
+            try:
+                row, findings = take_sample(ctx, now=now, sample_index=index,
+                                            uptime=now - process_start, gap=gap,
+                                            run_starts=run_starts, prev_sha=prev_sha,
+                                            prev_unchanged=prev_unchanged)
+            except Exception as exc:  # noqa: BLE001 —— 采样本不许杀死监控器
+                log.write(f"采样抛异常（已跳过本样本）：{exc.__class__.__name__}: {exc}")
+                row, findings = {"sample_index": index, "ts": round(now, 3),
+                                 "check_status": "unknown", "note": "采样异常",
+                                 "findings_fail": 0, "findings_warn": 0}, []
+            # v1.2.0（D10）：签名原文先摘下来单独落盘，别让它进 samples.jsonl
+            log_excerpts = row.pop("log_excerpts", None) or []
+            append_sample(paths, row)
+            if log_excerpts:
+                append_log_excerpts(paths, log_excerpts, now=now, tz=tz)
+            # 立刻续命：后面可能出现分钟级的完整报告（build_report 会扫目录/读库/算哈希），
+            # 心跳要是压在最后写，一次慢周期就会超过锁的过期阈值 ⇒ 第二个进程接管锁 ⇒
+            # 两个监控器同时写 samples.jsonl / watch_state.json（整周数据都会被写乱）
+            if not lock.heartbeat():
+                log.write("⚠ 锁心跳写不进去（锁文件被占用或磁盘只读）："
+                          "另一个监控进程可能误判本进程已死")
+            prev_sha = str(row.get("state_sha16") or "")
+            prev_unchanged = as_int(row.get("state_unchanged_samples"))
+            tz = as_int(_section(_load_toml(sources.config_path)[0]
+                                 if sources.config_path else {},
+                                 "simulation").get("tz_offset_minutes"), tz)
+            events = tracker.update(findings, now=now)
+            gap_threshold = max(interval * 3.0, interval + 300.0)
+            if gap > gap_threshold:
+                events.append({"ts": now, "kind": "采样缺口", "id": "运行器|采样缺口",
+                               "level": "WARN", "prev_level": "", "title": "采样缺口",
+                               "evidence": f"距上一个样本 {human_span(gap)}"
+                                           f"（间隔 {human_span(interval)}）",
+                               "fix": "机器休眠/进程被杀/重启都会造成缺口；"
+                                      "看 watch.log 的启动记录", "scope": "运行器"})
+            write_alert_events(paths, events, tz=tz)
+            write_alerts_md(paths, tracker, now=now, tz=tz, interval=interval)
+
+            new_fail = [event for event in events
+                        if event.get("level") == "FAIL" and event.get("kind") in ("开始", "升级")]
+            captured_now = False
+            if new_fail:
+                same_day = [stamp for stamp in captured if now - stamp < 86400]
+                last_capture = max(captured) if captured else 0.0
+                if (now - last_capture >= CAPTURE_MIN_GAP_SECONDS
+                        and len(same_day) < CAPTURE_MAX_PER_DAY):
+                    if capture_full_report(paths, plugin_dir=plugin_dir, sources=sources,
+                                           search_roots=search_roots, now=now,
+                                           reason=f"新出现的 FAIL：{new_fail[0].get('title')}",
+                                           log=log) is not None:
+                        captured.append(now)
+                        captured_now = True
+                else:
+                    log.write("新的 FAIL 未补完整报告（触发节流）：看 alerts.md 与样本即可")
+
+            if args.once and not captured_now:
+                capture_full_report(paths, plugin_dir=plugin_dir, sources=sources,
+                                    search_roots=search_roots, now=now,
+                                    reason="--once 单次采样", log=log)
+            elif not args.once and report_every > 0 and now - next_report_at >= report_every:
+                reason = ("启动时补当日报告" if next_report_at <= 0
+                          else f"周期报告（每 {report_every / 3600:g} 小时）")
+                if capture_full_report(paths, plugin_dir=plugin_dir, sources=sources,
+                                       search_roots=search_roots, now=now, reason=reason,
+                                       log=log) is not None:
+                    next_report_at = now
+                    state["report_failures"] = 0
+                else:
+                    # 静默失败是这个工具最不能接受的结果：报告没生成，而 watch.log 里
+                    # 看起来一切正常。**不推进周期**（过一会儿重试）+ 计数进汇总表头。
+                    state["report_failures"] = as_int(state.get("report_failures")) + 1
+                    retry = max(60.0, min(report_every, 1800.0))
+                    next_report_at = now - report_every + retry
+
+            if now - last_prune_at >= 6 * 3600:
+                prune_watch_dir(paths, retain_days=retain_days, now=now, log=log)
+                last_prune_at = now
+
+            # 报告生成之后再刷一次心跳（报告可能耗时几十秒）
+            lock.heartbeat()
+            offsets_state = tailer.to_state()
+            if sources.log_paths:
+                tracked = {str(path) for path in sources.log_paths}
+                offsets_state = {key: value for key, value in offsets_state.items()
+                                 if key in tracked}
+            state.update({
+                "updated_at": now, "last_sample_at": now,
+                "heartbeat_iso": local_stamp(now, tz), "samples_total": index,
+                "last_gap_seconds": round(gap, 1) if gap >= 0 else "",
+                "data_dir": str(sources.data_dir) if sources.data_dir else "",
+                "data_dir_source": sources.data_dir_source,
+                "config_path": str(sources.config_path) if sources.config_path else "",
+                "log_paths": [str(path) for path in sources.log_paths],
+                "last_state_sha": prev_sha, "state_unchanged_samples": prev_unchanged,
+                "alerts": tracker.to_state(), "log_offsets": offsets_state,
+                "alert_events_total": as_int(state.get("alert_events_total")) + len(events),
+                "captures": captured[-32:],
+                "last_periodic_report_at": next_report_at, "last_prune_at": last_prune_at,
+                "last_discovery_at": last_discovery,
+                "first_sample_at": state.get("first_sample_at") or now,
+                "last_status": row.get("check_status"), "last_note": row.get("note"),
+                # v1.19.0（PR-AF-1 配套）：缓存配置原文，让汇总/分段能读
+                # [diagnostics] 阈值（否则 --summary-only 时拿不到口径）
+                "config": _load_toml(sources.config_path)[0] if sources.config_path else {},
+            })
+            save_watch_state(paths, state)
+
+            active = tracker.active_alerts()
+            log.write(f"#{index} {row.get('check_status')} "
+                      f"活动={row.get('activity_label') or '—'} "
+                      f"情绪={_fmt(row.get('emotion'))} 体力={_fmt(row.get('energy'))} "
+                      f"tick={human_span(as_float(row.get('tick_age_seconds')) or 0) if row.get('tick_age_seconds') != '' else '—'} "
+                      f"告警={len(active)}"
+                      f"（FAIL {sum(1 for alert in active if alert.level == 'FAIL')}）"
+                      + (f" 备注：{row.get('note')}" if row.get("check_status") not in ("ok", "") else ""))
+
+            if summary_every > 0 and (last_summary_at == 0.0
+                                      or now - last_summary_at >= summary_every):
+                rows, broken = load_samples(paths)
+                _atomic_write_text(paths.summary, render_watch_summary(
+                    paths, rows=rows, summary=summarize_rows(rows, interval=interval),
+                    tracker=tracker, state=state, tz=tz, now=now, interval=interval,
+                    broken_lines=broken))
+                last_summary_at = now
+
+            if stop.stopped:
+                stopped_reason = stop.reason or "收到停止请求"
+                break
+            if args.once:
+                stopped_reason = "已完成单次采样（--once）"
+                break
+            if max_samples and index >= max_samples:
+                stopped_reason = f"达到 --max-samples {max_samples}"
+                break
+            if duration_hours > 0 and now - campaign_started >= duration_hours * 3600:
+                stopped_reason = (f"已达到目标时长 {duration_hours:g} 小时"
+                                  "（按首次采样时间累计；想继续用 --duration-hours 0 或删 watch_state.json）")
+                break
+
+            next_wall = cycle_wall + interval
+            while not stop.stopped and time.time() < next_wall:
+                if paths.stop.exists():
+                    stop.request(f"发现停止文件 {paths.stop.name}（处理完即退出）")
+                    break
+                time.sleep(min(5.0, max(0.05, next_wall - time.time())))
+    except KeyboardInterrupt:  # 双保险：信号处理器没装上时也一样优雅退出
+        stopped_reason = "KeyboardInterrupt"
+    finally:
+        final = "正常结束"
+        try:
+            rows, broken = load_samples(paths)
+            state.update({"alerts": tracker.to_state(), "log_offsets": tailer.to_state(),
+                          "updated_at": time.time(),
+                          "stopped_reason": stopped_reason or "未知"})
+            save_watch_state(paths, state)
+            _atomic_write_text(paths.summary, render_watch_summary(
+                paths, rows=rows, summary=summarize_rows(rows, interval=interval),
+                tracker=tracker, state=state, tz=tz, now=time.time(), interval=interval,
+                broken_lines=broken))
+            active = tracker.active_alerts()
+            fail_count = sum(1 for alert in active if alert.level == "FAIL")
+            log.write(f"监控结束（{stopped_reason or '未知'}）：样本 {len(rows)} 个、"
+                      f"未恢复告警 {len(active)} 条（FAIL {fail_count}）；"
+                      f"汇总 {paths.summary}")
+        except Exception as exc:  # noqa: BLE001 —— 收尾失败也必须放锁
+            final = f"收尾失败：{exc.__class__.__name__}: {exc}"
+            log.write(final)
+        finally:
+            lock.release()
+            restore_signal_handlers(saved_handlers)
+    unresolved = sum(1 for alert in tracker.active_alerts() if alert.level == "FAIL")
+    # 只有「因为停止文件才停的」才删它：否则会把用户刚放下的停止文件悄悄吃掉
+    # （下一次启动又得再放一次，而用户以为已经放过了）
+    if "停止文件" in stopped_reason and paths.stop.exists():
+        try:
+            paths.stop.unlink()
+        except OSError:
+            pass
+    return 1 if unresolved else 0
+
+
 # ================================================================ 主流程
 
 
@@ -2189,9 +4662,34 @@ def bundle(output_dir: pathlib.Path, base_name: str, report_path: pathlib.Path,
     return target
 
 
+def harden_console_encoding() -> None:
+    """把 Windows 控制台切到 UTF-8 代码页：强制 UTF-8 输出才不会在窗口里变成乱码。
+
+    ⚠ ``stream.reconfigure(encoding="utf-8")`` 只保证**写出去的是 UTF-8 字节**；
+    旧式控制台（默认代码页 936/GBK）会把这些字节按 GBK 解释 ⇒ 中文全花，
+    而文件里其实是对的（用 VS Code / 记事本 / `Get-Content -Encoding UTF8` 看都正常）。
+    只在**真的连着控制台**时切代码页：管道与重定向（写文件、给别的程序吃）不受影响，
+    也不该去动它们的代码页。
+    """
+
+    if os.name != "nt":
+        return
+    try:
+        if not (sys.stdout.isatty() or sys.stderr.isatty()):
+            return
+        import ctypes  # noqa: PLC0415 —— 只有 Windows 控制台需要
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleOutputCP(65001)
+        kernel32.SetConsoleCP(65001)
+    except Exception:  # noqa: BLE001 —— 切不了就算了，输出仍然是合法 UTF-8
+        pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # Windows 默认控制台是 GBK：报告里全是中文，不加固的话摘要行会变成乱码
     # （run_gates.py 里踩过同一个坑，这里沿用同一套 workaround）。
+    harden_console_encoding()
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -2218,6 +4716,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out-dir", default="", help="报告输出目录（默认 <插件目录>/diagnostics）")
     parser.add_argument("--bundle", action="store_true", help="额外打包 zip")
     parser.add_argument("--with-sources", action="store_true", help="打包时把源码也放进去")
+    # ---- 长期监控（见文件开头的「长期监控」一节）----
+    watch_group = parser.add_argument_group("长期监控")
+    watch_group.add_argument("--watch", action="store_true",
+                             help="常驻监控：按 --interval 采样，直到 --duration-hours 用尽或被停止")
+    watch_group.add_argument("--once", action="store_true",
+                             help="只采一个样本 + 落一份完整报告（手动看 / 计划任务用）")
+    watch_group.add_argument("--summary-only", action="store_true",
+                             help="不采样，只用已有样本重算 watch_summary.md")
+    watch_group.add_argument("--interval", type=float, default=DEFAULT_WATCH_INTERVAL,
+                             help=f"采样间隔秒数（默认 {DEFAULT_WATCH_INTERVAL:g}，最小 1）")
+    watch_group.add_argument("--duration-hours", type=float, default=DEFAULT_WATCH_HOURS,
+                             help=f"累计监控时长（默认 {DEFAULT_WATCH_HOURS:g} 小时 = 7 天；"
+                                  "0 = 不限）")
+    watch_group.add_argument("--max-samples", type=int, default=0,
+                             help="采够多少个样本就停（0 = 不限；测试与短程观察用）")
+    watch_group.add_argument("--watch-dir", default="",
+                             help="监控产物目录（默认 <插件目录>/diagnostics/watch）")
+    watch_group.add_argument("--retain-days", type=float, default=DEFAULT_RETAIN_DAYS,
+                             help=f"样本与历史报告保留天数（默认 {DEFAULT_RETAIN_DAYS:g}；0 = 不裁）")
+    watch_group.add_argument("--report-every-hours", type=float, default=24.0,
+                             help="多久落一份完整诊断报告（默认 24 小时；0 = 只在启动/新 FAIL 时）")
+    watch_group.add_argument("--summary-every-minutes", type=float, default=60.0,
+                             help="多久重算一次汇总报告（默认 60 分钟；0 = 只在启动与结束时）")
+    watch_group.add_argument("--no-lock", action="store_true",
+                             help="跳过单实例锁（默认拒绝与已有监控进程并发写同一目录）")
+    watch_group.add_argument("--force-lock", action="store_true",
+                             help="强行接管锁（确认上一个监控进程已经死了再用）")
+    watch_group.add_argument("--quiet", action="store_true", help="不往控制台打日志（仍写 watch.log）")
+    watch_group.add_argument("--mark", default="",
+                             help="v1.19.0：给长期监控打一个「改动时点」标记并立即退出"
+                                  "（部署重启后调用，如 --mark \"改清醒侧判据\"）；"
+                                  "汇总会按标记把样本分段统计，改前/改后不再混在一起")
     args = parser.parse_args(argv)
 
     plugin_dir = pathlib.Path(args.plugin_dir).resolve()
@@ -2229,6 +4759,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not search_roots:
         search_roots = base_search_roots(plugin_dir)
     output_dir = pathlib.Path(args.out_dir).resolve() if args.out_dir else plugin_dir / "diagnostics"
+
+    if args.watch or args.once or args.summary_only or args.mark:
+        return run_watch(args, plugin_dir=plugin_dir, search_roots=search_roots,
+                         base_output_dir=output_dir)
 
     report = build_report(
         plugin_dir,

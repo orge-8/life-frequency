@@ -266,14 +266,35 @@ def test_rested_suppresses_only_window_driven_sleep():
     )
     assert tired.activity == A.SLEEP
 
-    # 生病同理（健康优先）
-    sick = A.enforce(
+    # 生病：v1.19.0（PR-AF-1）起**按病程分级**，不再一刀切短路。
+    # 初起（onset）不再享有「病中随时可睡」特权——真机实测它把清醒压成 1 个 tick
+    # （continuous_awake 长期恒为 10 分钟、睡觉占比 79.6%）。
+    onset = A.enforce(
         facts(activity=A.DAZE, now_minutes=9 * 60 + 40, energy=9.9, sick=True,
               cold_stage=A.COLD_ONSET, rested=True, awake_minutes_today=20 * 60),
         request(A.SLEEP),
         policy(),
     )
-    assert sick.activity == A.SLEEP
+    assert onset.activity == A.DAZE, "感冒初起不再短路清醒下限"
+
+    # 加重 / 好转期**保留**短路：那两段她本就该多躺
+    for stage in (A.COLD_WORSENING, A.COLD_RECOVERING):
+        worse = A.enforce(
+            facts(activity=A.DAZE, now_minutes=9 * 60 + 40, energy=9.9, sick=True,
+                  cold_stage=stage, rested=True, awake_minutes_today=20 * 60),
+            request(A.SLEEP),
+            policy(),
+        )
+        assert worse.activity == A.SLEEP, f"{stage} 仍应短路清醒下限（该多躺）"
+
+    # 旧状态兼容：只填 ``sick=True``、没有段位 ⇒ 归一为 worsening ⇒ 与 v1.18.1 一致
+    legacy = A.enforce(
+        facts(activity=A.DAZE, now_minutes=9 * 60 + 40, energy=9.9, sick=True,
+              rested=True, awake_minutes_today=20 * 60),
+        request(A.SLEEP),
+        policy(),
+    )
+    assert legacy.activity == A.SLEEP, "旧状态（无段位）按加重期处理，存量行为不变"
 
 
 def test_rested_until_is_set_on_a_target_satisfying_wake():
@@ -1387,3 +1408,83 @@ def test_sleep_config_is_visible_in_webui_schema():
         "night_waking_enabled", "night_waking_probability",
     ):
         assert name in sections["mood"]["fields"], f"mood.{name} 没进 WebUI schema"
+
+
+# ================================================================ PR-BS-1
+# 「准备睡觉」入口拦截：不具备入睡资格就不许进去
+#
+# 真机 2026-10-15：02:38 睡满目标醒来 ⇒ rested_until 指向本轮窗口结束
+# （sleep_window = 00:00-23:59 ⇒ 次日 00:00），她 05:18 进 before_sleep 后被拒入睡，
+# 滞留 13.7 小时（simulate_drift.py 复现：滞留存在于所有参数组合）。
+
+def test_before_sleep_blocked_when_sleep_not_allowed():
+    """窗口外 + 本轮已睡够（rested）⇒ 不许进入「准备睡觉」。"""
+
+    out = A.enforce(
+        facts(rested=True), request(A.BEFORE_SLEEP), policy(),
+    )
+    assert out.activity == A.DAILY, "不具备资格时应保持当前活动"
+    assert out.source == A.SOURCE_ENFORCED
+    assert "先不去准备睡" in out.note
+
+
+def test_before_sleep_blocked_when_awake_floor_unmet():
+    """窗口内但今日清醒不足 ⇒ 不许进入（与 requested == SLEEP 的拒绝同口径）。"""
+
+    out = A.enforce(
+        facts(now_minutes=4 * 60, awake_minutes_today=60, sleep_minutes_today=0),
+        request(A.BEFORE_SLEEP), policy(),
+    )
+    assert out.activity == A.DAILY
+    assert out.source == A.SOURCE_ENFORCED
+    assert "先不去准备睡" in out.note
+
+
+def test_before_sleep_allowed_when_eligible():
+    """窗口内 + 清醒够 + 未睡够 ⇒ 正常放行。"""
+
+    out = A.enforce(
+        facts(now_minutes=4 * 60, awake_minutes_today=10 * 60),
+        request(A.BEFORE_SLEEP), policy(),
+    )
+    assert out.activity == A.BEFORE_SLEEP
+    assert out.source == A.SOURCE_LLM
+
+
+def test_before_sleep_allowed_when_energy_below_threshold():
+    """真累了（体力低于入睡阈值）⇒ 急睡通道放行，rested 也不拦。"""
+
+    out = A.enforce(
+        facts(rested=True, energy=2.0), request(A.BEFORE_SLEEP), policy(),
+    )
+    assert out.activity == A.BEFORE_SLEEP
+
+
+def test_before_sleep_allowed_on_night_break():
+    """夜醒续睡窗口内 ⇒ 清醒不足也放行（与 _awake_floor_ok 的短路同口径）。"""
+
+    blocked = A.enforce(
+        facts(now_minutes=4 * 60, awake_minutes_today=60, night_break=False),
+        request(A.BEFORE_SLEEP), policy(),
+    )
+    allowed = A.enforce(
+        facts(now_minutes=4 * 60, awake_minutes_today=60, night_break=True),
+        request(A.BEFORE_SLEEP), policy(),
+    )
+    assert blocked.activity == A.DAILY
+    assert allowed.activity == A.BEFORE_SLEEP
+
+
+def test_before_sleep_gate_matches_the_no_proposal_path():
+    """裁定对称：不具资格时，提议 before_sleep 与「模型没提议」落在同一个活动上。"""
+
+    f = facts(rested=True)
+    with_proposal = A.enforce(f, request(A.BEFORE_SLEEP), policy())
+    without = A.enforce(f, None, policy())
+    assert with_proposal.activity == without.activity == A.DAILY
+
+
+def test_before_sleep_gate_does_not_make_asking_pointless():
+    """本闸门只收口一种提议 ⇒ 不该让「这一轮问模型」被判成白问。"""
+
+    assert A.request_is_pointless(facts(rested=True), policy()) == ""

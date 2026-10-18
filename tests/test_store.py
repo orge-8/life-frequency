@@ -13,6 +13,7 @@
 
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,12 @@ import pytest
 import life_store as S
 
 DAY = "2026-10-08"
+
+
+def P(uid: str, platform: str = "qq") -> str:
+    """关系表主键（v1.20.0/Y4 起是 ``md5(platform_user_id)``）。"""
+
+    return S.person_id_for(platform, uid)
 
 
 @pytest.fixture()
@@ -103,7 +110,15 @@ def test_concurrent_access_from_different_threads(store):
 
     def worker(index: int) -> None:
         try:
-            store.save_day(DAY, {f"line{index}": (index, S.ROUTINE_PENDING)})
+            # v1.19.0：_run 是 **fail-open** 的——等存储锁超过 2s / busy 时静默丢掉这次
+            # 记账并返回 False（不抛异常，调用方本来就要容忍）。全量跑测试时机器负载高，
+            # 8 线程并发可能触发这种设计内的降级，把这条「跨线程不炸」的回归打成假红。
+            # 这里按真实调用方的容错方式做有限重试：意图是「不异常 + 数据最终一致」，
+            # 不是「无论多忙都必须一次写进」。
+            for _ in range(20):
+                if store.save_day(DAY, {f"line{index}": (index, S.ROUTINE_PENDING)}):
+                    break
+                time.sleep(0.05)
             store.load_day(DAY)
         except BaseException as exc:  # noqa: BLE001 —— 收集起来断言「没有异常」
             errors.append(exc)
@@ -122,30 +137,34 @@ def test_concurrent_access_from_different_threads(store):
 
 
 def test_relationship_crud(store):
-    assert store.get_relationship("10001") is None
+    assert store.get_relationship(P("10001")) is None
 
-    record = S.new_relationship("10001", now=1000.0)
+    record = S.new_relationship(P("10001"), platform="qq", user_id="10001", now=1000.0)
+    assert record["person_id"] == P("10001")
     assert record["user_id"] == "10001"
+    assert record["platform"] == "qq"
     assert record["first_seen_at"] == 1000.0
     assert record["familiarity"] == 0.0
 
     assert store.put_relationship(record) is True
-    fetched = store.get_relationship("10001")
+    fetched = store.get_relationship(P("10001"))
     assert fetched is not None and fetched["user_id"] == "10001"
 
     fetched["familiarity"] = 42.0
     fetched["last_interaction_at"] = 2000.0
     store.put_relationship(fetched)  # upsert，不是重复插入
-    assert store.get_relationship("10001")["familiarity"] == 42.0
+    assert store.get_relationship(P("10001"))["familiarity"] == 42.0
 
-    assert store.delete_relationship("10001") is True
-    assert store.get_relationship("10001") is None
-    assert store.delete_relationship("10001") is False
+    assert store.delete_relationship(P("10001")) is True
+    assert store.get_relationship(P("10001")) is None
+    assert store.delete_relationship(P("10001")) is False
 
 
 def test_top_relationships_orders_by_familiarity(store):
     for index, familiarity in enumerate((10.0, 80.0, 50.0)):
-        record = S.new_relationship(f"u{index}", now=1000.0 + index)
+        record = S.new_relationship(
+            P(f"u{index}"), platform="qq", user_id=f"u{index}", now=1000.0 + index
+        )
         record["familiarity"] = familiarity
         store.put_relationship(record)
 
@@ -156,7 +175,9 @@ def test_top_relationships_orders_by_familiarity(store):
 
 def test_prune_relationships_drops_the_stalest(store):
     for index in range(5):
-        record = S.new_relationship(f"u{index}", now=1000.0 + index)
+        record = S.new_relationship(
+            P(f"u{index}"), platform="qq", user_id=f"u{index}", now=1000.0 + index
+        )
         store.put_relationship(record)
 
     assert store.prune_relationships(keep=2) == 3
@@ -176,6 +197,88 @@ def test_relationship_rows_normalizes_foreign_records():
     assert [item["user_id"] for item in cleaned] == ["42"]
     assert cleaned[0]["familiarity"] == 30.0
     assert "unknown" not in cleaned[0]
+    # v1.20.0（Y4）：没给 person_id 时按 (platform, user_id) 现算，而不是丢弃
+    assert cleaned[0]["person_id"] == P("42")
+    assert cleaned[0]["platform"] == "qq"
+
+
+# ---------------------------------------------------------------- v1→v2 迁移
+
+
+def test_migration_moves_v1_relationships_to_person_id(tmp_path):
+    """v1 库（``user_id`` 主键、无 ``person_id`` 列）升级到 v2 后数据必须还在。
+
+    这是**升级路径**的回归：老用户开一次新版本，关系档案不能凭空消失。
+    ``CREATE TABLE IF NOT EXISTS`` 对已存在的表是 no-op，所以升级完全依赖
+    ``_migrate_relationships_to_v2``——它一旦出错就是「关系全没了」且无报错。
+    """
+
+    path = tmp_path / "life_store.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE relationships (
+              user_id TEXT PRIMARY KEY,
+              first_seen_at REAL NOT NULL,
+              last_interaction_at REAL NOT NULL,
+              interaction_count INTEGER NOT NULL DEFAULT 0,
+              familiarity REAL NOT NULL DEFAULT 0,
+              relation_hint TEXT NOT NULL DEFAULT '',
+              shared_events INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO relationships VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("10001", 1000.0, 2000.0, 7, 66.5, "老档案", 2),
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = S.open_store(str(path))
+    try:
+        assert store.backend == "sqlite"
+        record = store.get_relationship(P("10001"))
+        assert record is not None, "迁移后老档案必须还在"
+        assert record["familiarity"] == pytest.approx(66.5)
+        assert record["interaction_count"] == 7
+        assert record["relation_hint"] == "老档案"
+        assert record["platform"] == "qq", "v1 不存平台，迁移按默认平台处理"
+        assert record["user_id"] == "10001", "user_id 降级为普通字段，仍要保留"
+        # 备份表必须清掉，不留残渣
+        conn = sqlite3.connect(str(path))
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        finally:
+            conn.close()
+        assert "relationships_v1_backup" not in tables
+    finally:
+        store.close()
+
+
+def test_migration_is_idempotent_on_fresh_v2_db(tmp_path):
+    """全新库（v2 结构 + user_version=0）不能被迁移逻辑当成 v1 去重建。"""
+
+    path = tmp_path / "life_store.db"
+    store = S.open_store(str(path))
+    try:
+        store.put_relationship(
+            S.new_relationship(P("777"), platform="qq", user_id="777", now=1.0)
+        )
+    finally:
+        store.close()
+    # 第二次打开：走的是「表已存在」的分支
+    store = S.open_store(str(path))
+    try:
+        assert store.get_relationship(P("777")) is not None
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------- 降级
@@ -187,8 +290,8 @@ def test_memory_backend_has_the_same_interface():
     store.save_day(DAY, {"a": (1, S.ROUTINE_FIRED)})
     assert store.load_day(DAY) == {"a": (1, S.ROUTINE_FIRED)}
     assert store.prune_before("2026-10-09") == 1
-    store.put_relationship(S.new_relationship("7", now=1.0))
-    assert store.get_relationship("7")["user_id"] == "7"
+    store.put_relationship(S.new_relationship(P("7"), platform="qq", user_id="7", now=1.0))
+    assert store.get_relationship(P("7"))["user_id"] == "7"
     assert store.prune_relationships(keep=0) == 1
     store.close()
     assert store.load_day(DAY) == {}

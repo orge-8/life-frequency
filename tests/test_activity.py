@@ -264,6 +264,99 @@ def _request(activity, scene="", source=A.SOURCE_LLM):
     return A.ActivityDecision(activity=activity, scene=scene, source=source, note="test")
 
 
+# ---------------------------------------------------------------- 感冒与入睡短路（v1.19.0 PR-AF-1）
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        # 不生病：恒 False（未感冒路径逐位不变）
+        (dict(sick=False), False),
+        (dict(sick=False, cold_stage=A.COLD_ONSET), False),
+        # 初起：默认**不**短路
+        (dict(sick=True, cold_stage=A.COLD_ONSET), False),
+        # 加重 / 好转：保留短路（那两段该多躺）
+        (dict(sick=True, cold_stage=A.COLD_WORSENING), True),
+        (dict(sick=True, cold_stage=A.COLD_RECOVERING), True),
+        # 旧状态兼容：只填 sick=True 无段位 ⇒ 归一为 worsening ⇒ 短路（存量不变）
+        (dict(sick=True), True),
+        (dict(sick=True, cold_stage=""), True),
+        (dict(sick=True, cold_stage="乱写的段位"), True),
+    ],
+)
+def test_sick_sleep_short_circuit_by_stage(kwargs, expected):
+    assert A._sick_sleep_short_circuit(_facts(**kwargs), _policy()) is expected
+
+
+def test_sick_sleep_short_circuit_escape_hatch():
+    """``cold_onset_awake_floor=False`` 是逃生舱：初起回到 v1.18.1 的一刀切短路。"""
+
+    onset = _facts(sick=True, cold_stage=A.COLD_ONSET)
+    assert A._sick_sleep_short_circuit(onset, _policy(cold_onset_awake_floor=True)) is False
+    assert A._sick_sleep_short_circuit(onset, _policy(cold_onset_awake_floor=False)) is True
+    # 开关只管初起：加重期怎么设都短路
+    worse = _facts(sick=True, cold_stage=A.COLD_WORSENING)
+    assert A._sick_sleep_short_circuit(worse, _policy(cold_onset_awake_floor=True)) is True
+    assert A._sick_sleep_short_circuit(worse, _policy(cold_onset_awake_floor=False)) is True
+
+
+def test_sick_sleep_short_circuit_defaults_when_policy_missing():
+    """``policy=None`` 按默认（True = 不短路）处理，便于纯模块调用。"""
+
+    assert A._sick_sleep_short_circuit(_facts(sick=True, cold_stage=A.COLD_ONSET), None) is False
+    assert A._sick_sleep_short_circuit(_facts(sick=True, cold_stage=A.COLD_WORSENING), None) is True
+
+
+def test_onset_no_longer_bypasses_awake_floor():
+    """核心回归：初起 + 今日清醒不足 ⇒ **拒绝**入睡（v1.18.1 会放行）。
+
+    真机实测：初起也短路时，她睡到体力满醒来、下一 tick 因病中立刻躺回去，
+    ``continuous_awake_minutes`` 长期恒为 10 分钟。
+    """
+
+    out = A.enforce(
+        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET,
+               awake_minutes_today=30, energy=8.0),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.DAILY, "初起且清醒不足，不该立刻躺回去"
+    assert "清醒不足" in out.note
+    assert "初起" in out.note, "拒睡原因要带病程阶段，否则排查时无法区分"
+
+
+def test_worsening_still_bypasses_awake_floor():
+    """加重期保留短路：清醒不足也放行。"""
+
+    out = A.enforce(
+        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_WORSENING,
+               awake_minutes_today=30, energy=8.0),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.SLEEP
+
+
+def test_onset_can_still_sleep_by_energy_or_awake_floor():
+    """初起不是「不许睡」：清醒够了、或体力掉到阈值以下，照常能睡。"""
+
+    awake_enough = A.enforce(
+        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET,
+               awake_minutes_today=9 * 60, energy=8.0, now_minutes=5 * 60),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert awake_enough.activity == A.SLEEP, "清醒够了、又在睡眠时段内，就该能睡"
+
+    drained = A.enforce(
+        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET,
+               awake_minutes_today=30, energy=2.0),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert drained.activity == A.SLEEP, "体力掉到阈值以下仍然放行（健康优先）"
+
+
 def test_enforce_retains_previous_when_no_valid_request():
     out = A.enforce(_facts(activity=A.MUSIC), None, _policy())
     assert out.activity == A.MUSIC

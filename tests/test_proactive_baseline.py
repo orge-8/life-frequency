@@ -90,6 +90,28 @@ def test_restore_reads_latest_timestamp_from_either_key():
     assert restored == pytest.approx(now - 120)
 
 
+def test_restore_reads_the_real_host_string_timestamps():
+    """真机的 ``timestamp`` 是**字符串**（``MessageDict.timestamp: str``）。
+
+    这一条是 v1.18.0 补的回归：以前这里走 ``_as_number``（只认 int/float），
+    真机上每个时间戳都被读成 0 ⇒ ``stamps`` 恒为空 ⇒ 基线补全**从未生效**，
+    只是本地用例一律用 float 才看着全绿。
+    """
+
+    module, plugin, host = _make_plugin()
+    now = time.time()
+    host.returns[CAPABILITY] = [
+        {"timestamp": str(now - 600)},
+        {"timestamp": f"{now - 120:.3f}"},
+    ]
+    restored = asyncio.run(plugin._restore_last_user_from_history("group-1", now))
+    assert restored == pytest.approx(now - 120)
+
+    # 坏值不参与（非数字字符串 / NaN 一律当没有）
+    host.returns[CAPABILITY] = [{"timestamp": "不是时间"}, {"timestamp": "nan"}]
+    assert asyncio.run(plugin._restore_last_user_from_history("group-1", now)) == 0.0
+
+
 def test_restore_returns_zero_when_nothing_found():
     module, plugin, host = _make_plugin()
     host.returns[CAPABILITY] = []

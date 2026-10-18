@@ -86,16 +86,72 @@ def test_mention_costs_battery_and_relieves_loneliness():
     assert state.loneliness == pytest.approx(4.7)
 
 
+def test_sleep_exempts_message_drain_tick_side():
+    """v1.18.1（D9）：睡着/小睡时普通消息不扣电量——真机实测夜间群流量把
+
+    睡眠回充（+1.0/h）全部吃光，电量整夜贴 0。tick 侧 ``had_contact`` 走
+    ``last_contact_at`` 兜底判据，睡眠中同样命中，必须在这里门住。
+    """
+
+    for activity in ("sleep", "nap"):
+        state = type("S", (), {"stress": 3.0, "loneliness": 4.0, "social_battery": 1.0})()
+        M.evolve(state, activity=activity, minutes=10, had_contact=True,
+                 had_mention=False, policy=POLICY, last_contact_at=NOW - 60, now=NOW)
+        # 10 分钟睡眠回充 +0.1667，且没有被消息扣费吃掉
+        assert state.social_battery == pytest.approx(1.0 + POLICY.battery_recover_per_sleep_hour / 6.0), (
+            f"{activity} 中普通消息必须豁免扣费"
+        )
+
+
+def test_sleep_does_not_exempt_mention_drain_tick_side():
+    """被 @ 不豁免：唤醒机制在，mention 是「真叫醒」。"""
+
+    state = type("S", (), {"stress": 3.0, "loneliness": 4.0, "social_battery": 5.0})()
+    M.evolve(state, activity="sleep", minutes=10, had_contact=False,
+             had_mention=True, policy=POLICY, last_contact_at=NOW - 60, now=NOW)
+    # 被 @ 扣费照结，睡眠回充也照给（两条独立结算）
+    assert state.social_battery == pytest.approx(
+        5.0 - POLICY.battery_per_mention + POLICY.battery_recover_per_sleep_hour / 6.0
+    )
+
+
+def test_hook_sleep_exempts_normal_message_drain():
+    """接线层（v1.18.1 D9）：钩子对每条入站消息即时扣费——睡着时普通消息跳过。"""
+
+    async def run():
+        module, plugin, host = _make_plugin()
+        plugin._state.activity = "sleep"
+        plugin._state.social_battery = 2.0
+        plugin._state.loneliness = 4.0
+        plugin._mood_signal_in_hook({"mentioned": False, "at": 1_700_000_000.0})
+        assert plugin._state.social_battery == pytest.approx(2.0), "睡眠中普通消息不扣电量"
+        # 清醒后恢复扣费
+        plugin._state.activity = "daily"
+        plugin._mood_signal_in_hook({"mentioned": False, "at": 1_700_000_060.0})
+        assert plugin._state.social_battery == pytest.approx(2.0 - POLICY.battery_per_message)
+        # 被 @ 永远扣（睡眠中也一样）
+        plugin._state.activity = "sleep"
+        plugin._state.social_battery = 2.0
+        plugin._mood_signal_in_hook({"mentioned": True, "at": 1_700_000_120.0})
+        assert plugin._state.social_battery == pytest.approx(2.0 - POLICY.battery_per_mention)
+
+    asyncio.run(run())
+
+
 def test_loneliness_grows_after_six_quiet_hours_only():
     # 刚互动过：不涨
     state = type("S", (), {"stress": 3.0, "loneliness": 4.0, "social_battery": 7.0})()
     M.evolve(state, activity="daze", minutes=10, had_contact=False,
-             had_mention=False, policy=POLICY, last_contact_at=NOW - 60, now=NOW)
+             had_mention=False, policy=POLICY, last_contact_at=NOW - 60, now=NOW,
+             last_addressed_at=NOW - 60)
     assert state.loneliness == 4.0
-    # 六小时没人理：涨
+    # 六小时没人跟她说话：涨
+    # v1.20.1（#6）：锚点换成 ``last_addressed_at``（"有人跟我说话"）——
+    # 用 ``last_contact_at``（"房间里有人说话"）时活跃群下永远到不了这一支。
     state2 = type("S", (), {"stress": 3.0, "loneliness": 4.0, "social_battery": 7.0})()
     M.evolve(state2, activity="daze", minutes=10, had_contact=False,
-             had_mention=False, policy=POLICY, last_contact_at=NOW - 7 * 3600, now=NOW)
+             had_mention=False, policy=POLICY, last_contact_at=NOW - 7 * 3600, now=NOW,
+             last_addressed_at=NOW - 7 * 3600)
     assert state2.loneliness > 4.0
 
 
@@ -207,3 +263,167 @@ def test_low_battery_blocks_proactive():
         assert plugin._state.skip_ledger.get("low_battery"), plugin._state.skip_ledger
 
     asyncio.run(run())
+
+
+# ================================================================ v1.19.2
+# 孤独回落有界化（D8-2）+ 钩子层不再回落（D8-1）
+#
+# 真机 2026-10-15：钩子每条消息 -0.3 而上涨唯一通道 quiet>=6h 才 +0.05/tick，
+# 活跃群（消息间隔中位 0.17h）下结构性只降不涨，18h 恒 0.0。
+
+def test_loneliness_relief_is_bounded_per_tick():
+    """一个 tick 内来 30 条消息也只回一次：-relief 而非 30×relief。"""
+
+    state = type("S", (), {"stress": 3.0, "loneliness": 5.0, "social_battery": 9.0})()
+    M.evolve(state, activity="daily", minutes=10, had_contact=True,
+             had_mention=False, policy=POLICY, last_contact_at=NOW - 60, now=NOW,
+             had_addressed=True)
+    assert state.loneliness == pytest.approx(5.0 - POLICY.loneliness_relief_per_tick), (
+        "回落必须每 tick 至多一次（有界），与消息条数无关"
+    )
+
+
+def test_loneliness_can_actually_grow_between_sparse_quiets():
+    """回归锚点：涨与落同量级时，安静段孤独能真实累积（旧设计下永远不能）。"""
+
+    state = type("S", (), {"stress": 3.0, "loneliness": 0.0, "social_battery": 9.0})()
+    # 模拟「每小时一批消息 + 消息间隔 < 6h 但有安静 tick」的活跃群白天：
+    # 消息 tick 落 -0.3，安静 tick（未满 6h）不动 ⇒ 白天缓降、最多到 0，不再钉死在任意值
+    now = NOW
+    for _ in range(30):
+        M.evolve(state, activity="daily", minutes=10, had_contact=True,
+                 had_mention=False, policy=POLICY, last_contact_at=now - 60, now=now,
+                 had_addressed=True, last_addressed_at=now - 60)
+        now += 600
+    assert state.loneliness == 0.0
+    # 深夜安静段（>6h）必须能涨回去——旧设计下白天已被钉 0，这段也能涨，但
+    # 关键差别是：**白天不再以 -0.3/条 的速度瞬间清零后保持 0**，而是有界缓降
+    state2 = type("S", (), {"stress": 3.0, "loneliness": 2.0, "social_battery": 9.0})()
+    for _ in range(12):
+        M.evolve(state2, activity="daze", minutes=10, had_contact=False,
+                 had_mention=False, policy=POLICY, last_contact_at=now - 7 * 3600, now=now,
+                 last_addressed_at=now - 7 * 3600)
+        now += 600
+    assert state2.loneliness > 2.0, "安静 6h 后孤独必须累积（每小时 +0.3）"
+
+
+def test_hook_no_longer_relieves_loneliness():
+    """接线层（D8-1）：钩子只刷 last_contact_at 锚点，孤独回落统一下沉到 tick 层。"""
+
+    async def run():
+        module, plugin, host = _make_plugin()
+        plugin._state.activity = "daily"
+        plugin._state.loneliness = 5.0
+        before = plugin._state.loneliness
+        plugin._mood_signal_in_hook({"mentioned": False, "at": 1_700_000_000.0})
+        assert plugin._state.loneliness == before, "钩子层不许再动孤独（有界化后统一在 tick 层）"
+        assert plugin._state.last_contact_at == 1_700_000_000.0, "锚点照常刷新"
+
+    asyncio.run(run())
+
+
+def test_hook_sleep_still_updates_contact_anchor():
+    """睡眠中收到消息：锚点照刷（醒来后 quiet 从消息时刻起算），孤独电量都不动。"""
+
+    async def run():
+        module, plugin, host = _make_plugin()
+        plugin._state.activity = "sleep"
+        plugin._state.loneliness = 5.0
+        plugin._state.social_battery = 3.0
+        plugin._mood_signal_in_hook({"mentioned": False, "at": 1_700_000_500.0})
+        assert plugin._state.last_contact_at == 1_700_000_500.0
+        assert plugin._state.loneliness == 5.0, "睡眠中孤独不被消息压（模块注释语义）"
+        assert plugin._state.social_battery == 3.0, "睡眠中普通消息不扣电量（v1.18.1 语义保持）"
+
+    asyncio.run(run())
+
+
+def test_hook_mention_still_costs_battery_and_does_not_relieve_loneliness():
+    """被 @：电量照扣（真叫醒），孤独回落也统一下沉到 tick 层（不在钩子）。"""
+
+    async def run():
+        module, plugin, host = _make_plugin()
+        plugin._state.activity = "daily"
+        plugin._state.loneliness = 5.0
+        plugin._state.social_battery = 5.0
+        plugin._mood_signal_in_hook({"mentioned": True, "at": 1_700_000_900.0})
+        assert plugin._state.social_battery == pytest.approx(
+            5.0 - POLICY.battery_per_mention), "被 @ 扣电量保持"
+        assert plugin._state.loneliness == 5.0, "孤独回落不在钩子层"
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 「被找」口径（v1.20.1 #6）
+
+
+def test_loneliness_growth_ignores_group_chatter_among_others():
+    """**核心回归**：别人互相刷屏不算"有人陪她"，孤独必须能涨。
+
+    真机 283 样本（23.5 小时、v1.19.2）里孤独 **283/283 恒 0.0000**，根因是
+    ``had_contact`` 由**任何**入站群消息刷新 ⇒ 活跃群清醒时几乎每个 tick 都走回落
+    分支、增长分支连进都进不去。这一条把「房间里有人说话」与「有人跟我说话」分开：
+    前者成立（``had_contact=True``）而后者不成立时，孤独**不再回落**，安静够久就涨。
+    """
+
+    state = type("S", (), {"stress": 3.0, "loneliness": 4.0, "social_battery": 9.0})()
+    # 群里一直有人在聊（had_contact 恒真），但没人跟她说话、且已 7 小时没人找她
+    for _ in range(12):
+        M.evolve(
+            state, activity="daily", minutes=10,
+            had_contact=True, had_mention=False, policy=POLICY,
+            last_contact_at=NOW - 60,          # 房间里刚有人说话
+            now=NOW,
+            had_addressed=False,
+            last_addressed_at=NOW - 7 * 3600,  # 但她已经 7 小时没被找过
+        )
+        assert state.loneliness >= 4.0, "别人刷屏不该消除她的孤独"
+    assert state.loneliness > 4.0, "安静够久就该涨（每小时 +0.3）"
+
+
+def test_loneliness_still_relieves_when_someone_addresses_her():
+    """反向：真的有人跟她说话时照常回落（有界，每 tick 至多一次）。"""
+
+    state = type("S", (), {"stress": 3.0, "loneliness": 6.0, "social_battery": 9.0})()
+    M.evolve(
+        state, activity="daily", minutes=10,
+        had_contact=True, had_mention=False, policy=POLICY,
+        last_contact_at=NOW, now=NOW,
+        had_addressed=True, last_addressed_at=NOW,
+    )
+    assert state.loneliness == pytest.approx(6.0 - POLICY.loneliness_relief_per_tick)
+
+
+def test_loneliness_rollback_switch_restores_v1192_behaviour():
+    """回退开关：``loneliness_requires_addressed=False`` 精确回到"房间里有人=有人陪"。"""
+
+    policy = M.MoodPolicy(loneliness_requires_addressed=False)
+    state = type("S", (), {"stress": 3.0, "loneliness": 4.0, "social_battery": 9.0})()
+    for _ in range(12):
+        M.evolve(
+            state, activity="daily", minutes=10,
+            had_contact=True, had_mention=False, policy=policy,
+            last_contact_at=NOW - 60, now=NOW,
+            had_addressed=False, last_addressed_at=NOW - 7 * 3600,
+        )
+    # 旧口径下 had_contact=True ⇒ 每 tick 走回落、增长分支永远进不去
+    assert state.loneliness == pytest.approx(
+        4.0 - 12 * POLICY.loneliness_relief_per_tick
+    ), "旧口径下只降不涨"
+
+
+def test_battery_branch_still_counts_group_chatter():
+    """电量**不受**这项影响：群体闲聊仍算「在场社交」、照常耗电。
+
+    两个维度问的不是同一个问题——孤独看"有没有人跟我说话"，电量看"我在不在社交场合"。
+    """
+
+    state = type("S", (), {"stress": 3.0, "loneliness": 4.0, "social_battery": 5.0})()
+    before = state.social_battery
+    M.evolve(
+        state, activity="daily", minutes=10,
+        had_contact=True, had_mention=False, policy=POLICY,
+        last_contact_at=NOW, now=NOW,
+        had_addressed=False, last_addressed_at=NOW - 7 * 3600,
+    )
+    assert state.social_battery < before, "群里有人说话仍然耗电（在场社交）"

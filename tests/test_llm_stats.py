@@ -259,3 +259,106 @@ def test_stats_do_not_change_the_decision():
         assert plugin._state.activity_source == "llm"
 
     asyncio.run(run())
+
+
+def test_hanging_model_call_is_cut_by_the_outer_hard_fuse():
+    """v1.20.0（G2）：宿主侧超时不生效（调用永不返回）时，外层硬熔断必须掐断这一轮。
+
+    没有它的话 ``_sim_loop`` 会**永久挂起**——整个生活模型停摆（不推进 tick、
+    不下发倍率、不核销 pending_verify）。这类故障诊断查得出来，但插件无法自愈。
+
+    内层预算压到 1 秒、余量收紧到 0.2 秒 ⇒ 外层总闸约 1.2 秒，测试跑得动。
+    """
+
+    async def run():
+        module, plugin, host = _make_plugin()
+        # ⚠ 这一处打桩打的是**标准库 time 模块本身**（``module.time`` 就是 ``time``），
+        # 不是插件模块的属性。所以还原也必须还原 ``time.time``——写成
+        # ``module.time = real_time`` 只是把插件模块的 ``time`` 属性换成一个函数，
+        # 全局时钟**仍然冻结**：此后所有依赖真实时钟的用例都会挂死
+        # （实测 ``test_watch::test_watch_loop_collects_several_samples_then_stops``
+        # 在采样间隔的 ``time.sleep`` 里永不退出；见本文件末尾的还原守卫）。
+        real_clock = module.time.time
+        now = _at(14, 0)
+        real_margin = module._LLM_HARD_FUSE_MARGIN_SECONDS
+        try:
+            module.time.time = lambda: now
+            module._LLM_HARD_FUSE_MARGIN_SECONDS = 0.2
+            plugin._state.last_tick_at = now - 600
+            plugin._llm_ready = lambda _now: True
+            plugin._fetch_identity = lambda: asyncio.sleep(0)
+            plugin.config.activity.llm.skip_when_forced = False
+            plugin.config.activity.llm.timeout_ms = 1000
+
+            async def never_returns(**_kwargs):
+                await asyncio.sleep(3600)
+
+            plugin.ctx.llm.generate = never_returns
+            # 关键断言：这一轮必须**返回**。真挂住的话这里先超时，测试红。
+            await asyncio.wait_for(plugin._sim_tick(), timeout=10)
+        finally:
+            module.time.time = real_clock
+            module._LLM_HARD_FUSE_MARGIN_SECONDS = real_margin
+
+        stats = plugin._llm_stats_today(now)
+        assert stats.get("asked") == 1, stats
+        assert stats.get("failed") == 1, "熔断要记进既有失败链，而不是静默返回"
+        # 熔断被 ``_is_timeout_failure`` 认成「等超时」⇒ 复用了既有告警，不必另开分支
+        assert plugin._state.activity == "daily", "熔断后保持当前活动"
+        assert plugin._state.llm_fail_streak == 1, "熔断计入失败计数，供冷却使用"
+
+    asyncio.run(run())
+
+
+def test_outer_fuse_margin_is_positive():
+    """外层总闸必须**严格高于**内层 RPC 预算（铁律：外层先断会盖住内层错误）。
+
+    总闸是 ``timeout_ms / 1000 + _LLM_HARD_FUSE_MARGIN_SECONDS``，所以余量为正
+    就等于「外层在内层之后」。这条守的是那个常数不被改成 0 或负数——
+    改成 0 之后行为看起来照常（正常调用内层先超时），只有真挂起时才暴露。
+    """
+
+    module, plugin, host = _make_plugin()
+    assert module._LLM_HARD_FUSE_MARGIN_SECONDS > 0, "余量必须为正，否则外层会先于内层断"
+
+
+def test_frozen_clock_cases_restore_the_real_clock():
+    """时钟还原守卫：打桩打的是**标准库 time**，漏还原会把后面所有用例挂死。
+
+    实测代价（2026-10-18）：``test_hanging_model_call_is_cut_by_the_outer_hard_fuse``
+    的 ``finally`` 写成 ``module.time = real_time``——只换掉了插件模块的属性，全局
+    ``time.time`` 仍是冻结的 lambda。于是 ``test_watch.py`` 的 watch 循环在
+    ``while time.time() < next_wall`` 里永不退出（堆栈停在采样间隔的 ``time.sleep``），
+    **单跑 test_watch 绿、全量跑挂死**，而门禁只看到「卡住」看不到原因。
+
+    这条守的是「跑完这一族用例之后，时钟必须还是活的」。
+    """
+
+    import time as _time
+
+    first = _time.time()
+    _time.sleep(0.01)
+    assert _time.time() > first, (
+        "全局 time.time 被冻结且没有还原（曾让 test_watch 的 watch 循环永久挂起）"
+    )
+
+
+def test_frozen_clock_cases_restore_the_real_clock():
+    """时钟还原守卫：打桩打的是**标准库 time**，漏还原会把后面所有用例挂死。
+
+    实测代价（2026-10-18）：``test_hanging_model_call_is_cut_by_the_outer_hard_fuse``
+    的 ``finally`` 写成 ``module.time = real_time``——只换掉了插件模块的属性，全局
+    ``time.time`` 仍是冻结的 lambda。于是 ``test_watch.py`` 的 watch 循环在
+    ``while time.time() < next_wall`` 里永不退出（堆栈停在采样间隔的 ``time.sleep``），
+    **单跑 test_watch 绿、全量跑挂死**，而门禁只看到「卡住」看不到原因。
+
+    这条守的是「跑完这一族用例之后，时钟必须还是活的」。
+    """
+
+    import time as _time
+
+    first = _time.time()
+    _time.sleep(0.01)
+    assert _time.time() > first, (
+        "全局 time.time 被冻结且没有还原（曾让 test_watch 的 watch 循环永久挂起）"
+    )

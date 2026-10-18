@@ -31,6 +31,16 @@ TZ = 480
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
 
 
+def P(uid, platform="qq"):
+    """关系表主键（v1.20.0/Y4 起是 ``md5(platform_user_id)``）。
+
+    熟悉度索引与信号查表都按它走，所以本文件里所有 ``_relation_familiarity``
+    的字面量键都必须用这个函数生成，不能写裸 QQ 号。
+    """
+
+    return R.person_id_for(platform, uid)
+
+
 def ts(year, month, day, hour, minute=0):
     return datetime(year, month, day, hour, minute, tzinfo=timezone.utc).timestamp() - TZ * 60
 
@@ -242,16 +252,20 @@ class _FakeStore:
     """够用的关系库替身：只实现纯模块真正调用的那几个方法。"""
 
     def __init__(self, records=None):
-        self.records = {str(item["user_id"]): dict(item) for item in (records or [])}
+        # v1.20.0（Y4）：主键是 person_id；来源只给 user_id 时按 (platform, user_id) 现算。
+        self.records = {
+            P(item.get("user_id"), item.get("platform")): dict(item)
+            for item in (records or [])
+        }
         self.puts = 0
 
-    def get_relationship(self, user_id):  # noqa: ANN001
-        record = self.records.get(str(user_id))
+    def get_relationship(self, person_id):  # noqa: ANN001
+        record = self.records.get(str(person_id))
         return dict(record) if record else None
 
     def put_relationship(self, record):  # noqa: ANN001
         self.puts += 1
-        self.records[str(record["user_id"])] = dict(record)
+        self.records[P(record.get("user_id"), record.get("platform"))] = dict(record)
         return True
 
     def prune_relationships(self, keep=200):  # noqa: ANN001
@@ -312,7 +326,7 @@ def test_d_phase_switches_come_back_to_old_behaviour():
     )
     assert plugin._sim_config().emotion_impact_scaling is False
     # 关掉关系加权后，即使索引里有熟人也是 1.0
-    plugin._relation_familiarity = {"10001": 88.0}
+    plugin._relation_familiarity = {P("10001"): 88.0}
     assert plugin._relation_factor_for_signals([{"user_id": "10001"}]) == 1.0
 
 
@@ -331,7 +345,7 @@ def test_relation_factor_takes_the_most_familiar_speaker():
     pytest.importorskip("maibot_sdk", reason="接线用例需要 maibot-plugin-sdk")
 
     _module, plugin, _host = _make_plugin()
-    plugin._relation_familiarity = {"10001": 5.0, "10002": 85.0, "10003": 45.0}
+    plugin._relation_familiarity = {P("10001"): 5.0, P("10002"): 85.0, P("10003"): 45.0}
     assert plugin._relation_factor_for_signals(
         [{"user_id": "10001"}, {"user_id": "10002"}]
     ) == pytest.approx(1.5)
@@ -350,12 +364,12 @@ def test_relation_index_is_filled_by_touch_and_by_the_daily_refresh():
             {"is_mentioned": True, "processed_plain_text": "在吗"},
             session_id="g1", group_id="123456", user_id="20001", now=time.time(),
         )
-        assert plugin._relation_familiarity["20001"] == pytest.approx(0.2)
+        assert plugin._relation_familiarity[P("20001")] == pytest.approx(0.2)
         assert plugin._relation_factor_for_signals([{"user_id": "20001"}]) == pytest.approx(1.0)
 
         # ② 全量刷新：库里的 60 分熟人进索引
         await plugin._refresh_relation_index()
-        assert plugin._relation_familiarity["20002"] == pytest.approx(60.0)
+        assert plugin._relation_familiarity[P("20002")] == pytest.approx(60.0)
         assert plugin._relation_factor_for_signals([{"user_id": "20002"}]) == pytest.approx(
             R.emotion_factor(60.0)
         )
@@ -368,7 +382,7 @@ def test_relation_index_is_empty_when_the_relation_layer_is_off():
 
     async def run():
         _module, plugin, _host = _make_plugin(relations={"enabled": False})
-        plugin._relation_familiarity = {"10001": 90.0}
+        plugin._relation_familiarity = {P("10001"): 90.0}
         await plugin._refresh_relation_index()
         assert plugin._relation_familiarity == {}
         assert plugin._relation_factor_for_signals([{"user_id": "10001"}]) == 1.0
@@ -383,7 +397,7 @@ def test_intake_wires_relation_and_impact_factors_into_the_event():
         _module, plugin, _host = _make_plugin(
             social={"enabled": True}, mood={"loneliness_social_scaling": False}
         )
-        plugin._relation_familiarity = {"10001": 85.0}
+        plugin._relation_familiarity = {P("10001"): 85.0}
         plugin._state.day_key = "2026-10-01"
         plugin._state.activity = A.DAILY
         plugin._state.emotion = 1.0  # 低谷 ⇒ 正向增量 ×1.3

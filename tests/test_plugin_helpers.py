@@ -239,6 +239,16 @@ def test_all_manifest_capabilities_are_used_in_plugin_py():
             continue  # ctx.logger / ctx.paths 是辅助对象，不需要声明能力
         used.add(chain)
 
+    # v1.22.0：动态分发器里的**字面量**能力名也要算。
+    # ``self.ctx.call_capability("knowledge.search", person_id=..., mode=...)`` 的能力名
+    # 静态上不是属性访问，但它是确定的字符串——不认这一条，「用了也声明了」会被误判成
+    # 「声明了没用到」（knowledge.search 需要 person_id/mode/respect_filter，代理方法的
+    # 签名接不住，只能走分发器）。
+    for literal in re.findall(
+        r"""self\.ctx\.call_capability\(\s*["']([a-z_]+(?:[._][a-z_]+)+)["']""", source
+    ):
+        used.add(literal)
+
     declared = set(manifest["capabilities"])
     missing = used - declared
     unused = declared - used

@@ -295,6 +295,24 @@ def session_ids(message: object) -> tuple[str, str, str]:
     return session_id, group_id, user_id
 
 
+def platform_of(message: object) -> str:
+    """从 Hook 载荷取 ``platform``；认不出给 ``"qq"``（v1.20.0，Y4）。
+
+    与 ``session_ids`` 同源的读法：顶层优先，再退到 ``message_info.platform``
+    （真机载荷是嵌套的，同 ``session_ids`` 的说明）。
+
+    默认 ``"qq"`` 而不是空串：这个值要喂给 ``person_id_for``——
+    ``md5(platform_user_id)``，**空串会算出与宿主不一致的 person_id**
+    （宿主 ``person_info::get_person_id`` 里 ``platform or "qq"``），
+    那样「对齐 Host 画像」这件事就静默失效了。
+    """
+
+    if not isinstance(message, Mapping):
+        return "qq"
+    value = str(message.get("platform") or _deep(message, "message_info", "platform") or "").strip()
+    return value or "qq"
+
+
 def live_signal(message: object, *, now: float) -> dict[str, Any] | None:
     """把一条入站消息压成**无原文**的信号；不值得记就返回 ``None``。
 
@@ -323,6 +341,9 @@ def live_signal(message: object, *, now: float) -> dict[str, Any] | None:
         # ⚠ **只在内存里流转**（信号本身不进 recent_events、不落盘），所以这里带
         # user_id 不违反「QQ 号不进提示词与状态文件」的脱敏纪律（v1.13.1 F-001）。
         "user_id": str(user_id or ""),
+        # v1.20.0（Y4）：关系表的键变成 ``md5(platform_user_id)``，所以信号必须
+        # 一起带 platform，否则查熟悉度时算不出与建档时同一个 person_id。
+        "platform": platform_of(message),
     }
 
 

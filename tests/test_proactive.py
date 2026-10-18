@@ -328,8 +328,13 @@ def test_records_are_rebuilt_from_garbage():
 # ---------------------------------------------------------------- G1 未回应退避
 
 
-def test_unanswered_backoff_lengthens_interval_private_only():
-    """G1：对方连续不回应 → 间隔 ×2^连击 拉长（封顶）；仅私聊；回话立即归零。"""
+def test_unanswered_backoff_lengthens_interval_private_and_group():
+    """G1：对方连续不回应 → 间隔 ×2^连击 拉长（封顶）；回话立即归零。
+
+    v1.22.2 起**群聊也退避**（``unanswered_backoff_group`` 默认开）：允许她去活跃冷群
+    之后，「群里总会有人接」这个前提反过来了——没人的群最不可能有人接。置
+    ``unanswered_backoff_group=False`` 精确回到 v1.22.1 的「仅私聊」（下面有断言）。
+    """
 
     record = {
         "last_proactive_at": 900.0,        # 距 now=1000 只有 100 秒
@@ -350,9 +355,12 @@ def test_unanswered_backoff_lengthens_interval_private_only():
     out = _decide(session=capped, private_chat=True)
     assert "×16" in out.detail              # 连击封顶 2^4 = 48 小时
 
-    out = _decide(session=record)           # 群聊 / 未传 private_chat：不退避
+    out = _decide(session=record)           # 群聊（private_chat 默认 False）：v1.22.2 起也退避
     assert out.reason == P.REASON_INTERVAL
-    assert "退避" not in out.detail
+    assert "未回应退避 ×2" in out.detail
+
+    legacy = _decide(session=record, config=_config(unanswered_backoff_group=False))
+    assert "退避" not in legacy.detail        # 关掉开关 = 回到仅私聊
 
     replied = dict(record, last_user_message_at=950.0)   # 主动之后对方说过话
     out = _decide(session=replied, private_chat=True)
@@ -394,10 +402,224 @@ def test_backoff_level_is_observable_in_the_ledger():
     assert out.reason == P.REASON_INTERVAL
     assert out.backoff == pytest.approx(4.0)        # 连击 1+1 → ×4
 
-    group = _decide(session=record)                 # 群聊不退避
-    assert group.backoff == pytest.approx(1.0)
+    group = _decide(session=record)                 # 群聊也退避（v1.22.2 默认）
+    assert group.backoff == pytest.approx(4.0)
+
+    legacy = _decide(session=record, config=_config(unanswered_backoff_group=False))
+    assert legacy.backoff == pytest.approx(1.0), "关掉开关 = 回到仅私聊"
 
     label = P.SKIP_REASON_LABELS[P.REASON_INTERVAL]
     lines = P.ledger_lines({f"{P.REASON_INTERVAL}×4": 3, P.REASON_INTERVAL: 5})
     assert f"{label} ×4：3 次" in lines
     assert f"{label}：5 次" in lines
+
+
+# ---------------------------------------------------------------- v1.18.0 四道新闸
+#
+# 来自 mohobot ``plugins/proactive_chat``（AGPL-3.0，只借机制）的四条：
+# 失败要冷却、受理≠发送要核实、间隔要抖动、止损要有硬上限。
+
+
+def test_attempt_cooldown_blocks_then_expires():
+    now = 1000.0
+    blocked = _decide(now=now, session={"last_attempt_at": now - 300.0})
+    assert blocked.reason == P.REASON_ATTEMPT_COOLDOWN
+    assert "分钟" in blocked.detail
+    # 冷却 15 分钟：1000 秒前失败 ⇒ 已经过了
+    assert _decide(now=now, session={"last_attempt_at": now - 1000.0}).should_send
+
+
+def test_attempt_cooldown_can_be_disabled():
+    now = 1000.0
+    decision = _decide(config=_config(failure_cooldown_minutes=0), now=now,
+                       session={"last_attempt_at": now - 1.0})
+    assert decision.should_send
+
+
+def test_a_later_success_clears_the_cooldown():
+    """``last_attempt_at`` 比 ``last_proactive_at`` 旧 ⇒ 上次失败之后已经成功过。"""
+
+    now = 1000.0
+    outcome = _decide(now=now, session={"last_attempt_at": now - 60.0,
+                                        "last_proactive_at": now - 30.0})
+    assert outcome.reason == P.REASON_INTERVAL
+
+
+def test_record_attempt_only_moves_the_cooldown_anchor():
+    """没有发出去的尝试不该消耗配额、不该记连击、不该推后间隔闸。"""
+
+    sessions: dict = {}
+    P.record_proactive(sessions, stream_id="s1", now=100.0, day_key="d")
+    before = dict(sessions["s1"])
+    P.record_attempt(sessions, stream_id="s1", now=200.0, day_key="d")
+    after = sessions["s1"]
+    assert after["last_attempt_at"] == 200.0
+    for key in ("count", "unanswered_streak", "last_proactive_at"):
+        assert after[key] == before[key], f"{key} 不该被一次没发出去的尝试改动"
+
+
+def test_pending_verify_blocks_until_it_is_resolved():
+    """只要上一次开口还挂着（没核销），pending 就拦住——**不看**它到没到点。
+
+    核销在每轮判定**之前**跑（``_verify_pending_proactive``）：能核销的早就核销掉了，
+    还挂着的（本轮配额不够 / 形状坏掉）恰恰是该拦住这个会话的情况。
+    """
+
+    now = 1000.0
+    not_due = {"pending_verify": {"trigger_at": now - 60.0, "verify_after": now + 60.0}}
+    assert _decide(now=now, session=not_due).reason == P.REASON_PENDING
+    # 已到点但（因为配额等原因）还没核销：同样拦住，否则空窗里会连开两枪
+    due = {"pending_verify": {"trigger_at": now - 600.0, "verify_after": now - 1.0}}
+    assert _decide(now=now, session=due).reason == P.REASON_PENDING
+    # 核销掉（或形状坏掉被丢弃）之后立刻放行
+    assert _decide(now=now, session={"pending_verify": None}).should_send
+
+
+def test_pending_verify_helpers_round_trip():
+    sessions: dict = {}
+    P.record_pending_verify(sessions, stream_id="s1", trigger_at=10.0,
+                            verify_after=20.0, day_key="2026-10-11")
+    assert P.pending_verify_of(sessions["s1"]) == {
+        "trigger_at": 10.0, "verify_after": 20.0, "day_key": "2026-10-11",
+    }
+    P.clear_pending_verify(sessions["s1"])
+    assert P.pending_verify_of(sessions["s1"]) is None
+    # 形状坏掉一律当没有（被外部写坏的状态文件不能让闸门抛错）
+    assert P.pending_verify_of(None) is None
+    assert P.pending_verify_of({}) is None
+    assert P.pending_verify_of({"pending_verify": "不是字典"}) is None
+    assert P.pending_verify_of({"pending_verify": {"trigger_at": "坏", "verify_after": 1.0}}) is None
+    assert P.pending_verify_of({"pending_verify": {"trigger_at": -1.0, "verify_after": 2.0}}) is None
+    assert P.pending_verify_of({"pending_verify": {"trigger_at": 1.0, "verify_after": 0.0}}) is None
+
+
+def test_record_proactive_clears_the_pending_marker():
+    """核销落地（不管成功还是失败）都必须把待核实标记清掉，否则闸门永久卡住。"""
+
+    sessions: dict = {}
+    P.record_pending_verify(sessions, stream_id="s1", trigger_at=10.0,
+                            verify_after=20.0, day_key="d")
+    P.record_proactive(sessions, stream_id="s1", now=10.0, day_key="d")
+    assert "pending_verify" not in sessions["s1"]
+    P.record_pending_verify(sessions, stream_id="s1", trigger_at=30.0,
+                            verify_after=40.0, day_key="d")
+    P.record_attempt(sessions, stream_id="s1", now=35.0, day_key="d")
+    assert "pending_verify" not in sessions["s1"]
+
+
+def test_interval_jitter_is_off_by_default_and_deterministic():
+    assert P.interval_jitter("2026-10-11|s1|0", 0.0) == 1.0
+    assert P.interval_jitter("2026-10-11|s1|0", -1.0) == 1.0
+    one = P.interval_jitter("2026-10-11|s1|0", 0.15)
+    assert 1.0 <= one < 1.15
+    # 同一种子恒同倍率（tick 间不重掷、重启一致）
+    assert P.interval_jitter("2026-10-11|s1|0", 0.15) == one
+    # 比例超范围被夹到 1.0
+    assert P.interval_jitter("2026-10-11|s1|0", 999.0) < 2.0
+    assert P.interval_jitter("2026-10-11|s1|0", "坏值") == 1.0
+
+
+def test_interval_jitter_spreads_across_sessions_and_days():
+    same_day = {P.interval_jitter(f"2026-10-11|s{i}|0", 0.15) for i in range(8)}
+    assert len(same_day) > 1, "抖动应该在会话之间散开"
+    days = {P.interval_jitter(f"2026-10-{day:02d}|s1|0", 0.15) for day in range(1, 8)}
+    assert len(days) > 1, "抖动应该按天变化"
+
+
+def test_interval_gate_honours_the_jitter_ceiling():
+    """抖动只把间隔**拉长**：基础间隔到头仍被拦，抖动上界之后才放行。"""
+
+    config = _config(min_interval_minutes=180, interval_jitter_ratio=0.15)
+    # ``last_user_message_at`` 与 ``last_proactive_at`` 同为 10000：**对方后来接过话**，
+    # 未回应退避不成立（v1.22.2 起群聊也退避，不补这一笔会把 ×2 混进抖动断言里）
+    session = {"stream_id": "s1", "day_key": "2026-10-11", "count": 0,
+               "last_user_message_at": 10000.0}
+    seed_ratio = P.interval_jitter("2026-10-11|s1|0", 0.15)
+    base = 180 * 60.0
+    at_base = 10000.0 + base
+    assert _decide(config=config, now=at_base, day_key="2026-10-11",
+                   materials=[_material(now=at_base)],
+                   session={**session, "last_proactive_at": 10000.0}).reason == P.REASON_INTERVAL
+    at_ceiling = 10000.0 + base * seed_ratio
+    assert _decide(config=config, now=at_ceiling + 1.0, day_key="2026-10-11",
+                   materials=[_material(now=at_ceiling + 1.0)],
+                   session={**session, "last_proactive_at": 10000.0}).should_send
+
+
+def test_interval_jitter_is_visible_in_the_detail():
+    config = _config(min_interval_minutes=180, interval_jitter_ratio=0.15)
+    now = 10000.0 + 180 * 60.0
+    outcome = _decide(config=config, now=now, day_key="2026-10-11",
+                      materials=[_material(now=now)],
+                      session={"stream_id": "s1", "last_proactive_at": 10000.0})
+    assert outcome.reason == P.REASON_INTERVAL
+    assert "抖动" in outcome.detail
+
+
+#: 未回应上限的时间锚点：必须是一个**正数**的真实 epoch。``decide`` 的退避段要求
+#: ``last_proactive_at > 0``（0 = 从没主动过），拿 10000.0 去减 10 天会变成负数，
+#: 闸门会被整条跳过——测试就变成假绿。
+_CAP_NOW = 1_700_000_000.0
+
+
+def _unanswered_session(now: float, streak: int) -> dict:
+    return {
+        "last_proactive_at": now - 10 * 86400.0,
+        "last_user_message_at": now - 11 * 86400.0,
+        "unanswered_streak": streak,
+        "day_key": "2026-10-11",
+        "count": 0,
+    }
+
+
+def test_unanswered_cap_stops_at_the_configured_streak():
+    now = _CAP_NOW
+    config = _config(max_unanswered_times=4)
+    # streak=3 ⇒ 这一次是第 4 次 ⇒ 仍放行；streak=4 ⇒ 第 5 次 ⇒ 停
+    assert _decide(config=config, now=now, materials=[_material(now=now)],
+                   session=_unanswered_session(now, 3), private_chat=True).should_send
+    capped = _decide(config=config, now=now, materials=[_material(now=now)],
+                     session=_unanswered_session(now, 4), private_chat=True)
+    assert capped.reason == P.REASON_UNANSWERED_CAP
+    assert "4 次" in capped.detail
+
+
+def test_unanswered_cap_is_off_by_default_and_covers_groups_too():
+    now = _CAP_NOW
+    session = _unanswered_session(now, 9)
+    material = [_material(now=now)]
+    # 默认 0 = 关：退避封顶后她仍能隔天说一句（私聊与群聊都一样）
+    assert _decide(now=now, materials=material, session=session, private_chat=True).should_send
+    assert _decide(now=now, materials=material, session=session, private_chat=False).should_send
+    # v1.22.2：上限与退避同一适用面，群聊也生效
+    capped = _decide(config=_config(max_unanswered_times=4), now=now, materials=material,
+                     session=session, private_chat=False)
+    assert capped.reason == P.REASON_UNANSWERED_CAP
+    # 关掉群聊退避 = 上限也不在群聊生效（回到 v1.22.1）
+    legacy = _decide(now=now, materials=material, session=session, private_chat=False,
+                     config=_config(max_unanswered_times=4, unanswered_backoff_group=False))
+    assert legacy.should_send
+
+
+def test_unanswered_cap_recovers_when_the_user_answers():
+    now = _CAP_NOW
+    session = dict(_unanswered_session(now, 9), last_user_message_at=now - 5.0)
+    outcome = _decide(config=_config(max_unanswered_times=4), now=now,
+                      materials=[_material(now=now)], session=session, private_chat=True)
+    assert outcome.reason == P.REASON_SILENCE, "对方刚回话 ⇒ 上限不成立，转由沉默闸解释"
+
+
+def test_unanswered_cap_is_not_confused_by_the_backoff_ceiling():
+    """硬上限比的是**真实连击**，不能被退避封顶（max_streak）掩盖。"""
+
+    now = _CAP_NOW
+    config = _config(max_unanswered_times=6, unanswered_backoff_max_streak=4)
+    session = _unanswered_session(now, 6)
+    assert _decide(config=config, now=now, materials=[_material(now=now)],
+                   session=session, private_chat=True).reason == P.REASON_UNANSWERED_CAP
+
+
+def test_new_reason_labels_are_present():
+    for key in (P.REASON_PENDING, P.REASON_ATTEMPT_COOLDOWN,
+                P.REASON_UNANSWERED_CAP, P.LEDGER_SENT, P.LEDGER_NOT_SENT):
+        assert P.SKIP_REASON_LABELS.get(key), f"{key} 缺少中文标签"

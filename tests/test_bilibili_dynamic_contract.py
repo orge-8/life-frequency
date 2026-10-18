@@ -189,11 +189,18 @@ def test_manual_test_push_is_not_recorded(dynamic_push, tmp_path):
         plugin = _make_plugin(dynamic_push, tmp_path)
         calls = {"sent": 0}
 
-        async def _stream_id(group_id):
+        # ``**kwargs`` 是刻意的：上游 ``_get_stream_id`` 后来多了一个 ``refresh=``
+        # 关键字（v1.21.0 起本机副本已带）。契约测试关心的是「record=False 不落事件」，
+        # 不该因为上游给自家私有助手加了个参数就红——那是把内部实现细节当契约。
+        async def _stream_id(group_id, **kwargs):
             return f"stream-{group_id}"
 
+        # 返回值要如实给 True：上游把这些发送助手的返回值当**投递结果**统计
+        # （真机日志「成功 0/1 个群」就是这么来的），返回 None 会被判成失败并重试，
+        # 于是 ``sent`` 翻倍。契约关心的是「真的发了」与「不落事件」，不是内部重试次数。
         async def _send(stream_id, text, image_b64s, *, where, sender_name):
             calls["sent"] += 1
+            return True
 
         plugin._get_stream_id = _stream_id
         plugin._send_dynamic_content = _send

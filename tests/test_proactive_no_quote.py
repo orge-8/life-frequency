@@ -247,7 +247,7 @@ def test_trigger_opens_the_window_on_success():
     now = time.time()
 
     accepted = asyncio.run(plugin._trigger_proactive("group-1", _decision(material), "2026-10-05", now))
-    assert accepted, "FakeHost 默认受理主动任务"
+    assert accepted == "sent", "FakeHost 默认受理主动任务"
     assert "group-1" in plugin._proactive_no_quote_until
     assert plugin._proactive_no_quote_until["group-1"] > now
 
@@ -262,10 +262,11 @@ def test_trigger_failure_does_not_open_the_window():
     host.returns["maisaka.proactive.trigger"] = {"success": False, "error": "宿主拒绝"}
     material = {"label": "小事", "text": "刚泡了杯茶"}
 
-    accepted = asyncio.run(
+    outcome = asyncio.run(
         plugin._trigger_proactive("group-1", _decision(material), "2026-10-05", time.time())
     )
-    assert not accepted
+    # v1.18.0 起是三态：failed（失败，要冷却）与 aborted（对方刚说话，不冷却）分开
+    assert outcome == "failed"
     assert "group-1" not in plugin._proactive_no_quote_until, "宿主没受理就不该开窗"
 
 

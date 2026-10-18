@@ -215,7 +215,9 @@ def test_relation_motive_reads_store_records():
 
         store = plugin._routine_store
         assert store is not None
-        record = new_relationship("10001", now=NOW - 5 * 86400)
+        record = new_relationship(
+            "10001", platform="qq", user_id="10001", now=NOW - 5 * 86400
+        )
         record["familiarity"] = 60.0
         record["last_interaction_at"] = NOW - 5 * 86400
         store.put_relationship(record)

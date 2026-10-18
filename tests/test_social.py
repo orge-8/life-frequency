@@ -211,7 +211,10 @@ def test_live_signal_reads_group_identity_and_mention():
         now=1000.0,
     )
     assert signal == {"at": 1000.0, "session_id": "g1", "is_group": True,
-                      "mentioned": True, "text_len": 4, "user_id": ""}
+                      "mentioned": True, "text_len": 4, "user_id": "",
+                      # v1.20.0（Y4）：关系表键是 md5(platform_user_id)，
+                      # 所以信号必须带上平台，否则查不出建档时那个 person_id。
+                      "platform": "qq"}
     # v1.16.3（M7）：说话的人要在信号里——社交情绪按关系加权要靠它认人。
     # ⚠ 它只在内存里流转（不落盘、不进提示词），所以带 user_id 不违反脱敏纪律。
     identified = SOS.live_signal(

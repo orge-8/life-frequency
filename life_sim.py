@@ -302,6 +302,10 @@ class SimConfig:
     sleep_energy_threshold: float = 3.0
     max_sleep_hours: float = 12.0
     min_awake_hours_per_day: float = 8.0
+    #: 感冒**初起**是否也不短路「每日清醒下限」（v1.19.0 PR-AF-1，默认 True）。
+    #: False = 回到 v1.18.1 的「生病即短路」一刀切。详见
+    #: ``life_activity._sick_sleep_short_circuit``。
+    cold_onset_awake_floor: bool = True
     min_dwell_minutes: int = 60
     min_sleep_minutes: int = 180
     #: 睡眠中体力恢复到上限就强制唤醒（v1.6.0：**不再要求睡满最短时长**——
@@ -691,6 +695,7 @@ def build_enforce_policy(config: SimConfig) -> EnforcePolicy:
         sleep_energy_threshold=config.sleep_energy_threshold,
         max_sleep_hours=config.max_sleep_hours,
         min_awake_hours_per_day=config.min_awake_hours_per_day,
+        cold_onset_awake_floor=bool(getattr(config, "cold_onset_awake_floor", True)),
         min_dwell_minutes=config.min_dwell_minutes,
         min_sleep_minutes=config.min_sleep_minutes,
         energy_full_wake=config.energy_full_wake,
@@ -884,7 +889,9 @@ def _sanitize_session_map(raw: object) -> dict[str, dict[str, Any]]:
         if not session_id or not isinstance(value, dict):
             continue
         record = dict(value)
-        for stamp in ("last_user_message_at", "last_proactive_at"):
+        # v1.18.0：last_attempt_at 与 last_proactive_at 同属冷却/间隔锚点，
+        # 一个 NaN 会让比较恒为假 ⇒ 冷却静默失效（与 last_user_message_at 同理）。
+        for stamp in ("last_user_message_at", "last_proactive_at", "last_attempt_at"):
             if stamp in record:
                 number = _as_float(record.get(stamp))
                 record[stamp] = number if number is not None else 0.0
@@ -892,6 +899,23 @@ def _sanitize_session_map(raw: object) -> dict[str, dict[str, Any]]:
             if count in record:
                 number = _as_float(record.get(count))
                 record[count] = int(number) if number is not None else 0
+        # v1.18.0：pending_verify 是嵌套结构，形态坏掉要**整键丢弃**而不是留着
+        # 半个 dict 进消费点——它的 trigger_at/verify_after 会直接参与闸门比较。
+        pending = record.get("pending_verify")
+        if pending is not None:
+            if not isinstance(pending, dict):
+                record.pop("pending_verify", None)
+            else:
+                trigger_at = _as_float(pending.get("trigger_at"))
+                verify_after = _as_float(pending.get("verify_after"))
+                if trigger_at is None or verify_after is None or trigger_at <= 0.0 or verify_after <= 0.0:
+                    record.pop("pending_verify", None)
+                else:
+                    record["pending_verify"] = {
+                        "trigger_at": float(trigger_at),
+                        "verify_after": float(verify_after),
+                        "day_key": str(pending.get("day_key", "") or ""),
+                    }
         cleaned[session_id] = record
     return cleaned
 
@@ -1001,6 +1025,12 @@ class LifeState:
     social_battery: float = 7.0
     #: 最近一次「有人互动」的时刻（epoch 秒；供 loneliness 的 6 小时判据）。
     last_contact_at: float = 0.0
+    #: 最近一次「**有人跟她说话**」的时刻（epoch 秒，v1.20.1 #6）。
+    #: 口径与 ``last_contact_at`` 刻意不同：那个是「房间里有人说话」（别人互相刷屏也算，
+    #: 电量维度用），这个是「有人对我说话」（私聊 / 被 @ / 回复她，孤独维度用）。
+    #: 真机 283 样本实测：只用 ``last_contact_at`` 时活跃群下孤独永远走回落分支、
+    #: 恒 0.0000——因为"房间里一直有人"被当成了"一直有人陪她"。
+    last_addressed_at: float = 0.0
     #: 压力**持续**处于高位的起点（epoch 秒；0 = 当前不高）。
     #: v1.16.2（M3a）：高压崩溃事件要求「stress ≥ 阈值持续 ≥ 2 小时」，所以要记起点；
     #: 由 ``life_mood.evolve`` 每 tick 维护，回落到 ``stress_breakdown_reset`` 以下时清零。
