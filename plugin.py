@@ -170,9 +170,9 @@ try:
     )
     from .life_topic import cold_group_material
     from .life_memory import (
-        MEMORY_SEARCH_MODES, FactCache as MemoryFactCache,
-        facts_from_content as memory_facts_from_content,
-        filter_facts as memory_filter_facts,
+        FactCache as MemoryFactCache, MemoryLog as MemoryLog,
+        MemoryScopeGuard as MemoryScopeGuard,
+        fetch_person_facts as memory_fetch_person_facts,
         materials_for_session as memory_materials_for_session,
         memory_materials as memory_materials_of,
     )
@@ -472,9 +472,9 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     )
     from life_topic import cold_group_material
     from life_memory import (
-        MEMORY_SEARCH_MODES, FactCache as MemoryFactCache,
-        facts_from_content as memory_facts_from_content,
-        filter_facts as memory_filter_facts,
+        FactCache as MemoryFactCache, MemoryLog as MemoryLog,
+        MemoryScopeGuard as MemoryScopeGuard,
+        fetch_person_facts as memory_fetch_person_facts,
         materials_for_session as memory_materials_for_session,
         memory_materials as memory_materials_of,
     )
@@ -956,6 +956,10 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         #: 长期记忆（v1.22.0）：``person_id → 事实`` 的惰性缓存（进程内，不落盘）。
         #: 空结果也缓存——否则「查不到」会变成每 tick 重查一遍（见 life_memory.FactCache）。
         self._memory_cache: MemoryFactCache = MemoryFactCache()
+        #: 长期记忆作用域（v1.22.4）：``person_id`` / ``respect_filter`` 有没有被宿主
+        #: 兑现靠哨兵对照自证，不靠 SDK 签名假设（它们不在公开签名里）。
+        self._memory_scope: MemoryScopeGuard = MemoryScopeGuard()
+        self._memory_log: MemoryLog = MemoryLog(plugin_id=__plugin_id__)
         # ---- 习惯层（v1.9.0）----
         #: 解析后的习惯行（配置变化时重建；空元组 = 这一层不存在）
         self._routine_lines: tuple[Any, ...] = ()
@@ -1267,6 +1271,10 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             )
         else:
             self._memory_cache.clear()
+            # 关掉这一层时把作用域结论也一起丢掉：重新开启要**重新自证**一次，
+            # 不能沿用「宿主不支持」的旧结论（宿主可能已经升级/换过配置）。
+            self._memory_scope.reset()
+            self._memory_log.forget("memory_scope")
 
     # ------------------------------------------------------------ 状态读写
 
@@ -4320,29 +4328,17 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         tokens.extend(sorted(self._bot_qq_ids or ()))
         return tuple(tokens)
 
-    def _note_memory_failure(self, error: Any) -> None:
-        """记忆检索失败的记账：首次 warning，之后 debug（每 tick 都刷警告没人看）。"""
-
-        if "memory_fetch" in self._warned:
-            self.ctx.logger.debug("%s 长期记忆检索失败：%s", __plugin_id__, error)
-            return
-        self._warned.add("memory_fetch")
-        self.ctx.logger.warning(
-            "%s 长期记忆检索失败（本进程只报一次，之后降为 debug）：%s；"
-            "请确认宿主已配置 A_Memorix，或关掉 [memory] enabled",
-            __plugin_id__, error,
-        )
-
     async def _memory_facts_for_person(
         self, person_id: str, *, query: str = "", user_id: str = ""
     ) -> tuple[str, ...]:
         """这个人的长期记忆事实；任何失败都返回空元组，绝不抛。
 
-        三条硬约束（见 ``life_memory`` 模块文档）：
-
-        1. ``respect_filter=True`` + ``person_id`` 必传，否则 A_Memorix 全库检索串人；
-        2. ``mode`` 只用 ``search``——``hybrid`` / ``episode`` / ``time`` 会刷 SQLite 错；
-        3. **串行**：本方法一次只发一条 RPC，调用方也不许 gather（并行会撞写锁）。
+        **作用域自证（v1.22.4）**：``person_id`` / ``respect_filter`` 不在 SDK 的
+        ``KnowledgeCapability.search(query, limit=5)`` 签名里，宿主可能接受、忽略或
+        直接报错，公开文档无从判断。所以这一层会拿哨兵 ``person_id`` 对照自证一次：
+        验不出作用域就**停用本层**，而不是退回无作用域的检索——那正是串人本身。
+        判定与检索都在 ``life_memory.fetch_person_facts``（入口模块的结构预算是
+        门禁化的，一层可选接线不该把它撑大）。
 
         **失败不写缓存**：把一次网络抖动缓存成 6 小时的「她没有记忆」，比不查更糟。
         成功但为空**要**缓存，否则新用户每次巡检都被重查一遍。
@@ -4350,49 +4346,30 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         cfg = self.config.memory
         pid = str(person_id or "").strip()
-        if not cfg.enabled or not pid:
+        if not cfg.enabled or not pid or self._memory_scope.disabled:
             return ()
         now = time.time()
         cached = self._memory_cache.get(pid, now)
         if cached is not None:
             return cached
-
-        limit = max(1, int(cfg.search_limit))
-        text_query = str(query or "").strip() or pid
-        try:
-            content = await self.ctx.call_capability(
-                "knowledge.search",
-                query=text_query,
-                person_id=pid,
-                limit=limit,
-                mode=MEMORY_SEARCH_MODES[0],
-                respect_filter=True,
-            )
-        except Exception as exc:  # noqa: BLE001 —— 记忆是可选接线，失败不影响主流程
-            self._note_memory_failure(exc)
-            return ()
-        if isinstance(content, Mapping) and content.get("success") is False:
-            self._note_memory_failure(content.get("error"))
-            return ()
-
-        raw = memory_facts_from_content(
-            content, max_items=limit, max_chars=int(cfg.fact_max_chars)
-        )
-        facts = memory_filter_facts(
-            raw,
-            # 查询词就是人名时才当作身份词；退化成 person_id 的查询不能当身份词用
-            person_tokens=(text_query,) if text_query != pid else (),
+        facts = await memory_fetch_person_facts(
+            self.ctx.call_capability,
+            person_id=pid,
+            query=str(query or "").strip() or pid,
+            guard=self._memory_scope,
+            cache=self._memory_cache,
+            log=self._memory_log.bind(self.ctx.logger),
+            limit=cfg.search_limit,
+            max_chars=int(cfg.fact_max_chars),
             bot_tokens=self._memory_bot_tokens(),
             require_person_mention=bool(cfg.require_person_mention),
         )
-        if "memory_fetch" in self._warned:
+        if facts is None:
+            return ()
+        if self._memory_log.warned("memory_fetch"):
             # 曾经坏过、现在好了：把告警标记撤掉，下次再坏能重新告警
-            self._warned.discard("memory_fetch")
+            self._memory_log.forget("memory_fetch")
         self._memory_cache.put(pid, facts, now)
-        self.ctx.logger.debug(
-            "%s 长期记忆 person_id=%s user_id=%s 查询=%r 原始=%d 过滤后=%d",
-            __plugin_id__, pid, user_id or "-", text_query, len(raw), len(facts),
-        )
         return facts
 
     async def _memory_gate_ok(self, person_id: str) -> tuple[bool, str]:

@@ -9,12 +9,31 @@
 所以这一层只读：读得到就用，读不到就什么都不发生（与 ``[world]`` / ``[economy]``
 那几路可选接线同一条纪律）。
 
-**三条真机契约**（来自 ``impression-card-lite`` 的踩坑，别再试一遍）
+**四条真机契约**（来自 ``impression-card-lite`` 的踩坑，别再试一遍）
 1. **必须** ``respect_filter=True`` 且带 ``person_id``。否则 A_Memorix 走全库检索、
    把别人的记忆捞回来——这是「串人」的第一根因。
 2. ``mode`` 只允许 ``search`` / ``aggregate``；``hybrid`` / ``episode`` / ``time``
    在 A_Memorix 的并行或部分路径上会刷 tuple / SQLite 错。
 3. 多次检索**串行**调用，并行会撞 SQLite 写锁。
+4. **第 1 条的两个参数不在公开 SDK 里**（v1.22.4 起的硬约束，见下）。
+
+**作用域必须自证，不能假设（v1.22.4）**
+``person_id`` / ``mode`` / ``respect_filter`` 都不在 SDK 2.8.1 的
+``KnowledgeCapability.search(query, limit=5)`` 签名里，``ctx.call_capability`` 只是把
+``**kwargs`` 原样塞进 ``cap.call`` 的 ``args``——宿主**接受、忽略、报错**三种行为都
+存在，公开文档与 SDK 都无从判断。所以插件不能再把「不串人」押在这两个参数被兑现上：
+
+- **哨兵对照**（:data:`SCOPE_PROBE_PERSON_ID`）：拿到非空结果时，用一个不可能属于
+  真人的 ``person_id`` 发同一条查询；回来的东西与真实查询**一致且非空**，就说明
+  ``person_id`` 被忽略了 → 判 :data:`SCOPE_UNSCOPED`，**整层停用**（不是退回全库检索，
+  没有作用域的检索本身就是串人）。
+- **参数不受理也算证据**：宿主直接抛「unexpected keyword」一类错误，同样判
+  ``unscoped``（:func:`looks_like_unsupported_argument`）。
+- **没验证过就从严**：状态还是 ``unknown`` 时强制 ``require_person_mention=True``，
+  只接受点名了目标人的条目——宁可这一轮少提一句，也不猜。
+
+这三条加起来，无论宿主是「接受并生效 / 接受但忽略 / 直接报错」哪一种，都不会把
+别人的记忆说出口；区别只是功能可用、自动停用、还是只在严格模式下可用。
 
 **隔离的第二道闸在本地**
 服务端过滤只能保证「这条记忆属于这个人」，不能保证「它不会出现在别人的会话里」。
@@ -41,6 +60,31 @@ except ImportError:  # 平铺兜底（脚本直跑 / 测试）
 
 #: 允许的检索模式（见模块文档契约 2）。``hybrid`` / ``episode`` / ``time`` 一律不试。
 MEMORY_SEARCH_MODES: tuple[str, ...] = ("search", "aggregate")
+
+#: 作用域尚未验证：``person_id`` / ``respect_filter`` 到底生不生效还不知道。
+#: 此状态下**强制**按人点名过滤（见 :func:`filter_facts` 的 ``require_person_mention``）。
+SCOPE_UNKNOWN = "unknown"
+#: 已验证：服务端确实按 ``person_id`` 圈定了检索范围。
+SCOPE_SCOPED = "scoped"
+#: 已验证：**没有**按人圈定（参数被忽略或不被受理）。此状态下整层停用。
+SCOPE_UNSCOPED = "unscoped"
+
+#: 哨兵 ``person_id``：与 :func:`relation_person_id` 同形却不可能对应真人
+#: （真人的键是 ``md5(platform_user_id)`` 的 32 位十六进制）。拿它发同一条查询，
+#: 若返回与真人查询一致且非空，就证明服务端**没有**按人过滤。
+SCOPE_PROBE_PERSON_ID = "0" * 32
+
+#: 宿主「不接受这些参数」的错误特征（中英文宿主都考虑）。命中即判
+#: :data:`SCOPE_UNSCOPED`——参数不被受理时，继续发等于发一条无作用域的全库检索。
+_UNSUPPORTED_ARG_MARKERS: tuple[str, ...] = (
+    "unexpected keyword",
+    "unexpected parameter",
+    "unexpected argument",
+    "unknown parameter",
+    "unknown argument",
+    "unsupported parameter",
+    "unsupported argument",
+)
 
 #: 素材标签（进 ``build_intent`` 的括号里，也进 ``/生活 为什么`` 的来由）
 MEMORY_LABEL = "记忆:旧事"
@@ -244,6 +288,133 @@ def filter_facts(
     return tuple(kept)
 
 
+# ---------------------------------------------------------------- 作用域自证
+
+
+def facts_equal(left: Sequence[str], right: Sequence[str]) -> bool:
+    """两组事实是否**逐条相同**（哨兵对照的判据，忽略顺序）。
+
+    只在两边都非空时才有意义：空对空说明「两边都查不到」，那也可能是过滤生效了
+    （哨兵本来就没有记忆），不能拿来判 ``unscoped``。
+    """
+
+    a = tuple(str(item or "").strip().casefold() for item in left if str(item or "").strip())
+    b = tuple(str(item or "").strip().casefold() for item in right if str(item or "").strip())
+    if not a or not b or len(a) != len(b):
+        return False
+    return sorted(a) == sorted(b)
+
+
+def looks_like_unsupported_argument(error: Any) -> bool:
+    """这个异常是不是「宿主不接受 ``person_id`` / ``respect_filter``」？
+
+    **只认明确特征**，认不出就返回 ``False``——判定错成「不支持」会让功能白停，
+    判定错成「支持」会让全库检索继续跑，后者才是事故。所以宁可漏判（维持
+    ``unknown`` 的严格模式），也不许拿模糊信号下结论。
+    """
+
+    text = f"{type(error).__name__}: {error}".casefold()
+    if not text.strip(":"):
+        return False
+    return any(marker in text for marker in _UNSUPPORTED_ARG_MARKERS)
+
+
+class MemoryScopeGuard:
+    """``knowledge.search`` 作用域自证的状态机（纯逻辑，不碰 IO）。
+
+    宿主对 ``person_id`` / ``respect_filter`` 有「接受并生效 / 接受但忽略 / 直接报错」
+    三种可能，公开 SDK 无从判断——所以不串人这件事由**这个状态机**负责，不由
+    SDK 签名假设负责。三态见 :data:`SCOPE_UNKNOWN` / :data:`SCOPE_SCOPED` /
+    :data:`SCOPE_UNSCOPED`。
+
+    **粘性**：判成 ``unscoped`` 之后不再回头。宿主不支持是契约事实，重试也不会变，
+    而每次重试都是一次无作用域的全库检索。
+    """
+
+    def __init__(self, *, require_person_mention: bool = False) -> None:
+        self._state = SCOPE_UNKNOWN
+        self._require_person_mention = bool(require_person_mention)
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def disabled(self) -> bool:
+        """已证实宿主不按人圈定：这一层必须停用。"""
+        return self._state == SCOPE_UNSCOPED
+
+    @property
+    def strict_person_mention(self) -> bool:
+        """是否强制「条目必须点名本人」。作用域没验过时恒为 ``True``。"""
+        return self._require_person_mention or self._state == SCOPE_UNKNOWN
+
+    def note_rejected(self, error: Any) -> bool:
+        """检索抛异常时调用；返回 ``True`` 表示「宿主不认这些参数」→ 已停用。"""
+
+        if looks_like_unsupported_argument(error):
+            self._state = SCOPE_UNSCOPED
+            return True
+        return False
+
+    def probe_needed(self, facts: Sequence[str]) -> bool:
+        """拿到 ``facts`` 后要不要再发一条哨兵对照（只在第一次拿到非空结果时）。"""
+
+        return bool(facts) and self._state == SCOPE_UNKNOWN
+
+    def note_probe(self, real_facts: Sequence[str], probe_facts: Sequence[str]) -> None:
+        """喂进哨兵结果：一致且非空 = 作用域失效，否则视为生效。"""
+
+        if facts_equal(real_facts, probe_facts):
+            self._state = SCOPE_UNSCOPED
+            return
+        self._state = SCOPE_SCOPED
+
+    def reset(self) -> None:
+        """重新自证（配置关掉又打开时用：宿主可能已经换过）。"""
+
+        self._state = SCOPE_UNKNOWN
+
+
+class MemoryLog:
+    """记忆层的日志出口：一次性告警 + debug，``logger`` 为 ``None`` 时全静默。
+
+    告警只报一次是刻意的：10 分钟一个 tick，每 tick 刷同一条警告没人看，真出事时
+    还会把它顶掉。**坏了又好了要把标记撤掉**（:meth:`forget`），否则下次再坏不吭声。
+    """
+
+    def __init__(self, logger: Any = None, plugin_id: str = "") -> None:
+        self._logger = logger
+        self._plugin_id = str(plugin_id or "")
+        self._warned: set[str] = set()
+
+    def bind(self, logger: Any) -> "MemoryLog":
+        """绑定 logger（插件的 ``ctx.logger`` 是 bind 之后才有的，每次调用顺手刷新）。"""
+
+        self._logger = logger
+        return self
+
+    def warned(self, key: str) -> bool:
+        return key in self._warned
+
+    def forget(self, key: str) -> None:
+        self._warned.discard(key)
+
+    def debug(self, message: str, *args: Any) -> None:
+        if self._logger is None:
+            return
+        self._logger.debug(f"{self._plugin_id} {message}", *args)
+
+    def warn_once(self, key: str, message: str, *args: Any) -> None:
+        if key in self._warned:
+            self.debug(message, *args)
+            return
+        self._warned.add(key)
+        if self._logger is None:
+            return
+        self._logger.warning(f"{self._plugin_id} {message}", *args)
+
+
 # ---------------------------------------------------------------- 素材
 
 
@@ -385,18 +556,156 @@ class FactCache:
         return len(self._entries)
 
 
+# ---------------------------------------------------------------- 读取一个人的记忆
+
+
+async def fetch_person_facts(
+    call_capability: Any,
+    *,
+    person_id: str,
+    query: str = "",
+    guard: MemoryScopeGuard,
+    cache: FactCache,
+    log: MemoryLog,
+    limit: int = 5,
+    max_chars: int = DEFAULT_FACT_MAX_CHARS,
+    bot_tokens: Iterable[object] = (),
+    require_person_mention: bool = False,
+) -> tuple[str, ...] | None:
+    """这个人的记忆事实；``None`` = 这次不能用（停用 / 失败），**不写缓存**。
+
+    把「作用域自证 + 检索 + 解析 + 身份过滤」收在一处，``plugin.py`` 只留「取配置 +
+    委托」——入口模块的结构预算是门禁化的，一层可选接线不该把它继续撑大。
+
+    **串行**：一次只发一条 RPC（自证那次也严格前后相继），调用方不许 gather——并行
+    会撞 A_Memorix 的 SQLite 写锁。
+    """
+
+    pid = str(person_id or "").strip()
+    if not pid or guard.disabled:
+        return None
+    limit_i = max(1, int(limit))
+    try:
+        content = await call_capability(
+            "knowledge.search",
+            query=query,
+            person_id=pid,
+            limit=limit_i,
+            mode=MEMORY_SEARCH_MODES[0],
+            respect_filter=True,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 记忆是可选接线，失败不影响主流程
+        if guard.note_rejected(exc):
+            _disable(cache, log, f"宿主不接受检索参数（{exc}）")
+            return None
+        _note_failure(log, exc)
+        return None
+    if isinstance(content, Mapping) and content.get("success") is False:
+        _note_failure(log, content.get("error"))
+        return None
+
+    raw = facts_from_content(content, max_items=limit_i, max_chars=int(max_chars))
+    if guard.probe_needed(raw):
+        await _verify_scope(
+            call_capability, query=query, limit=limit_i, max_chars=max_chars,
+            real_facts=raw, guard=guard, log=log,
+        )
+        if guard.disabled:
+            _disable(cache, log, "哨兵 person_id 返回了与真人一致的结果")
+            return None
+    facts = filter_facts(
+        raw,
+        # 查询词就是人名时才当身份词；退化成 person_id 的查询不能当身份词用
+        person_tokens=(query,) if query != pid else (),
+        bot_tokens=bot_tokens,
+        require_person_mention=require_person_mention or guard.strict_person_mention,
+    )
+    log.debug(
+        "长期记忆 person_id=%s 查询=%r 原始=%d 过滤后=%d 作用域=%s",
+        pid, query, len(raw), len(facts), guard.state,
+    )
+    return facts
+
+
+async def _verify_scope(
+    call_capability: Any,
+    *,
+    query: str,
+    limit: int,
+    max_chars: int,
+    real_facts: Sequence[str],
+    guard: MemoryScopeGuard,
+    log: MemoryLog,
+) -> None:
+    """哨兵对照：同一条查询、只把 ``person_id`` 换成一个不可能属于真人的值。
+
+    两边结果的差异只能来自服务端有没有按人过滤：一致且非空 → 参数被忽略；不一致
+    （哨兵通常查不到东西）→ 参数生效。**探测自己失败不算证据**（可能只是抖动），
+    维持严格模式，下一次拿到非空结果时再验。
+    """
+
+    try:
+        probe = await call_capability(
+            "knowledge.search",
+            query=query,
+            person_id=SCOPE_PROBE_PERSON_ID,
+            limit=limit,
+            mode=MEMORY_SEARCH_MODES[0],
+            respect_filter=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("长期记忆作用域探测失败（维持严格模式，下次再验）：%s", exc)
+        return
+    if isinstance(probe, Mapping) and probe.get("success") is False:
+        log.debug("长期记忆作用域探测被宿主拒绝：%s", probe.get("error"))
+        return
+    guard.note_probe(
+        real_facts,
+        facts_from_content(probe, max_items=limit, max_chars=int(max_chars)),
+    )
+
+
+def _note_failure(log: MemoryLog, error: Any) -> None:
+    log.warn_once(
+        "memory_fetch",
+        "长期记忆检索失败（本进程只报一次，之后降为 debug）：%s；"
+        "请确认宿主已配置 A_Memorix，或关掉 [memory] enabled", error,
+    )
+
+
+def _disable(cache: FactCache, log: MemoryLog, reason: str) -> None:
+    """停用整层：已缓存的事实一并作废（它们是在无作用域的前提下取回来的）。"""
+
+    cache.clear()
+    log.warn_once(
+        "memory_scope",
+        "长期记忆已停用：宿主 knowledge.search 未兑现 person_id / respect_filter 的"
+        "作用域（%s）。无作用域的检索会把别人的记忆捞回来，因此本进程不再读取；"
+        "请确认宿主 A_Memorix 支持这两个参数，或关掉 [memory] enabled", reason,
+    )
+
+
 __all__ = [
     "DEFAULT_FACT_MAX_CHARS",
     "FactCache",
+    "MemoryLog",
+    "MemoryScopeGuard",
+    "fetch_person_facts",
     "MAX_MATERIAL_CHARS",
     "MEMORY_INTRO",
     "MEMORY_LABEL",
     "MEMORY_MATERIAL_TTL_HOURS",
     "MEMORY_MATERIAL_WEIGHT",
     "MEMORY_SEARCH_MODES",
+    "SCOPE_PROBE_PERSON_ID",
+    "SCOPE_SCOPED",
+    "SCOPE_UNKNOWN",
+    "SCOPE_UNSCOPED",
     "fact_to_material",
+    "facts_equal",
     "facts_from_content",
     "filter_facts",
+    "looks_like_unsupported_argument",
     "materials_for_session",
     "memory_materials",
     "scrub_fact",

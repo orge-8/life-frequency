@@ -109,8 +109,12 @@ NON_CAPABILITY_PROXIES = {"paths", "logger", "call_capability", "call_host_metho
 #: ``call_capability`` 的能力名通常是运行时参数，静态推不出来；但写成
 #: ``ctx.call_capability("knowledge.search", ...)`` 时名字是确定的。不认这一条，
 #: 「确实用了、也确实声明了」的插件会被反报成「声明了但没用到」——把真警告淹掉。
+#: v1.22.4：``ctx.`` 前缀改可选。能力调用会随逻辑下沉到 ``life_*.py``（记忆层的
+#: ``knowledge.search`` 就是一例），那里拿到的是**分发器本身**而不是 ``ctx``，
+#: 写成 ``await call_capability("knowledge.search", ...)``。前缀一锁死，下沉之后
+#: 「确实用了也声明了」会被反报成「声明了但没用到」——与 v1.22.0 那条同源。
 CALL_CAPABILITY_LITERAL_RE = re.compile(
-    r"""ctx\.call_capability\(\s*["']([A-Za-z_][A-Za-z0-9_.]*)["']"""
+    r"""(?:ctx\.)?call_capability\(\s*["']([A-Za-z_][A-Za-z0-9_.]*)["']"""
 )
 """不是能力代理的名字。
 
@@ -392,14 +396,21 @@ def _has_os_path_dirname_call(tree: ast.AST) -> bool:
 
 
 def check_source(source: str, caps: list[str], rep: Report,
-                 extra_sources: list[tuple[str, str]] | None = None) -> None:
+                 extra_sources: list[tuple[str, str]] | None = None,
+                 capability_sources: list[str] | None = None) -> None:
     """L1 源码检查。``extra_sources`` = 一起参与结构判定的附加模块（名称, 源码）。
 
     目前只有 ``life_config.py``：配置模型在那里，所以「config_version 是否声明」
     与「配置层不许出现 ctx 调用」两条必须连它一起看。
+
+    ``capability_sources`` = 只参与**能力名反推**的源码（v1.22.4）：能力调用随逻辑
+    下沉到 ``life_*.py`` 之后，光扫 ``plugin.py`` 会把「确实用了」判成「声明了没用到」。
+    注意它**不**参与上面那两条结构判定——纯模块里有 ``from __future__``、也没有
+    ``self.ctx``，把整包塞进 ``extra_sources`` 会凭空造出 FAIL。
     """
 
     extra_sources = extra_sources or []
+    capability_sources = capability_sources or []
     if re.search(r"^\s*import\s+src\.|^\s*from\s+src\.", source, re.M):
         rep.fail("源码/禁止 import src", "插件只允许导入标准库、第三方库与 maibot_sdk")
     else:
@@ -531,11 +542,13 @@ def check_source(source: str, caps: list[str], rep: Report,
             unknown.add(proxy)
     # 动态分发器里的字面量能力名（v1.22.0）：``ctx.call_capability("knowledge.search", ...)``
     # 的名字是确定值，不认这一条会把「用了也声明了」误报成「声明了但没用到」。
-    for literal in CALL_CAPABILITY_LITERAL_RE.findall(source):
-        if literal.startswith(STATISTICS_PREFIX):
-            used.add(literal)
-            continue
-        used.add(CAPABILITY_MAP.get(literal, literal))
+    # v1.22.4 起连 ``life_*.py`` 一起扫：能力调用会随逻辑下沉（记忆层就是一例）。
+    for text in [source, *capability_sources]:
+        for literal in CALL_CAPABILITY_LITERAL_RE.findall(text):
+            if literal.startswith(STATISTICS_PREFIX):
+                used.add(literal)
+                continue
+            used.add(CAPABILITY_MAP.get(literal, literal))
     declared = set(caps)
     missing = sorted(used - declared - FREE_CAPABILITIES)
     if missing:
@@ -636,7 +649,16 @@ def run(plugin_dir: str) -> Report:
         cfg_path = os.path.join(plugin_dir, CONFIG_MODULE)
         if os.path.isfile(cfg_path):
             extra.append((CONFIG_MODULE, read_text(cfg_path)))
-        check_source(source, caps, rep, extra_sources=extra)
+        # 能力名反推要连 life_*.py 一起扫（v1.22.4）：入口模块的结构预算是门禁化的，
+        # 逻辑下沉之后能力名会跟着走，只扫 plugin.py 会漏。
+        capability_sources = [
+            read_text(os.path.join(plugin_dir, name))
+            for name in sorted(os.listdir(plugin_dir))
+            if name.startswith("life_") and name.endswith(".py")
+            and os.path.isfile(os.path.join(plugin_dir, name))
+        ]
+        check_source(source, caps, rep, extra_sources=extra,
+                     capability_sources=capability_sources)
     check_hygiene(plugin_dir, rep)
     return rep
 

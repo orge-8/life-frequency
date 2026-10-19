@@ -100,6 +100,10 @@ class FakeHost:
         #: 未登记的目标一律返回「未找到 API 提供方插件」，与真机缺失提供方一致。
         self.api_returns: dict[str, Any] = {}
         self.api_errors: dict[str, str] = {}
+        #: ``knowledge.search`` 是否**忽略** ``person_id``（仿真「接受但忽略」的宿主）。
+        #: 默认 ``False`` = 宿主真的按人圈定：哨兵 ``person_id``（全 0 串）查不到东西。
+        #: 置 ``True`` 可复现 v1.22.4 作用域守卫要防的那种宿主。
+        self.knowledge_ignores_person_id: bool = False
 
     # 插件侧所有 ctx.* 最终都走这里。
     # 真实 SDK 链路: ctx.send.text(...) -> call_capability("send.text", ...)
@@ -142,6 +146,13 @@ class FakeHost:
                 0.0, float(args.get("value") or 0.0)
             )
             return {"success": True}
+        if capability == "knowledge.search" and not self.knowledge_ignores_person_id:
+            # 仿真**支持** person_id 的宿主：插件会拿一个全 0 的哨兵 person_id 做
+            # 作用域自证（v1.22.4），正常宿主在这种人身上查不到任何记忆。不补这条，
+            # 假宿主会无差别返回同一份结果，于是「哨兵 == 真人」被判成作用域失效，
+            # 基于裸 FakeHost 的所有记忆用例都会静默空转（本地绿、真机才动）。
+            if str(args.get("person_id") or "") == "0" * 32:
+                return []
         if capability in self.returns:
             return self.returns[capability]
         return {"success": True, "result": None}

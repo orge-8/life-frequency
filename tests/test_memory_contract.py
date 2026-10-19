@@ -12,7 +12,9 @@
 5. **降级**：检索抛异常时返回空、不写缓存、不影响调用方；
 6. **隔离**：素材带 ``target_user_id``、只属于本会话，且**从不写回** ``state.materials``；
 7. **不串进回复**：``_life_digest``（直接进回复 prompt）里绝不出现记忆内容；
-8. **陌生人不提旧事**：熟悉度不够时连 RPC 都不发。
+8. **陌生人不提旧事**：熟悉度不够时连 RPC 都不发；
+9. **作用域自证（v1.22.4）**：``person_id`` / ``respect_filter`` 不在 SDK 签名里，
+   宿主可能接受、忽略或直接报错。三种宿主行为下都不能把别人的记忆说出口。
 """
 
 import asyncio
@@ -85,6 +87,20 @@ def _seed_friend(plugin, uid: str = "123456", familiarity: float = 60.0) -> str:
     pid = _seed_session(plugin, uid=uid)
     plugin._relation_familiarity[pid] = familiarity
     return pid
+
+
+def _real_calls(host) -> list[dict]:
+    """真实检索调用（**排除**哨兵对照）。
+
+    v1.22.4 起第一次拿到非空结果时会多发一条 ``person_id`` 为全 0 的哨兵查询做
+    作用域自证，所以「调用次数」必须按人分开数，否则这条探测会把所有计数断言
+    顶成 +1（看起来像缓存失效）。
+    """
+
+    return [
+        kw for kw in host.calls_of("knowledge.search")
+        if str(kw.get("person_id") or "") != M.SCOPE_PROBE_PERSON_ID
+    ]
 
 
 # ---------------------------------------------------------------- 纯模块
@@ -186,13 +202,21 @@ def test_knowledge_search_sends_person_id_and_respect_filter():
         facts = await plugin._memory_facts_for_person(pid, query="张三")
         assert facts == ("提过要考公",)
 
-        calls = host.calls_of("knowledge.search")
+        calls = _real_calls(host)
         assert len(calls) == 1
         args = calls[0]
         assert args["person_id"] == pid
         assert args["respect_filter"] is True
         assert args["mode"] in M.MEMORY_SEARCH_MODES
         assert args["limit"] >= 1
+        # 同一轮还发过一次哨兵对照（作用域自证），且哨兵也带着完整的作用域参数
+        probe = [
+            kw for kw in host.calls_of("knowledge.search")
+            if str(kw.get("person_id") or "") == M.SCOPE_PROBE_PERSON_ID
+        ]
+        assert len(probe) == 1
+        assert probe[0]["respect_filter"] is True
+        assert plugin._memory_scope.state == M.SCOPE_SCOPED
 
     asyncio.run(run())
 
@@ -239,11 +263,13 @@ def test_cache_hit_skips_rpc_and_ttl_expiry_refetches():
 
         await plugin._memory_facts_for_person(pid)
         await plugin._memory_facts_for_person(pid)
-        assert len(host.calls_of("knowledge.search")) == 1
+        assert len(_real_calls(host)) == 1
+        # 自证只做一次：第二次命中缓存，不该再发哨兵
+        assert len(_real_calls(host)) == 1
 
         plugin._memory_cache.ttl_seconds = 0.0
         await plugin._memory_facts_for_person(pid)
-        assert len(host.calls_of("knowledge.search")) == 2
+        assert len(_real_calls(host)) == 2
 
     asyncio.run(run())
 
@@ -343,3 +369,115 @@ def test_relation_lines_render_facts_only_when_given():
         records, max_lines=3, memory_facts={P_id("123456"): ("提过要考公",)}
     )
     assert "记得 提过要考公" in with_memory[0]
+
+
+# ---------------------------------------------------------------- 作用域自证（v1.22.4）
+
+
+def test_facts_equal_needs_both_sides_nonempty():
+    """哨兵对照的判据：两边都非空且内容一致才算「作用域失效」。"""
+
+    assert M.facts_equal(("a", "b"), ("b", "a")) is True      # 顺序无关
+    assert M.facts_equal(("a",), ("b",)) is False             # 内容不同 = 参数生效
+    assert M.facts_equal(("a",), ()) is False                 # 哨兵查不到 = 参数生效
+    # 空对空**不是**证据：两边都查不到，也可能是过滤真的生效了
+    assert M.facts_equal((), ()) is False
+
+
+def test_looks_like_unsupported_argument_is_conservative():
+    """认不出就不下结论——误判成「支持」会让全库检索继续跑，那是事故。"""
+
+    assert M.looks_like_unsupported_argument(
+        TypeError("search() got an unexpected keyword argument 'person_id'")
+    )
+    assert M.looks_like_unsupported_argument(ValueError("unexpected parameter: mode"))
+    assert not M.looks_like_unsupported_argument(RuntimeError("A_Memorix unavailable"))
+    assert not M.looks_like_unsupported_argument(TimeoutError())
+
+
+def test_scope_probe_disables_layer_when_person_id_is_ignored():
+    """宿主「接受但忽略」：哨兵与真人结果一致 → 停用，且不再当作抖动去重试。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        host.knowledge_ignores_person_id = True
+        host.returns["knowledge.search"] = "提过要考公"
+        pid = _seed_friend(plugin)
+
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert plugin._memory_scope.state == M.SCOPE_UNSCOPED
+        # 粘性：之后再查连 RPC 都不发（发一次就是一次无作用域的全库检索）
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert len(_real_calls(host)) == 1
+
+    asyncio.run(run())
+
+
+def test_unsupported_kwargs_disable_the_layer_without_retry():
+    """宿主直接不认参数：这是契约事实，重试也不会变。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        pid = _seed_friend(plugin)
+        attempts = {"n": 0}
+
+        async def reject(capability, **kwargs):
+            attempts["n"] += 1
+            raise TypeError("search() got an unexpected keyword argument 'person_id'")
+
+        plugin.ctx.call_capability = reject
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert plugin._memory_scope.state == M.SCOPE_UNSCOPED
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert attempts["n"] == 1, "契约不支持，重试没有意义"
+        assert not host.calls_of("knowledge.search")
+
+    asyncio.run(run())
+
+
+def test_unverified_scope_forces_person_mention():
+    """探测本身失败**不算证据**：维持 unknown，只接受点名本人的条目。"""
+
+    async def run():
+        _module, plugin, _host = _make_plugin()
+        pid = _seed_friend(plugin)
+
+        def flaky(capability, **kwargs):
+            if str(kwargs.get("person_id") or "") == M.SCOPE_PROBE_PERSON_ID:
+                raise RuntimeError("A_Memorix busy")
+
+        async def call(capability, **kwargs):
+            flaky(capability, **kwargs)
+            return "提过要考公"
+
+        plugin.ctx.call_capability = call
+        # 没点名「张三」→ 严格模式整条丢掉
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert plugin._memory_scope.state == M.SCOPE_UNKNOWN
+
+        async def call_named(capability, **kwargs):
+            flaky(capability, **kwargs)
+            return "张三提过要考公"
+
+        plugin.ctx.call_capability = call_named
+        plugin._memory_cache.clear()
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ("张三提过要考公",)
+
+    asyncio.run(run())
+
+
+def test_disabling_scope_drops_already_cached_facts():
+    """判成无作用域时，先前取回的事实必须一起作废（它们是在无作用域下取的）。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        pid = _seed_friend(plugin)
+        plugin._memory_cache.put(pid, ("提过要考公",), time.time())
+        host.knowledge_ignores_person_id = True
+        host.returns["knowledge.search"] = "提过要考公"
+        plugin._memory_cache.ttl_seconds = 0.0  # 逼它真的去查（否则命中缓存就返回了）
+
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert len(plugin._memory_cache) == 0
+
+    asyncio.run(run())

@@ -221,7 +221,7 @@ def test_pure_modules_never_touch_ctx():
 
 
 def test_all_manifest_capabilities_are_used_in_plugin_py():
-    """manifest 声明的能力必须在 plugin.py 里真的被调用（避免 WARN 与空挂权限）。"""
+    """manifest 声明的能力必须在源码里真的被调用（避免 WARN 与空挂权限）。"""
 
     import json
     import pathlib
@@ -230,6 +230,11 @@ def test_all_manifest_capabilities_are_used_in_plugin_py():
     plugin_dir = pathlib.Path(__file__).resolve().parent.parent
     manifest = json.loads((plugin_dir / "_manifest.json").read_text(encoding="utf-8"))
     source = (plugin_dir / "plugin.py").read_text(encoding="utf-8")
+    # v1.22.4：能力调用会随逻辑下沉到 life_*.py，字面量那一路要连它们一起扫
+    # （``self.ctx.<proxy>`` 那一路仍只认 plugin.py——纯模块里没有 ctx）。
+    module_sources = [
+        path.read_text(encoding="utf-8") for path in sorted(plugin_dir.glob("life_*.py"))
+    ]
 
     used = set()
     # 能力名就是 self.ctx 之后的整条点分链（可能是 send.text，也可能是
@@ -243,11 +248,14 @@ def test_all_manifest_capabilities_are_used_in_plugin_py():
     # ``self.ctx.call_capability("knowledge.search", person_id=..., mode=...)`` 的能力名
     # 静态上不是属性访问，但它是确定的字符串——不认这一条，「用了也声明了」会被误判成
     # 「声明了没用到」（knowledge.search 需要 person_id/mode/respect_filter，代理方法的
-    # 签名接不住，只能走分发器）。
-    for literal in re.findall(
-        r"""self\.ctx\.call_capability\(\s*["']([a-z_]+(?:[._][a-z_]+)+)["']""", source
-    ):
-        used.add(literal)
+    # 签名接不住，只能走分发器）。v1.22.4 起 ``ctx.`` 前缀可选：记忆层下沉后拿到的是
+    # 分发器本身，写法是 ``await call_capability("knowledge.search", ...)``。
+    for text in [source, *module_sources]:
+        for literal in re.findall(
+            r"""(?:self\.ctx\.|ctx\.)?call_capability\(\s*["']([a-z_]+(?:[._][a-z_]+)+)["']""",
+            text,
+        ):
+            used.add(literal)
 
     declared = set(manifest["capabilities"])
     missing = used - declared
