@@ -46,6 +46,7 @@ from uuid import uuid4
 
 # --- 唯一允许的宿主依赖入口：maibot_sdk（禁止 import src.*）---
 from maibot_sdk import (
+    API,
     CONFIG_RELOAD_SCOPE_SELF,
     Command,
     Field,
@@ -306,6 +307,7 @@ try:
         world_events,
         world_lines,
     )
+    from .life_webui import dashboard as webui_dashboard, set_paused as webui_set_paused
 except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_activity import (
         ACTIVITY_LABELS,
@@ -538,6 +540,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         world_events,
         world_lines,
     )
+    from life_webui import dashboard as webui_dashboard, set_paused as webui_set_paused
 
 # --- 配置层（v1.21.0 抽出，见 life_config.py）---
 try:
@@ -6816,6 +6819,21 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 "%s 送药未生效：session=%s 原因=%s", __plugin_id__, stream_id, reason
             )
         return ok, text
+
+    @API("life.dashboard", description="生活频率仪表盘快照（webui.json 自定义页面）", version="1")
+    async def api_dashboard(self, **kwargs: Any) -> dict[str, Any]:
+        """页面唯一查询：状态/倍率/归因/关系四段打包（同一个 now，段内自降级）。"""
+        return await webui_dashboard(self, time.time())
+
+    @API("life.pause", description="暂停频率干预（与 /生活 暂停 同路径）", version="1")
+    async def api_pause(self, **kwargs: Any) -> dict[str, Any]:
+        """页面「暂停干预」按钮；执行体与命令侧同一份（life_webui.set_paused）。"""
+        return await webui_set_paused(self, True)
+
+    @API("life.resume", description="恢复频率干预（与 /生活 恢复 同路径）", version="1")
+    async def api_resume(self, **kwargs: Any) -> dict[str, Any]:
+        """页面「恢复干预」按钮；执行体与命令侧同一份（life_webui.set_paused）。"""
+        return await webui_set_paused(self, False)
 
     @Command(
         "life_state",

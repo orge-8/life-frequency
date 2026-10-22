@@ -1,0 +1,264 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["declarative_basic"],
+  "workspace_title": "生活频率",
+  "pages": [
+    {
+      "id": "dashboard",
+      "title": "生活频率",
+      "description": "麦麦的当前生活状态、发言倍率拆解、情绪体力归因与关系档案概览。数据与 /生活 状态、/生活 频率、/生活 归因、/生活 关系 同源；暂停 / 恢复与 /生活 暂停、/生活 恢复 走同一条执行体。页面每 5 秒自动刷新。",
+      "placement": "workspace",
+      "icon": "chart",
+      "auto_refresh": true,
+      "poll_interval_seconds": 5,
+      "queries": {
+        "overview": {
+          "api": "life.dashboard",
+          "version": "1",
+          "parameters": {}
+        }
+      },
+      "actions": {
+        "pause": {
+          "api": "life.pause",
+          "version": "1",
+          "parameters": {}
+        },
+        "resume": {
+          "api": "life.resume",
+          "version": "1",
+          "parameters": {}
+        }
+      },
+      "content": [
+        {
+          "type": "grid",
+          "columns": 2,
+          "children": [
+            {
+              "type": "stat",
+              "label": "当前倍率",
+              "value": { "scope": "query", "source": "overview", "field": "status.adjust_text" }
+            },
+            {
+              "type": "stat",
+              "label": "生效频率",
+              "value": { "scope": "query", "source": "overview", "field": "status.effective_text" }
+            },
+            {
+              "type": "progress",
+              "label": "情绪",
+              "value": { "scope": "query", "source": "overview", "field": "status.emotion_pct" }
+            },
+            {
+              "type": "progress",
+              "label": "体力",
+              "value": { "scope": "query", "source": "overview", "field": "status.energy_pct" }
+            },
+            {
+              "type": "progress",
+              "label": "饱腹",
+              "value": { "scope": "query", "source": "overview", "field": "status.satiety_pct" }
+            },
+            {
+              "type": "stat",
+              "label": "今日已睡 / 清醒",
+              "value": { "scope": "query", "source": "overview", "field": "status.sleep_text" }
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "生活状态",
+          "children": [
+            {
+              "type": "text",
+              "label": "活动",
+              "value": { "scope": "query", "source": "overview", "field": "status.activity_line" }
+            },
+            {
+              "type": "text",
+              "label": "日期",
+              "value": { "scope": "query", "source": "overview", "field": "status.date_line" }
+            },
+            {
+              "type": "text",
+              "label": "作息班表",
+              "value": { "scope": "query", "source": "overview", "field": "status.schedule_text" }
+            },
+            {
+              "type": "text",
+              "label": "身体",
+              "value": { "scope": "query", "source": "overview", "field": "status.health_line" }
+            },
+            {
+              "type": "text",
+              "label": "内心",
+              "value": { "scope": "query", "source": "overview", "field": "status.inner_line" }
+            },
+            {
+              "type": "text",
+              "label": "最熟的人",
+              "value": { "scope": "query", "source": "overview", "field": "status.top_relation" }
+            },
+            {
+              "type": "text",
+              "label": "模型状态",
+              "value": { "scope": "query", "source": "overview", "field": "status.model_status" }
+            },
+            {
+              "type": "text",
+              "label": "经济 / 社交 / 世界",
+              "value": { "scope": "query", "source": "overview", "field": "status.wiring_text" }
+            },
+            {
+              "type": "text",
+              "label": "素材",
+              "value": { "scope": "query", "source": "overview", "field": "status.material_text" }
+            },
+            {
+              "type": "text",
+              "label": "宿主模式",
+              "value": { "scope": "query", "source": "overview", "field": "status.host_line" }
+            },
+            {
+              "type": "text",
+              "label": "生效范围",
+              "value": { "scope": "query", "source": "overview", "field": "status.scope_line" }
+            },
+            {
+              "type": "text",
+              "label": "写入退避",
+              "value": { "scope": "query", "source": "overview", "field": "status.backoff_text" }
+            },
+            {
+              "type": "text",
+              "label": "倍率说明",
+              "value": { "scope": "query", "source": "overview", "field": "status.pause_line" }
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "倍率拆解",
+          "children": [
+            {
+              "type": "text",
+              "label": "曲线与硬闸",
+              "value": { "scope": "query", "source": "overview", "field": "frequency.gate_text" }
+            },
+            {
+              "type": "table",
+              "label": "因子明细",
+              "value": { "scope": "query", "source": "overview", "field": "frequency.factors" },
+              "columns": [
+                { "field": "factor", "label": "因子" },
+                { "field": "value", "label": "取值" }
+              ]
+            },
+            {
+              "type": "text",
+              "label": "合成方式",
+              "value": { "scope": "query", "source": "overview", "field": "frequency.compose_text" }
+            },
+            {
+              "type": "text",
+              "label": "后果",
+              "value": { "scope": "query", "source": "overview", "field": "frequency.verdict_text" }
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "情绪体力归因",
+          "children": [
+            {
+              "type": "text",
+              "label": "归因明细",
+              "format": "log",
+              "value": { "scope": "query", "source": "overview", "field": "attribution.text" }
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "关系档案",
+          "children": [
+            {
+              "type": "grid",
+              "columns": 3,
+              "children": [
+                {
+                  "type": "stat",
+                  "label": "档案人数",
+                  "value": { "scope": "query", "source": "overview", "field": "relations.count" }
+                },
+                {
+                  "type": "stat",
+                  "label": "中位熟悉度",
+                  "value": { "scope": "query", "source": "overview", "field": "relations.median_text" }
+                },
+                {
+                  "type": "stat",
+                  "label": "最高熟悉度",
+                  "value": { "scope": "query", "source": "overview", "field": "relations.max_text" }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "label": "说明",
+              "value": { "scope": "query", "source": "overview", "field": "relations.note" }
+            },
+            {
+              "type": "table",
+              "label": "最熟的几位",
+              "value": { "scope": "query", "source": "overview", "field": "relations.rows" },
+              "columns": [
+                { "field": "person", "label": "熟人" },
+                { "field": "familiarity", "label": "熟悉度" },
+                { "field": "tier", "label": "档位" },
+                { "field": "interactions", "label": "互动次数" },
+                { "field": "last_seen", "label": "最近互动" },
+                { "field": "hint", "label": "备注" }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "干预开关",
+          "children": [
+            {
+              "type": "button",
+              "label": "暂停干预",
+              "action": "pause",
+              "variant": "primary",
+              "when": {
+                "reference": { "scope": "query", "source": "overview", "field": "status.paused" },
+                "operator": "equals",
+                "expected": false
+              }
+            },
+            {
+              "type": "button",
+              "label": "恢复干预",
+              "action": "resume",
+              "variant": "muted",
+              "when": {
+                "reference": { "scope": "query", "source": "overview", "field": "status.paused" },
+                "operator": "equals",
+                "expected": true
+              }
+            },
+            {
+              "type": "text",
+              "label": "提示",
+              "value": "与 /生活 暂停、/生活 恢复 同一条执行体；页面每 5 秒自动刷新，按钮生效后稍候即可看到新状态。重置 / 重锚误点成本高，留在命令侧。"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

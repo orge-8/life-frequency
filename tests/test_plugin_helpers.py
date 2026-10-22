@@ -257,6 +257,14 @@ def test_all_manifest_capabilities_are_used_in_plugin_py():
         ):
             used.add(literal)
 
+    # v1.22.5：宿主消费型能力（declarative_basic 等）没有 Python 调用点——
+    # Runner 注册插件时读 webui.json 的 required_capabilities，插件对它们的
+    # 「使用」就是那份声明文件。只有 webui.json 真的把它列进去才算（防空挂）。
+    webui_path = plugin_dir / "webui.json"
+    if webui_path.is_file():
+        webui = json.loads(webui_path.read_text(encoding="utf-8"))
+        used.update(str(item) for item in (webui.get("required_capabilities") or []))
+
     declared = set(manifest["capabilities"])
     missing = used - declared
     unused = declared - used

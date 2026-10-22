@@ -294,6 +294,11 @@ def _name_related(expected: str, actual: str) -> bool:
     约定形态: ping -> ping / cmd_ping / ping_command。完全不相关时大概率是
     辅助方法插队（真机报 unexpected keyword argument 的经典成因）。
 
+    v1.22.5：命名空间 API（``life.dashboard`` -> ``api_dashboard``）按**最后一段**
+    对齐——点号前的宿主前缀（life.）没有对应的函数名前缀，整串比对会把样板
+    插件的标准命名（``api_`` + 尾段）永远判成「名称无关」；尾段仍要求落在
+    def 名里，辅助方法插队照样被拦。
+
     归一化保留 Unicode 字母数字，否则中文组件名（点歌 / 选歌 / 动态…）会被
     整体抹掉，导致 `@Command("点歌") def cmd_点歌` 这种正确写法永远只能出警告。
     """
@@ -301,7 +306,14 @@ def _name_related(expected: str, actual: str) -> bool:
         return "".join(ch for ch in s.lower() if ch.isalnum())
 
     e, a = norm(expected), norm(actual)
-    return bool(e) and bool(a) and (a == e or a.endswith(e) or e.endswith(a))
+    if not e or not a:
+        return False
+    if a == e or a.endswith(e) or e.endswith(a):
+        return True
+    if "." in expected:
+        tail = norm(expected.rsplit(".", 1)[-1])
+        return bool(tail) and (a == tail or a.endswith(tail))
+    return False
 
 
 def _function_decorators(tree: ast.AST):
@@ -397,7 +409,8 @@ def _has_os_path_dirname_call(tree: ast.AST) -> bool:
 
 def check_source(source: str, caps: list[str], rep: Report,
                  extra_sources: list[tuple[str, str]] | None = None,
-                 capability_sources: list[str] | None = None) -> None:
+                 capability_sources: list[str] | None = None,
+                 webui_capabilities: list[str] | None = None) -> None:
     """L1 源码检查。``extra_sources`` = 一起参与结构判定的附加模块（名称, 源码）。
 
     目前只有 ``life_config.py``：配置模型在那里，所以「config_version 是否声明」
@@ -550,6 +563,12 @@ def check_source(source: str, caps: list[str], rep: Report,
                 continue
             used.add(CAPABILITY_MAP.get(literal, literal))
     declared = set(caps)
+    # v1.22.5：宿主消费型能力（declarative_basic / custom_pages / image_upload /
+    # structured_arguments）没有 Python 调用点——Runner 注册插件时读 webui.json 的
+    # required_capabilities（src/plugin_runtime/webui_schema.py），插件对它们的
+    # 「使用」就是那份声明文件。只有 webui.json 真的把它列进去才算
+    # （webui.json 缺失 / 没列 = 空挂权限，照旧报「声明了但没用到」）。
+    used.update(webui_capabilities or [])
     missing = sorted(used - declared - FREE_CAPABILITIES)
     if missing:
         rep.fail("能力/声明完整性",
@@ -657,8 +676,20 @@ def run(plugin_dir: str) -> Report:
             if name.startswith("life_") and name.endswith(".py")
             and os.path.isfile(os.path.join(plugin_dir, name))
         ]
+        # v1.22.5：webui.json 的 required_capabilities = 宿主消费型能力的使用点
+        webui_caps: list[str] = []
+        webui_path = os.path.join(plugin_dir, "webui.json")
+        if os.path.isfile(webui_path):
+            try:
+                webui_caps = [
+                    str(item) for item in
+                    (json.loads(read_text(webui_path)).get("required_capabilities") or [])
+                ]
+            except ValueError:
+                pass  # 坏 JSON 由 WebUI 专项审计兜底，这里不把它当「已使用」
         check_source(source, caps, rep, extra_sources=extra,
-                     capability_sources=capability_sources)
+                     capability_sources=capability_sources,
+                     webui_capabilities=webui_caps)
     check_hygiene(plugin_dir, rep)
     return rep
 
