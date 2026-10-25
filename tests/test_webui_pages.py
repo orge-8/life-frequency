@@ -39,7 +39,7 @@ if str(_PLUGIN_DIR) not in sys.path:
 import life_webui  # noqa: E402  投影层模块本身（无状态纯函数，可脱插件单测）
 
 _DEFAULT_HOST = (
-    "C:/Users/38160/AppData/Roaming/MaiBotOneKeyDesktop/e6a2be8e69ae/modules/MaiBot"
+    "/path/to/MaiBot"  # 本地宿主检出路径；请用环境变量 MAIBOT_HOST_DIR 指向实际位置
 )
 
 

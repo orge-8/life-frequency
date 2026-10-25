@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence
 
 try:  # 包式加载（Runner 真机）
     from .life_activity import DAILY, NAP, SLEEP, in_window
@@ -426,3 +426,77 @@ def reason_label(reason: str) -> str:
         REASON_QUIET_HOURS: "静默时段",
         "paused": "已暂停（写回 1.0，不干预宿主）",
     }.get(reason, reason)
+
+
+# ------------------------------------------------------- 演算模式（dry_run）日志节流
+#
+# 真机教训（2026-10-23）：演算模式下每轮对**每个**会话打一条
+# ``[演算] session=... 倍率 X``，18 个会话 × 每分钟一轮 ≈ **2.6 万条/天**，把宿主日志
+# 冲得只剩这一类行，真正的异常（锁库、事件循环卡顿）被埋在里面看不见。
+# 而这一组日志的信息量其实只有「倍率是多少、有没有变」——同一轮所有会话共用同一个
+# 倍率，重复 18 次零信息量。
+#
+# 所以改成**按轮聚合 + 值不变就节流**：倍率变了立刻打一条，没变则最多每
+# ``DRY_RUN_LOG_INTERVAL`` 秒打一条（带上「已连续 N 轮」，证明计算还在跑）。
+DRY_RUN_LOG_INTERVAL = 600.0
+
+
+class DryRunRoundLog:
+    """演算模式的一轮结果 → 一条日志（替代逐会话打印）。
+
+    三条纪律：
+
+    1. **值变了立刻打**：倍率是演算模式唯一想看的东西，变了必须当场可见；
+    2. 没变则最多每 ``DRY_RUN_LOG_INTERVAL`` 秒一条，并带上「已连续 N 轮」——
+       否则「日志安静」和「计算停了」无法区分（真机排查里这是致命的）；
+    3. 打完必须清空本轮快照：留着会让下一轮把已经不算在内的旧会话也算进条数。
+
+    放在 ``life_factors`` 而不是 ``plugin.py``：它不碰 ``self.ctx``，是纯逻辑，
+    而交付体积门禁要求胶水层别再长（v1.23.2）。
+    """
+
+    def __init__(self, interval: float = DRY_RUN_LOG_INTERVAL) -> None:
+        self.interval = max(0.0, float(interval))
+        self.targets: dict[str, float] = {}
+        self.log_at: float = 0.0
+        self.log_values: tuple[float, ...] = ()
+        self.rounds: int = 0
+
+    def record(self, session_id: str, target: float) -> None:
+        """记下这个会话本轮算出的倍率（不打印）。"""
+
+        self.targets[str(session_id)] = float(target)
+
+    def emit(self, logger: Any, now: float, reason: str = "") -> bool:
+        """需要打印就打一条并返回 True；被节流返回 False。"""
+
+        if not self.targets:
+            return False
+        values = tuple(sorted({round(float(v), 3) for v in self.targets.values()}))
+        count = len(self.targets)
+        self.rounds += 1
+
+        changed = values != self.log_values
+        if (
+            not changed
+            and self.log_at
+            and (now - self.log_at) < self.interval
+        ):
+            self.targets = {}
+            return False
+
+        if len(values) == 1:
+            detail = f"倍率 {values[0]:.3f}"
+        else:
+            # 多个取值只在「合成基数不同」的会话之间出现，是值得看一眼的异常
+            detail = f"倍率 {values[0]:.3f}~{values[-1]:.3f}（{len(values)} 种取值）"
+        tail = "" if changed else f"；已连续 {self.rounds} 轮保持该值"
+        logger.info(
+            "[演算] %d 个会话 %s%s%s，未写宿主（dry_run）",
+            count, detail, f"（{reason}）" if reason else "", tail,
+        )
+        self.log_at = now
+        self.log_values = values
+        self.rounds = 0
+        self.targets = {}
+        return True

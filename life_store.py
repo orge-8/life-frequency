@@ -37,7 +37,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 #: schema 版本。改表结构时 +1，并在 ``_migrate`` 里补迁移步骤。
 #: v2（2026-10-16，Y4）：``relationships`` 主键由 ``user_id`` 改为 ``person_id``。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: 默认平台。载荷没给 ``platform`` 时用它，也是 v1 关系数据的迁移假设。
 DEFAULT_PLATFORM = "qq"
@@ -74,6 +74,59 @@ _SCHEMA_STATEMENTS = (
       PRIMARY KEY (day_key, line_id)
     )
     """,
+    # v1.23.0（sleep backlog）：她睡着时进来的消息。
+    # 放 SQLite 而不是 ``life_state.json`` 的理由有两条：①状态文件是**整份序列化**
+    # 落盘的（每个 tick 一次），长文本会把 tick 拖慢；②这里存的是**原文**，
+    # 条数与保留时长都要能单独清理，混进状态文件就只能跟着状态一起截断。
+    """
+    CREATE TABLE IF NOT EXISTS sleep_backlog (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      person_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      user_id TEXT NOT NULL DEFAULT '',
+      platform TEXT NOT NULL DEFAULT 'qq',
+      is_group INTEGER NOT NULL DEFAULT 0,
+      at REAL NOT NULL,
+      text TEXT NOT NULL DEFAULT '',
+      delivered_at REAL NOT NULL DEFAULT 0,
+      caught_up_at REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_sleep_backlog_session
+      ON sleep_backlog (session_id, at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_sleep_backlog_person
+      ON sleep_backlog (person_id, at DESC)
+    """,
+)
+
+#: ``sleep_backlog`` 的取数列（与建表顺序一致；本模块没有 row_factory，只能显式 zip）
+_SLEEP_BACKLOG_FIELDS = (
+    "id",
+    "person_id",
+    "session_id",
+    "user_id",
+    "platform",
+    "is_group",
+    "at",
+    "text",
+    "delivered_at",
+    "caught_up_at",
+)
+
+#: ``pending_sleep_sessions`` 的取数列（聚合查询，顺序必须与 SQL 一致）
+_SLEEP_SESSION_FIELDS = (
+    "session_id",
+    "person_id",
+    "user_id",
+    "platform",
+    "is_group",
+    "count",
+    "last_at",
+    "ids",
+    "delivered_at",
 )
 
 _RELATIONSHIP_FIELDS = (
@@ -223,6 +276,17 @@ def _migrate_relationships_to_v2(conn: sqlite3.Connection) -> int:
     return migrated
 
 
+def _is_id(value: object) -> bool:
+    """能不能当成一个积压行 id。``bool`` 要排除（``True`` 会被 ``int`` 收成 1）。"""
+
+    if isinstance(value, bool) or value is None:
+        return False
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 class MemoryStore:
     """进程内兜底：库开不出来时顶上，接口与 :class:`LifeStore` 完全一致。
 
@@ -233,6 +297,8 @@ class MemoryStore:
     def __init__(self) -> None:
         self._rows: dict[tuple[str, str], tuple[int, int]] = {}
         self._people: dict[str, dict[str, Any]] = {}
+        self._backlog: list[dict[str, Any]] = []
+        self._backlog_seq = 0
         self._lock = threading.Lock()
 
     # ---- 习惯日态 ----
@@ -320,6 +386,157 @@ class MemoryStore:
     def delete_relationship(self, person_id: str) -> bool:
         with self._lock:
             return self._people.pop(str(person_id or "").strip(), None) is not None
+
+    # ---- 睡眠期积压（sleep backlog，v1.23.0）----
+    #
+    # 与 SQLite 后端的差异：**重启即丢**。语义上可以接受（补答本来就是「这一觉」
+    # 的事），但必须在模块文档里写清——否则「重启后补答全没了」会被当成 bug 排查。
+
+    def add_sleep_backlog(
+        self,
+        person_id: str,
+        session_id: str,
+        *,
+        at: float,
+        text: str,
+        user_id: str = "",
+        platform: str = DEFAULT_PLATFORM,
+        is_group: bool = False,
+        max_chars: int = 400,
+    ) -> int:
+        pid = str(person_id or "").strip()
+        sid = str(session_id or "").strip()
+        if not pid or not sid:
+            return 0
+        body = str(text or "").strip()
+        limit = int(max_chars)
+        if limit <= 0:
+            limit = 400
+        with self._lock:
+            self._backlog_seq += 1
+            row_id = self._backlog_seq
+            self._backlog.append(
+                {
+                    "id": row_id,
+                    "person_id": pid,
+                    "session_id": sid,
+                    "user_id": str(user_id or "")[:64],
+                    "platform": str(platform or DEFAULT_PLATFORM)[:32],
+                    "is_group": 1 if is_group else 0,
+                    "at": float(at),
+                    "text": body[:limit],
+                    "delivered_at": 0.0,
+                    "caught_up_at": 0.0,
+                }
+            )
+        return row_id
+
+    def peek_sleep_backlog(self, person_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        size = max(1, min(200, int(limit)))
+        with self._lock:
+            rows = [
+                dict(item)
+                for item in self._backlog
+                if item["person_id"] == pid and float(item["caught_up_at"]) <= 0.0
+            ]
+        rows.sort(key=lambda item: float(item["at"]))
+        return rows[-size:]
+
+    def pending_sleep_sessions(self, *, since: float = 0.0, limit: int = 50) -> list[dict[str, Any]]:
+        cutoff = float(since or 0.0)
+        size = max(1, min(200, int(limit)))
+        with self._lock:
+            rows = [
+                dict(item)
+                for item in self._backlog
+                if float(item["caught_up_at"]) <= 0.0 and float(item["at"]) >= cutoff
+            ]
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            bucket = grouped.setdefault(
+                str(row["session_id"]),
+                {
+                    "session_id": str(row["session_id"]),
+                    "person_id": str(row["person_id"]),
+                    "user_id": str(row["user_id"]),
+                    "platform": str(row["platform"]),
+                    "is_group": int(row["is_group"]),
+                    "count": 0,
+                    "last_at": 0.0,
+                    "ids": [],
+                    "delivered_at": 0.0,
+                },
+            )
+            bucket["count"] = int(bucket["count"]) + 1
+            bucket["last_at"] = max(float(bucket["last_at"]), float(row["at"]))
+            bucket["delivered_at"] = max(
+                float(bucket["delivered_at"]), float(row["delivered_at"])
+            )
+            bucket["ids"].append(int(row["id"]))
+        items = sorted(grouped.values(), key=lambda item: float(item["last_at"]))
+        return items[:size]
+
+    def mark_sleep_backlog_delivered(self, ids: Sequence[int], *, at: float) -> int:
+        keys = {int(item) for item in ids if _is_id(item)}
+        if not keys:
+            return 0
+        touched = 0
+        with self._lock:
+            for row in self._backlog:
+                if int(row["id"]) in keys and float(row["delivered_at"]) <= 0.0:
+                    row["delivered_at"] = float(at)
+                    touched += 1
+        return touched
+
+    def mark_sleep_backlog_caught_up(self, ids: Sequence[int], *, at: float) -> int:
+        keys = {int(item) for item in ids if _is_id(item)}
+        if not keys:
+            return 0
+        touched = 0
+        with self._lock:
+            for row in self._backlog:
+                if int(row["id"]) in keys:
+                    row["caught_up_at"] = float(at)
+                    if float(row["delivered_at"]) <= 0.0:
+                        row["delivered_at"] = float(at)
+                    touched += 1
+        return touched
+
+    def prune_sleep_backlog(self, *, before: float, keep_per_person: int = 5) -> int:
+        cutoff = float(before or 0.0)
+        keep = max(0, int(keep_per_person))
+        removed = 0
+        with self._lock:
+            if cutoff > 0.0:
+                stale = [item for item in self._backlog if float(item["at"]) < cutoff]
+                for item in stale:
+                    self._backlog.remove(item)
+                removed += len(stale)
+            if keep > 0:
+                by_person: dict[str, list[dict[str, Any]]] = {}
+                for item in self._backlog:
+                    by_person.setdefault(str(item["person_id"]), []).append(item)
+                for rows in by_person.values():
+                    if len(rows) <= keep:
+                        continue
+                    rows.sort(key=lambda item: float(item["at"]))
+                    for item in rows[: len(rows) - keep]:
+                        self._backlog.remove(item)
+                        removed += 1
+        return removed
+
+    def drop_sleep_backlog(self, person_id: str) -> int:
+        pid = str(person_id or "").strip()
+        if not pid:
+            return 0
+        with self._lock:
+            victims = [item for item in self._backlog if item["person_id"] == pid]
+            for item in victims:
+                self._backlog.remove(item)
+        return len(victims)
 
     # ---- 生命周期 ----
 
@@ -620,6 +837,195 @@ class LifeStore:
             return int(cursor.rowcount or 0) > 0
 
         return bool(self._run("删除关系档案", work))
+
+    # ---- 睡眠期积压（sleep backlog，v1.23.0）----
+    #
+    # 语义：``delivered_at`` = 被动回填时**注入过提示词**的时刻（只注入一次）；
+    # ``caught_up_at`` = 主动补答**确认说出去了**的时刻。两者分开存，是因为
+    # 「她看到了」与「她回应了」是两件事：Planner 受理但沉默的那一次不能让条目消失，
+    # 否则「补答失败」会被静默记成「已处理」。
+
+    def add_sleep_backlog(
+        self,
+        person_id: str,
+        session_id: str,
+        *,
+        at: float,
+        text: str,
+        user_id: str = "",
+        platform: str = DEFAULT_PLATFORM,
+        is_group: bool = False,
+        max_chars: int = 400,
+    ) -> int:
+        """追加一条积压；返回新行 id（0 = 没写进去）。
+
+        ``text`` 在这里**二次截断**：调用方已经按配置截过，但配置可热重载，
+        而库是持久的——不在这里兜一层，一次「把 max_chars 改成 0」就会让
+        单条消息永久占住库容。
+        """
+
+        pid = str(person_id or "").strip()
+        sid = str(session_id or "").strip()
+        if not pid or not sid:
+            return 0
+        body = str(text or "").strip()
+        limit = int(max_chars)
+        if limit <= 0:
+            limit = 400
+        if len(body) > limit:
+            body = body[:limit]
+
+        def work(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                "INSERT INTO sleep_backlog "
+                "(person_id, session_id, user_id, platform, is_group, at, text) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pid,
+                    sid,
+                    str(user_id or "")[:64],
+                    str(platform or DEFAULT_PLATFORM)[:32],
+                    1 if is_group else 0,
+                    float(at),
+                    body,
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+
+        return int(self._run("写入睡眠积压", work) or 0)
+
+    def peek_sleep_backlog(self, person_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """取某人**未主动补过**的记录（时间正序）。已投递过被动回填的也一并返回——
+        调用方据此判断「这次还能不能引原文」，是否重复注入由插件侧内存标记控制。
+        """
+
+        pid = str(person_id or "").strip()
+        if not pid:
+            return []
+        size = max(1, min(200, int(limit)))
+
+        def work(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT id, person_id, session_id, user_id, platform, is_group, at, text, "
+                "delivered_at, caught_up_at FROM sleep_backlog "
+                "WHERE person_id = ? AND caught_up_at <= 0 "
+                "ORDER BY at DESC LIMIT ?",
+                (pid, size),
+            ).fetchall()
+            # ⚠ 本模块的连接**没有** ``row_factory``（见 ``_connect``）：所有取数都要
+            # 显式 zip 列名，``dict(row)`` 在这里会抛 TypeError 并被 ``_run`` 静默吞掉
+            # ——表现是「写进去了但永远读不出来」。
+            return [dict(zip(_SLEEP_BACKLOG_FIELDS, row)) for row in rows][::-1]
+
+        result = self._run("读睡眠积压", work)
+        return list(result) if isinstance(result, list) else []
+
+    def pending_sleep_sessions(self, *, since: float = 0.0, limit: int = 50) -> list[dict[str, Any]]:
+        """按会话聚合「还没主动补过」的积压（供醒来触发与启动扫描）。
+
+        返回每项：``session_id / person_id / user_id / platform / is_group /
+        count / last_at / ids / delivered_at``。``ids`` 是该会话全部待补行 id
+        （主动补成功后按它核销）。
+        """
+
+        cutoff = float(since or 0.0)
+        size = max(1, min(200, int(limit)))
+
+        def work(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT session_id, person_id, user_id, platform, is_group, "
+                "       COUNT(*) AS count, MAX(at) AS last_at, "
+                "       GROUP_CONCAT(id) AS ids, MAX(delivered_at) AS delivered_at "
+                "FROM sleep_backlog WHERE caught_up_at <= 0 AND at >= ? "
+                "GROUP BY session_id ORDER BY last_at ASC LIMIT ?",
+                (cutoff, size),
+            ).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(zip(_SLEEP_SESSION_FIELDS, row))
+                raw_ids = str(item.pop("ids", "") or "")
+                item["ids"] = [int(part) for part in raw_ids.split(",") if part.strip().isdigit()]
+                items.append(item)
+            return items
+
+        result = self._run("聚合同步积压", work)
+        return list(result) if isinstance(result, list) else []
+
+    def mark_sleep_backlog_delivered(self, ids: Sequence[int], *, at: float) -> int:
+        """标记「这一批已经注入过提示词」（被动回填）。"""
+
+        keys = [int(item) for item in ids if _is_id(item)]
+        if not keys:
+            return 0
+        placeholders = ",".join("?" for _ in keys)
+
+        def work(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                f"UPDATE sleep_backlog SET delivered_at = ? "
+                f"WHERE id IN ({placeholders}) AND delivered_at <= 0",
+                [float(at), *keys],
+            )
+            return int(cursor.rowcount or 0)
+
+        return int(self._run("标记回填已投递", work) or 0)
+
+    def mark_sleep_backlog_caught_up(self, ids: Sequence[int], *, at: float) -> int:
+        """标记「这一批已经补答完毕」（主动补**确认说出去了**之后才调）。"""
+
+        keys = [int(item) for item in ids if _is_id(item)]
+        if not keys:
+            return 0
+        placeholders = ",".join("?" for _ in keys)
+
+        def work(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                f"UPDATE sleep_backlog SET caught_up_at = ?, delivered_at = "
+                f"CASE WHEN delivered_at <= 0 THEN ? ELSE delivered_at END "
+                f"WHERE id IN ({placeholders})",
+                [float(at), float(at), *keys],
+            )
+            return int(cursor.rowcount or 0)
+
+        return int(self._run("标记补答完成", work) or 0)
+
+    def prune_sleep_backlog(self, *, before: float, keep_per_person: int = 5) -> int:
+        """清理：①早于 ``before`` 的整条删除；②每人只留最近 ``keep_per_person`` 条。"""
+
+        cutoff = float(before or 0.0)
+        keep = max(0, int(keep_per_person))
+
+        def work(conn: sqlite3.Connection) -> int:
+            removed = 0
+            if cutoff > 0.0:
+                cursor = conn.execute("DELETE FROM sleep_backlog WHERE at < ?", (cutoff,))
+                removed += int(cursor.rowcount or 0)
+            if keep > 0:
+                cursor = conn.execute(
+                    "DELETE FROM sleep_backlog WHERE id IN ("
+                    "  SELECT id FROM sleep_backlog b WHERE ("
+                    "    SELECT COUNT(*) FROM sleep_backlog c "
+                    "    WHERE c.person_id = b.person_id AND c.at >= b.at"
+                    "  ) > ?"
+                    ")",
+                    (keep,),
+                )
+                removed += int(cursor.rowcount or 0)
+            return removed
+
+        return int(self._run("清理睡眠积压", work) or 0)
+
+    def drop_sleep_backlog(self, person_id: str) -> int:
+        """丢掉某人的全部积压。"""
+
+        pid = str(person_id or "").strip()
+        if not pid:
+            return 0
+
+        def work(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute("DELETE FROM sleep_backlog WHERE person_id = ?", (pid,))
+            return int(cursor.rowcount or 0)
+
+        return int(self._run("清空某人积压", work) or 0)
 
     # ---- 生命周期 ----
 

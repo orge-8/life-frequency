@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 import re
 from typing import Any
 
@@ -147,14 +148,25 @@ def topic_pool(now_minutes: int) -> tuple[str, ...]:
     return TOPIC_POOL.get(_bucket_of(now_minutes)) or _FALLBACK_TOPICS
 
 
-def pick_topic(session_id: str, day_key: str, now_minutes: int) -> str:
+def pick_topic(
+    session_id: str,
+    day_key: str,
+    now_minutes: int,
+    *,
+    pool: Sequence[str] | None = None,
+) -> str:
     """确定性地挑一条话头。
 
     种子是 ``(会话, 生活日)``：同一天同一个会话**恒得同一条**——每 tick 重新生成
     也不会变成「换个话题再问一遍」；不同群各自不同，避免所有群同一句话。
     """
 
-    pool = topic_pool(now_minutes)
+    candidates = [
+        str(item).strip()
+        for item in (pool or ())
+        if str(item or "").strip() and is_answerable_question(item)
+    ]
+    pool = tuple(candidates) or topic_pool(now_minutes)
     seed = f"{session_id}|{day_key}|{_bucket_of(now_minutes)}".encode("utf-8")
     index = int(hashlib.sha1(seed).hexdigest()[:8], 16) % len(pool)
     return pool[index]
@@ -185,6 +197,7 @@ def cold_topic_material(
     now_minutes: int,
     weight: float = COLD_TOPIC_WEIGHT,
     ttl_hours: float = COLD_TOPIC_TTL_HOURS,
+    pool: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """冷群话头 → 一条**定向**素材（带 ``target_session``，与其他会话互不可见）。
 
@@ -194,7 +207,9 @@ def cold_topic_material(
     后者会把一次**抛话题**说成一次**汇报**。
     """
 
-    text = sanitize_text(pick_topic(session_id, day_key, now_minutes), max_chars=60)
+    text = sanitize_text(
+        pick_topic(session_id, day_key, now_minutes, pool=pool), max_chars=60
+    )
     if not text:
         return {}
     ttl = max(0.5, float(ttl_hours)) * 3600.0
@@ -246,6 +261,7 @@ def cold_group_material(
     is_group: bool,
     last_user_at: float,
     cold_hours: float,
+    pool: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """冷群话头的**完整判定**（开关 + 群聊 + 冷度），命中返回一条素材，否则空 dict。
 
@@ -258,7 +274,9 @@ def cold_group_material(
         return {}
     if not is_cold(last_user_at, now, cold_hours=cold_hours):
         return {}
-    return cold_topic_material(session_id, day_key, now=now, now_minutes=now_minutes)
+    return cold_topic_material(
+        session_id, day_key, now=now, now_minutes=now_minutes, pool=pool
+    )
 
 
 __all__ = [

@@ -19,7 +19,9 @@
      plugin.py，业务逻辑放在 life_*.py 纯模块里（那些文件不允许出现 self.ctx）。
      v1.21.0 起配置模型也搬到了 ``life_config.py``（同一条判据：它没有宿主调用），
      新增配置字段去那里改；``check_plugin.py`` 会连它一起扫 config_version 与 ctx 泄漏。
-     本文件的行数预算是 7,300（``tests/test_layout_budget.py``）——超了就说明胶水在长肉。
+     本文件**没有行数预算**（v1.23.3 删掉了那条门禁：2026-10-18 的评估结论是「9 千行的
+     模块照样秒加载、常驻内存也没变」，体积/行数本来就不量可维护性）；但 ``self.ctx``
+     必须留在这里这条纪律仍然有效——它是 ``check_plugin.py`` 反推能力的依据。
 
 自检与门禁：
 
@@ -114,6 +116,7 @@ try:
     from .life_events import merge_events, sanitize_text
     from .life_factors import (
         CurveSet,
+        DryRunRoundLog,
         FactorConfig,
         compute_adjust,
         hold_baseline,
@@ -177,6 +180,8 @@ try:
         materials_for_session as memory_materials_for_session,
         memory_materials as memory_materials_of,
     )
+    from .life_catchup_host import CatchupHostMixin
+    from .life_persona_host import PersonaTopicMixin
     from .life_interrupt import (
         CHATTING as INTERRUPT_CHATTING,
         apply_interrupt as interrupt_apply,
@@ -194,6 +199,8 @@ try:
         REASON_INTERVAL,
         REASON_SILENCE,
         ProactiveConfig as ProactiveRules,
+        ProactiveDeniedTracker,
+        REASON_HOST_DENIED,
         bump_skip_ledger,
         decide as decide_proactive,
         ledger_lines,
@@ -351,6 +358,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_events import merge_events, sanitize_text
     from life_factors import (
         CurveSet,
+        DryRunRoundLog,
         FactorConfig,
         compute_adjust,
         hold_baseline,
@@ -367,6 +375,8 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         REASON_INTERVAL,
         REASON_SILENCE,
         ProactiveConfig as ProactiveRules,
+        ProactiveDeniedTracker,
+        REASON_HOST_DENIED,
         bump_skip_ledger,
         decide as decide_proactive,
         ledger_lines,
@@ -480,6 +490,8 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         materials_for_session as memory_materials_for_session,
         memory_materials as memory_materials_of,
     )
+    from life_catchup_host import CatchupHostMixin  # type: ignore[no-redef]
+    from life_persona_host import PersonaTopicMixin  # type: ignore[no-redef]
     from life_interrupt import (
         CHATTING as INTERRUPT_CHATTING,
         apply_interrupt as interrupt_apply,
@@ -739,11 +751,34 @@ _UNBACKED_MAX_SECONDS = 24 * 3600.0
 #: 宿主对账记忆里要落盘的字段（与生活状态分开存，见 _save_state）
 #: 电量临界的阈值上浮（方案七 §7.3：2.0–4.0 → score 阈值 +0.5 档）
 _BATTERY_THRESHOLD_PENALTY = 0.5
+#: 活动决策解析失败时打进日志的原始输出长度（v1.23.4）。要足够长才能看出
+#: 「截断在键名中间」还是「模型在写散文」，又不能把宿主日志冲掉。
+_LLM_RAW_SNIPPET_CHARS = 160
 
 
 _MEMORY_FIELDS = (
     "applied", "foreign", "observed", "unbacked", "unbacked_target", "unbacked_strikes",
 )
+
+
+def _looks_like_cut_json(text: str) -> bool:
+    """这段输出像不像「被 max_tokens 截断的 JSON」（v1.23.4）。
+
+    真机证据（2026-10-24 19:38）：``[activity.llm] max_tokens = 200`` 时宿主打出
+    「达到最大输出 token 限制，可能仅输出部分内容」，插件侧只看到「没有合法 JSON」。
+    两种情况必须分开说：**截断**（有 ``{`` 没有配平的 ``}``，或结尾停在键名/字符串中间）
+    重试一万次都一样，只能调大上限；**模型不肯给 JSON**（拒答、纯散文）则可能是人设/
+    提示词问题。判据刻意宽松——它只影响日志措辞，不影响任何决策。
+    """
+
+    raw = str(text or "").strip()
+    if not raw or "{" not in raw:
+        return False
+    # 去掉 ``` 围栏后再看括号配平，否则围栏里的合法 JSON 会被误判
+    body = raw.replace("```json", "").replace("```", "").strip()
+    if "{" in body and body.count("{") > body.count("}"):
+        return True
+    return not body.rstrip().endswith("}")
 
 
 # ---------------------------------------------------------------- 主动开口：不引用
@@ -878,7 +913,7 @@ def _inject_into_items(kwargs: dict[str, Any], text: str, marker: str) -> bool:
 # ===================================================================== 插件
 
 
-class LifeFrequencyPlugin(MaiBotPlugin):
+class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
     """插件主类：生命周期三件套 + 后台循环 + 组件。"""
 
     config_model: ClassVar[type[PluginConfigBase] | None] = LifeFrequencyConfig
@@ -923,6 +958,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         #: 主动开口后的「不引用」窗口：session_id → 截止时间戳。
         #: 窗口内该会话的 Planner 请求会被注入「不要引用」规则（见 PROACTIVE_NO_QUOTE_*）
         self._proactive_no_quote_until: dict[str, float] = {}
+        #: 主动开口被宿主**策略**拒绝过的会话（见 ``life_proactive.ProactiveDeniedTracker``）：
+        #: 名单外会话每轮撞一次墙、每轮一条宿主侧满栈 traceback，记住它是最省事的止损。
+        self._proactive_denied: ProactiveDeniedTracker = ProactiveDeniedTracker()
+        #: 演算模式（dry_run）的按轮聚合日志（见 ``life_factors.DryRunRoundLog``）：
+        #: 逐会话打印在真机是 2.6 万条/天，会把宿主日志冲爆。
+        self._dry_run_log: DryRunRoundLog = DryRunRoundLog()
         #: 已用历史消息补过「对方上次说话时间」的会话（每个会话只补一次，不每轮打 RPC）
         self._history_probed: set[str] = set()
         #: 历史查询连续失败次数：到 ``_HISTORY_PROBE_MAX_FAILURES`` 就停手
@@ -1001,6 +1042,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         #: 打断批次号（v1.13.1 / F-004）：每次「从非 chatting 进入 chatting」+1。
         #: 去重键用它而不是时间戳——同一秒内的两次打断用时间戳区分不开。
         self._interrupt_batch: int = 0
+        # ---- 睡醒补答 / 人设话头（v1.23.0）：字段与生命周期在同名 mixin 里 ----
+        self._init_catchup()
+        self._init_persona_topics()
         # ---- 关系模型（v1.11.0）----
         #: 已做过熟悉度衰减的生活日（每天一次）
         self._relations_decay_day: str = ""
@@ -1060,6 +1104,16 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         """
 
         self._state = self._load_state()
+        # v1.23.4：把「被宿主策略拒过」的会话记忆接回来。以前只存内存，重启后
+        # 对每个名单外会话再撞一次墙（一次失败 RPC + 一条宿主侧满栈 traceback）。
+        # 放在冷启动重建**之前**：重建只保留 _MEMORY_FIELDS，会让这张表清零，
+        # 而 tracker 是实例上的，先接回来就不受后续状态替换影响。
+        restored = self._proactive_denied.restore(self._state.proactive_denied, now=now)
+        if restored:
+            self.ctx.logger.info(
+                "%s 已接回 %d 个「宿主不受理」的会话冷却（重启不重撞墙）",
+                __plugin_id__, restored,
+            )
         if self._state.last_tick_at <= 0:
             memory = {field: getattr(self._state, field) for field in _MEMORY_FIELDS}
             has_memory = any(memory.values())
@@ -3029,26 +3083,48 @@ class LifeFrequencyPlugin(MaiBotPlugin):
 
         return max(0, int(self.config.apply.unbacked_retry_minutes)) * 60.0
 
-    def _is_active_session(self, session_id: str) -> bool:
+    def _active_window_seconds(self) -> float:
+        """「有活动迹象」的时间窗口（秒）；``0`` = 不限（退回旧行为）。"""
+
+        return max(0, int(self.config.apply.active_window_hours)) * 3600.0
+
+    def _is_active_session(self, session_id: str, now: float) -> bool:
         """这个会话有没有「活动迹象」，值得为它去写宿主倍率。
 
         ``chat.get_all_streams`` 返回的是**全部历史会话**（真机实测 41 个），
         而没有 heartflow chat 的会话写入必然被宿主静默 no-op（各刷一条 warning）——
         对纯历史会话反复尝试既是空转也是日志噪音。判定依据：
 
-        - 状态文件里留有它的**消息**记录（``state.sessions``，由 ``note_session`` 写，
-          跨重启有效）；
-        - 或者记忆里本来就在管它（``applied`` / ``unbacked``，保持退避与归还语义连续）。
+        - 记忆里本来就在管它（``applied`` / ``unbacked``）：**不看时间**。
+          这两张表是「宿主上那一层是我们写的」这个关键记忆的载体，把它们按时间
+          踢出去会让会话回到范围时把自己的写入误判成外部基数（**生活倍率乘两次**）；
+        - 否则看 ``state.sessions`` 里最后一次活动时间是否在
+          ``[apply].active_window_hours`` 小时内（由 ``note_session`` 写，跨重启有效）。
 
         ⚠ **不能**用 ``_seen_sessions`` 判定：那是 ``_list_sessions`` 的缓存，
         里面的每一项都只是「宿主列出来的会话」，等于没有任何过滤。
+
+        ⚠ 旧状态文件里可能没有时间戳（老版本写的记录）：那种**按活跃处理**。
+        一次升级把所有会话突然踢掉，比多干预几天危险得多。
         """
 
-        return bool(
-            session_id in self._state.applied
-            or session_id in self._state.unbacked
-            or session_id in self._state.sessions
+        if session_id in self._state.applied or session_id in self._state.unbacked:
+            return True
+        if session_id not in self._state.sessions:
+            return False
+        window = self._active_window_seconds()
+        if window <= 0:
+            return True
+        record = self._state.sessions.get(session_id)
+        if not isinstance(record, dict):
+            return True          # 结构异常：宁可多干预，也不要静默丢掉一个在管的会话
+        last_seen = max(
+            _as_epoch(record.get("last_user_message_at")),
+            _as_epoch(record.get("last_proactive_at")),
         )
+        if last_seen <= 0.0:
+            return True          # 缺时间戳的老记录：同上，保守算活跃
+        return (now - last_seen) <= window
 
     async def _target_sessions(self) -> list[str]:
         """当前该被干预的会话 id 列表（宿主会话表 + 消息旁路兜底）。"""
@@ -3057,10 +3133,13 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         only_active = bool(self.config.apply.only_active_sessions)
         targets: list[str] = []
         skipped_idle = 0
+        # 活跃窗口的「现在」在**取会话列表之后**取：``_list_sessions`` 是一次 RPC，
+        # 期间完全可能有新消息进来，用调用前的时间戳会把刚活跃的会话判成不活跃。
+        now = time.time()
 
         def _keep(session_id: str) -> bool:
             nonlocal skipped_idle
-            if only_active and not self._is_active_session(session_id):
+            if only_active and not self._is_active_session(session_id, now):
                 skipped_idle += 1
                 return False
             return True
@@ -3077,7 +3156,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             # 这里的候选也来自 ``_list_sessions`` 的缓存（真正"有消息"的会话在
             # state.sessions 里），所以同样要过活动过滤，否则前面的跳过会被原样加回来。
             # 不重复计数：第一轮已经把这些会话记进 skipped_idle 了。
-            if only_active and not self._is_active_session(session_id):
+            if only_active and not self._is_active_session(session_id, now):
                 continue
             targets.append(session_id)
         self._last_target_count = len(targets)
@@ -3085,9 +3164,10 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         if skipped_idle:
             self._warn_once(
                 "only_active",
-                "已跳过 %d 个无活动迹象的历史会话（[apply].only_active_sessions=true）；"
-                "它们一有消息就会被纳入（最多等 apply.interval_seconds）",
-                skipped_idle,
+                "已跳过 %d 个无活动迹象的会话（[apply].only_active_sessions=true，"
+                "窗口 %d 小时内有过消息才算活跃）；它们一有消息就会被纳入"
+                "（最多等 apply.interval_seconds）",
+                skipped_idle, max(0, int(self.config.apply.active_window_hours)),
             )
         return targets
 
@@ -3174,6 +3254,51 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         self._state.unbacked_strikes = {}
         self._state_dirty = True
         return len(written)
+
+    async def _llm_text(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.9,
+        max_tokens: int = 120,
+        timeout_ms: int = 12_000,
+    ) -> str:
+        """一次纯文本模型调用（子模块用）。
+
+        子模块（``life_*_host``）不直接摸 ``ctx``——``life_*.py`` 被约定为纯模块。
+        返回空串表示「没拿到话」：调用方一律降级到内置模板/静态池，绝不阻塞主流程。
+        """
+        kwargs: dict[str, Any] = {}
+        task_name = str(self.config.activity.llm.task_name or "").strip()
+        if task_name:
+            kwargs["task_name"] = task_name
+        result = await self.ctx.llm.generate(
+            prompt=prompt, temperature=temperature, max_tokens=max_tokens,
+            timeout_ms=timeout_ms, **kwargs,
+        )
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                return ""
+            return str(result.get("response") or result.get("content") or "").strip()
+        return str(result or "").strip() if isinstance(result, str) else ""
+
+    def _module_log(self, level: str, message: str, *args: Any) -> None:
+        """子模块日志出口（补答 / 人设话头共用）。
+
+        为什么不让 mixin 直接写 ``self.ctx.logger``：``life_*.py`` 被约定为**纯模块**
+        （``tests/test_plugin_helpers.py::test_pure_modules_never_touch_ctx``），
+        而能力反推曾经只扫 plugin.py——一条 ``self.ctx.xxx`` 出现在子模块里，
+        manifest 就可能漏声明。日志不是能力，但约定要一致，所以统一从这里出。
+        """
+
+        logger = getattr(self.ctx, "logger", None)
+        if logger is None:
+            return
+        method = getattr(logger, str(level or "info"), None)
+        if not callable(method):
+            method = getattr(logger, "info", None)
+        if callable(method):
+            method(message, *args)
 
     def _wake_active(self, now: float) -> bool:
         """此刻是否处在「睡眠中被 @ 唤醒」的临时清醒窗口里。
@@ -3301,23 +3426,44 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             return
         if self._state.activity != SLEEP:
             return
-        # PR-W1：私聊（没有 @）是否算「叫她」由配置决定，默认关 = 旧行为。
+        # PR-W1：私聊（没有 @）是否算「叫她」由配置决定；v1.23.0 起收窄成三态
+        # ``wake_private_scope``（off / admin / anyone）。
         # ⚠ ``mentioned`` 必须由调用方从**消息载荷**取（``flag_value(target, "is_at")``）：
         # ``info`` 是 ``_seen_sessions`` 里的会话记录，里面没有 is_at 这个字段
         # （在这里读它恒为 False，等于把「被 @ 唤醒」整条功能静默关掉）。
         private_chat = not bool(info.get("is_group_session"))
-        if not mentioned and not (
-            bool(self.config.simulation.wake_on_private) and private_chat
-        ):
+        scope = self._wake_private_scope()
+        owner = self._is_admin_user(
+            str(info.get("user_id") or ""), platform=str(info.get("platform") or "")
+        )
+        allowed = bool(mentioned) or (
+            private_chat and (scope == "anyone" or (scope == "admin" and owner))
+        )
+        if not allowed:
+            # 叫不醒她的那些消息不在这里处理：它们会进 `[catchup]` 的积压，
+            # 等她自然醒再补（见 `_record_sleep_backlog`）。
             return
         if self._in_quiet_hours(now):
-            # 你自己设的静默时段优先于一句 `@`：不开窗口、不写宿主，只留一条 debug
-            self.ctx.logger.debug(
-                "睡眠中被 %s，但此刻在 [frequency] quiet_hours 内：保持静默（session=%s）",
-                "私聊" if private_chat else "@",
-                session_id,
+            exempt = (
+                bool(self.config.simulation.wake_owner_exempt_quiet)
+                and private_chat
+                and owner
+                and scope in {"admin", "anyone"}
             )
-            return
+            if exempt:
+                # v1.23.0：`quiet_hours` 是用户自己设的硬闸，这里**只给主人**开一个口子。
+                # 不开的话，quiet_hours 覆盖夜间就等于「主人想聊随时能聊」在真机上失效。
+                self.ctx.logger.info(
+                    "睡眠中被主人私聊：越过 [frequency] quiet_hours 唤醒（session=%s）", session_id
+                )
+            else:
+                # 静默时段优先于一句 `@`：不开窗口、不写宿主，只留一条 debug
+                self.ctx.logger.debug(
+                    "睡眠中被 %s，但此刻在 [frequency] quiet_hours 内：保持静默（session=%s）",
+                    "私聊" if private_chat else "@",
+                    session_id,
+                )
+                return
         window_minutes = int(self.config.simulation.wake_minutes)
         if window_minutes <= 0:
             # 0 = 关闭唤醒（与 ``reseed_after_hours=0`` 同一种「0 即关」约定）：
@@ -3400,7 +3546,8 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         )
 
     async def _apply_one_session(
-        self, session_id: str, factor: float, now: float, *, reason: str = ""
+        self, session_id: str, factor: float, now: float, *, reason: str = "",
+        log_dry_run: bool = True,
     ) -> str:
         """把一个倍率下发到**单个**会话，返回结果标签（供巡检聚合日志）。
 
@@ -3413,6 +3560,11 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         （``state.applied`` / ``state.observed``）在两处漂移，而它正是与
         budget-pacer 之类写同一个标量的插件做乘性合成的唯一依据 —— 漂了就会把别人的
         基数认成自己的（或反过来），生活倍率被乘两次。
+
+        ``log_dry_run=False`` 时不逐条打印演算结果，而是把值记进 ``_dry_run_log``
+        交给 ``DryRunRoundLog.emit`` 按轮聚合——巡检一轮十几个会话、共用同一个倍率，
+        逐条打只会把宿主日志冲成这一类行的独奏（见 ``life_factors`` 里的注释）。
+        单会话路径（``@`` 唤醒）保持逐条打印：那里一轮只有一个会话，没有可聚合的对象。
         """
 
         compose = self._compose_external()
@@ -3444,6 +3596,11 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             target, current = float(factor), None
 
         if self.config.simulation.dry_run:
+            # 聚合模式只记账不打日志；单会话路径（@ 唤醒）照旧打一条。
+            # ⚠ 记账必须在返回前完成，否则聚合日志会漏掉这一轮。
+            self._dry_run_log.record(session_id, float(target))
+            if not log_dry_run:
+                return "dry_run"
             self.ctx.logger.info(
                 "[演算] session=%s 倍率 %.3f%s",
                 session_id,
@@ -3482,7 +3639,9 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         reason = reason_label(breakdown.reason)
 
         for session_id in targets:
-            outcome = await self._apply_one_session(session_id, breakdown.adjust, now, reason=reason)
+            outcome = await self._apply_one_session(
+                session_id, breakdown.adjust, now, reason=reason, log_dry_run=False
+            )
             if outcome == "wrote":
                 wrote += 1
             elif outcome == "backoff":
@@ -3529,6 +3688,10 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 "已按指数退避，会话一有消息就立刻重试",
                 new_backoff + still_backing_off, new_backoff, still_backing_off,
             )
+
+        # 演算模式：按轮聚合（逐条打会把宿主日志冲爆，见 DryRunRoundLog 的注释）。
+        # 放在最后：聚合对象里存的是这一轮的完整结果，中途聚合会漏会话。
+        self._dry_run_log.emit(self.ctx.logger, now, reason)
 
         # 只在**任一**记忆表夸张时才清理，且只清「本轮不在范围内」的。
         # ⚠ 守卫不能只看 ``applied``：死会话恰恰是从 applied 里 pop 掉、转进 unbacked 的
@@ -3886,6 +4049,29 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 "另外 task_name 留空会让请求落在宿主的 utils 任务上",
                 int(llm_config.timeout_ms),
             )
+        elif isinstance(raw, str) and raw.strip() and not raw.lstrip().startswith("<"):
+            # v1.23.4：**解析失败**必须自己留痕。以前这条只把 raw 塞进 llm_last_raw，
+            # 日志里与「模型拒答」长得一模一样，真机排查「输出被截断」只能靠宿主那条
+            # 「达到最大输出 token 限制」的 warning 去猜——而那条 warning 在宿主侧，
+            # 插件日志里没有任何指向它的线索。
+            cut = _looks_like_cut_json(raw)
+            self.ctx.logger.warning(
+                "%s 活动决策输出无法解析（%s）：前 %d 字符 = %r",
+                __plugin_id__,
+                "JSON 不完整，疑似被 max_tokens 截断" if cut else "模型没给出 JSON",
+                _LLM_RAW_SNIPPET_CHARS,
+                raw[:_LLM_RAW_SNIPPET_CHARS],
+            )
+            if cut:
+                # 截断是确定性的：调大上限才可能好，重试与换温度都没用。
+                self._warn_once(
+                    "llm_max_tokens_truncated",
+                    "活动决策输出被截断（当前 [activity.llm] max_tokens=%d，"
+                    "默认 800）。截断是**确定性**失败：重试、调温度、换任务都不会好，"
+                    "把 max_tokens 调大即可恢复。历史上 200 在会先写一段推理再给 JSON "
+                    "的模型上 18 次连续失败的根因就在这里",
+                    int(llm_config.max_tokens),
+                )
         limit = max(1, int(llm_config.fail_streak_limit))
         if int(self._state.llm_fail_streak) >= limit:
             self._state.llm_cooldown_until = now + max(1, int(llm_config.cooldown_minutes)) * 60.0
@@ -4493,6 +4679,7 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             is_group=self._session_is_group(session_id) is True,
             last_user_at=last_user,
             cold_hours=float(cfg.cold_group_hours),
+            pool=self._persona_topic_pool(day_key, now_minutes),
         )
         return (material,) if material else ()
 
@@ -4605,6 +4792,11 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 # 只标记不生成：LLM 调用回到 tick 的 async 流程（_maybe_dream），
                 # 绝不在收口路径上发 RPC。小憩（<3h）不标记——小憩不做梦。
                 self._dream_wake_pending = (float(now), minutes)
+        # 睡醒补答（v1.23.0）：任何一次「睡 → 非睡」都武装一次（**含短于 3h 的小睡**
+        # ——小睡期间也有人私聊；梦有 3h 门槛是叙事需要，补答没有这个理由）。
+        # 主人在半夜叫醒她**不**触发：唤醒窗口不改 `activity`，这里根本不会命中。
+        if was_sleeping and not is_asleep(self._state.activity):
+            self._catchup_pending_wake = True
         # 赖床宽限（v1.15.0 PR-R3）：强制层把她唤醒到 daze 时开一个窗口，
         # 否则下一个 tick 的 enforce 见她在睡眠时段内、又够格入睡，会立刻把她
         # 送回床（README 里那条「睡下 → 唤醒 → 再睡」的短周期往复）。
@@ -5388,6 +5580,12 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             # v1.5.2：主动开口自己的范围闸（[apply] 是总闸，这里只能在总闸内再收窄）
             if not self._proactive_matches(session_id, info):
                 continue
+            # v1.23.2：刚被宿主策略拒过（例如不在适配器名单里）⇒ 冷却期内不重试。
+            # 放在最前面：被拒的会话连「上次说话时间」都不必去补（那是一次历史 RPC）。
+            # 记账：跳过必须留痕，否则 /生活 为什么 答不出「为什么一直不开口」。
+            if self._proactive_denied.is_denied(session_id, now):
+                reasons[REASON_HOST_DENIED] = reasons.get(REASON_HOST_DENIED, 0) + 1
+                continue
             record = state.sessions.get(session_id)
             record, probed = await self._ensure_last_user_baseline(
                 session_id, record, day_key=day_key, now=now, probes_left=probes_left
@@ -5549,9 +5747,18 @@ class LifeFrequencyPlugin(MaiBotPlugin):
             )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("触发主动任务失败 session=%s：%s", session_id, exc)
+            self._note_proactive_denied(session_id, now, exc)
             return "failed"
         if isinstance(result, dict) and result.get("success") is False:
-            self.ctx.logger.info("宿主未受理主动任务：%s", result.get("error"))
+            # ⚠ 必须带 session_id：真机日志里这行前面就是 IPC 层打的一整条
+            # traceback，两者对不上号就无法归因（v1.23.2）。
+            error = result.get("error")
+            self.ctx.logger.info(
+                "宿主未受理主动任务 session=%s：%s", session_id, error
+            )
+            # 只有**策略**拒绝才进这个冷却；「宿主故障」这类抖动交给既有的
+            # ``failure_cooldown_minutes``（见 _POLICY_DENIAL_MARKERS 的注释）。
+            self._note_proactive_denied(session_id, now, error)
             return "failed"
         self.ctx.logger.info("%s 主动开口 session=%s score=%.3f", __plugin_id__, session_id, decision.score)
         # 打开「不引用」窗口：接下来这一轮 Planner 请求会被注入发言规则
@@ -5694,13 +5901,19 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 message_id=f"life-frequency-proactive:{session_id}:{int(time.time())}",
             )
         except Exception as exc:  # noqa: BLE001 —— 来由写不进去只是少一层上下文，不该拦住开口
-            self._warn_once("proactive_fact", "写入主动开口来由失败（不影响开口）：%s", exc)
+            # key 带上 session_id：共用同一个 key 会让第二个会话的失败被「只告警一次」吞掉
+            self._warn_once(
+                f"proactive_fact:{session_id}",
+                "写入主动开口来由失败 session=%s（不影响开口）：%s", session_id, exc,
+            )
             return
         # 宿主会把组件异常**包装成返回值**而不是抛出（skill §5.5）：必须校验返回值，
         # 否则会出现「日志说写了、实际没写」。
         if isinstance(result, dict) and result.get("success") is False:
             self._warn_once(
-                "proactive_fact", "写入主动开口来由被宿主拒绝（不影响开口）：%s", result.get("error")
+                f"proactive_fact:{session_id}",
+                "写入主动开口来由被宿主拒绝 session=%s（不影响开口）：%s",
+                session_id, result.get("error"),
             )
 
     def _open_no_quote_window(self, session_id: str, now: float) -> None:
@@ -5716,6 +5929,21 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 if deadline > now
             }
         self._proactive_no_quote_until[session_id] = float(now) + PROACTIVE_NO_QUOTE_WINDOW_SECONDS
+
+    def _note_proactive_denied(self, session_id: str, now: float, error: object) -> bool:
+        """宿主**策略**拒绝的统一出口：记冷却表 + 立刻落盘（v1.23.4）。
+
+        落盘是本次修复的重点：冷却只存内存时，进程每次重启都会对名单外会话再撞
+        一次墙——真机日志里那对「满栈 traceback + 宿主未受理」就是这么重复出现的。
+        拒绝是**低频事件**（每次开机至多每会话一次），因此这里同步写一次状态文件，
+        不必等下一轮巡检的延迟落盘。
+        """
+
+        if not self._proactive_denied.apply_if_policy(session_id, now, error):
+            return False
+        self._state.proactive_denied = self._proactive_denied.snapshot(now=now)
+        self._save_state()
+        return True
 
     # ------------------------------------------------------------ 后台循环
 
@@ -5926,12 +6154,18 @@ class LifeFrequencyPlugin(MaiBotPlugin):
         #（放在所有 enforce 之后，两个醒来点都不漏；梦进 recent_events，
         # 从下一轮活动决策的近层经历起可见）
         await self._maybe_dream(now)
+        # 睡醒补答（v1.23.0）：紧跟在梦境之后——两者都由「刚醒」触发，但补答要
+        # **先于**主动开口（`_maybe_proactive`）排队：有人断在半截等她，比她想分享
+        # 一件小事更要紧。
+        await self._maybe_catchup(now)
+        await self._catchup_prune(now, self._catchup_rules())
 
         self._reseed_activity_if_stale(now, sim_config)
         await self._refresh_host_context()
         await self._apply_sweep(now)
         # 动机素材（v1.13.0）：问候/分享/关系维护三类「想说的念头」，排在主动
         # 开口挑选之前——本 tick 冒出的念头本轮就有机会被选中
+        await self._refresh_persona_topics(now)
         await self._refresh_motives(now, sim_config)
         await self._maybe_proactive(now)
 
@@ -7099,25 +7333,36 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 "is_group_session": bool(group_id),
             }
             self._seen_sessions[session_id] = info
-        # 睡眠中被 `@`（或私聊，PR-W1）⇒ 开一个临时清醒窗口，并立刻把倍率抬起来
-        # （见方法说明）。放在社交信号之前：唤醒是「这条消息能不能被看见」的关键路径，
-        # 不能被后面的旁路逻辑挡在前面。整段自己兜异常，绝不让消息主链受插件影响。
-        if flag_value(target, "is_at") or (
-            bool(self.config.simulation.wake_on_private) and not group_id
-        ):
-            try:
-                await self._at_wake_from_hook(
-                    session_id, info, now, mentioned=flag_value(target, "is_at")
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.ctx.logger.warning("%s 睡眠唤醒失败：%s", __plugin_id__, exc)
+        # 睡眠中被 `@`（或私聊，v1.23.0 起按 ``wake_private_scope`` 收窄）⇒ 开一个临时
+        # 清醒窗口，并立刻把倍率抬起来（见方法说明）。放在社交信号之前：唤醒是
+        # 「这条消息能不能被看见」的关键路径，不能被后面的旁路逻辑挡在前面。
+        # 判据全部在 ``_at_wake_from_hook`` 内部（她没睡、不在目标会话、静默时段等），
+        # 所以这里不再重复 ``wake_on_private`` 那一层——两处各判一次迟早会打架。
+        try:
+            await self._at_wake_from_hook(
+                session_id, info, now, mentioned=flag_value(target, "is_at")
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("%s 睡眠唤醒失败：%s", __plugin_id__, exc)
         # 唤醒窗口内的**对话顺延**（v1.15.0 PR-W2）：她回了一句、对方接着聊，
         # 不该因为「没再 @ 她」而 10 分钟后突然断线。只顺延、不写宿主。
-        elif self._wake_active(now) and not flag_value(target, "is_at"):
+        if self._wake_active(now) and not flag_value(target, "is_at"):
             try:
                 self._extend_wake_window(now)
             except Exception as exc:  # noqa: BLE001
                 self.ctx.logger.debug("%s 唤醒窗口顺延失败：%s", __plugin_id__, exc)
+        # 睡眠期积压（v1.23.0）：叫不醒她的那些消息要先记住，否则她醒来对这段时间
+        # 一无所知。放在唤醒之后——刚被叫醒的那条（在窗口内）不该进积压。
+        try:
+            await self._record_sleep_backlog(
+                target,
+                session_id=session_id,
+                group_id=group_id,
+                user_id=user_id,
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("%s 睡眠积压记录失败：%s", __plugin_id__, exc)
         # 社交信号：只做一次 append（**无 RPC、无落盘、无 O(n) 扫描**）。
         # 这个钩子挂在消息主链上，任何异常都可能影响别人的回复：除了装饰器上的
         # error_policy=SKIP，这里自己再兜一层，并且只在 debug 级留痕
@@ -7212,6 +7457,15 @@ class LifeFrequencyPlugin(MaiBotPlugin):
                 self._inject_fail_streak = 0  # 打一次就重置，避免刷屏
             return {"action": "continue"}
         self._inject_fail_streak = 0
+        # 睡眠期积压的被动回填（v1.23.0）：只在她回来接这句话时提一次。
+        # 失败绝不阻断注入（这条是「锦上添花」，生活摘要才是主菜）。
+        try:
+            extra = self._catchup_fill(session_id, time.time())
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("%s 补答回填失败：%s", __plugin_id__, exc)
+            extra = ""
+        if extra:
+            digest = f"{digest}\n{extra}" if digest else extra
         original = str(kwargs.get("extra_prompt") or "")
         limit = int(self.config.prompt.max_chars)
         if limit > 0:

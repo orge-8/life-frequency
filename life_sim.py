@@ -1073,6 +1073,17 @@ class LifeState:
     #: 与节日 ``fired_date_keys``（列表语义）和 mood 注入（会话维度）都不同构。
     motive_seen: dict[str, float] = field(default_factory=dict)
 
+    # ---- 睡醒补答（v1.23.0，catchup）----
+    #: 当前配额所属的生活日。跨日即重置下面两个计数器（与其它「生活日」计数器同口径）。
+    catchup_day: str = ""
+    #: 该生活日已经**确认说出去了**的补答条数（受理但沉默的不算）。
+    catchup_sent: int = 0
+    #: person_id → 该生活日被补答的次数（每人每天上限用）。
+    catchup_people: dict[str, int] = field(default_factory=dict)
+    #: 人设化冷场话头缓存（v1.23.0）：「人设哈希|生活日|时段段」→ 问句列表。
+    #: 它只是缓存（生成一次可用一整段时段），坏了/丢了就退回静态话题池。
+    persona_topics: dict[str, list[str]] = field(default_factory=dict)
+
     fired_date_keys: list[str] = field(default_factory=list)
     materials: list[dict[str, Any]] = field(default_factory=list)
     recent_events: list[dict[str, Any]] = field(default_factory=list)
@@ -1118,6 +1129,15 @@ class LifeState:
     llm_cooldown_until: float = 0.0
     llm_last_success_at: float = 0.0
     llm_last_raw: str = ""
+
+    #: 会话 id → 主动开口被宿主**策略**拒绝后的冷却截止时间戳（v1.23.4）。
+    #:
+    #: 以前这张表只活在进程内存里（``life_proactive.ProactiveDeniedTracker``），
+    #: 每次重启都清零 ⇒ 对每个名单外会话再撞一次墙：一次失败的
+    #: ``maisaka.context.append`` + 一条宿主侧满栈 traceback。会话名单本身
+    #: 插件读不到，唯一能跨重启的「已知结论」就是这张表，所以必须落盘。
+    #: 只影响主动开口，不影响倍率下发与被动回复。
+    proactive_denied: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1222,6 +1242,9 @@ class LifeState:
         # （skip_ledger 在 bump_skip_ledger 的 int() 处、sessions 的时间戳 NaN 会让
         # 「对方刚说过话」的闸静默失效），与上面六张映射表对齐。
         state.skip_ledger = _sanitize_int_map(state.skip_ledger)
+        # v1.23.4：主动开口的策略拒绝冷却表是时间戳映射，走 float 洗值（允许负值、
+        # 不认字符串数字）。坏项丢弃即可，冷却表少一条只会多重试一次，无害。
+        state.proactive_denied = _sanitize_float_map(state.proactive_denied)
         state.sessions = _sanitize_session_map(state.sessions)
         # v1.9.1（physio）：饱腹钳进 0–10（float 分支已拦 NaN/inf，这里只管范围）
         state.satiety = _clamp(state.satiety, 0.0, 10.0)
@@ -1243,6 +1266,26 @@ class LifeState:
             state.interrupted_from = ""
         state.interrupt_injected = _sanitize_float_map(state.interrupt_injected)
         state.motive_seen = _sanitize_float_map(state.motive_seen)
+        # v1.23.0（catchup）：配额三件套同款净化。``catchup_people`` 用 int map——
+        # 一个坏值会让「每人每天一次」的判据变成 ``int("x")`` 直接抛，抛在醒来那一刻
+        # ⇒ 补答整条链路失效且没有任何日志。
+        # ⚠ ``from_dict`` 的通用 coerce 段落会把 JSON 的 ``null`` 变成字符串 "None"
+        # （``str(None)`` 非空 ⇒ 后面的 ``or ""`` 兜不住），这里显式排掉两个字面量。
+        _day = str(state.catchup_day or "").strip()[:16]
+        state.catchup_day = "" if _day.lower() in {"none", "null"} else _day
+        state.catchup_sent = max(0, int(_as_float(state.catchup_sent, 0.0) or 0.0))
+        state.catchup_people = _sanitize_int_map(state.catchup_people)
+        # 人设话头缓存：只留「键非空 + 值是非空字符串列表」，超过 8 组按插入顺序丢老的
+        _topics: dict[str, list[str]] = {}
+        if isinstance(state.persona_topics, dict):
+            for _key, _value in state.persona_topics.items():
+                _name = str(_key or "").strip()
+                if not _name or not isinstance(_value, (list, tuple)):
+                    continue
+                _items = [str(item).strip() for item in _value if str(item or "").strip()]
+                if _items:
+                    _topics[_name] = _items[:8]
+        state.persona_topics = dict(list(_topics.items())[-8:])
         # v1.14.0（病程系统）：阶段名过白名单（坏值按旧口径 = 生病但无阶段 ⇒ 加重），
         # 时间戳与计数做有限性收口，两张映射表洗值。
         state.cold_stage = normalize_cold_stage(state.cold_stage)

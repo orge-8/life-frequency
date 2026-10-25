@@ -421,6 +421,8 @@ class SimulationConfig(PluginConfigBase):
         ),
         json_schema_extra={"label": "私聊也叫醒她", "order": 23},
     )
+    wake_private_scope: str = Field(default="", description="谁能靠私聊把她叫醒：`off` 谁都不行 / `admin` 只有管理员 / `anyone` 任何人。留空 = 跟随下方「私聊也叫醒她」（为真即 anyone，否则 admin）；`admin` 档在管理员 QQ 留空时等于 off（fail-closed）", json_schema_extra={"label": "私聊叫醒范围", "order": 22, "placeholder": "off / admin / anyone"})
+    wake_owner_exempt_quiet: bool = Field(default=True, description="管理员私聊可以越过 `[frequency] quiet_hours`。这是**唯一**能越过你自己设的静默时段的路径；群聊 @ 与其他人一律照旧被拦", json_schema_extra={"label": "主人可越过静默时段", "order": 26})
     wake_extend_on_message: bool = Field(
         default=True,
         description=(
@@ -466,8 +468,13 @@ class ActivityLLMConfig(PluginConfigBase):
         json_schema_extra={"label": "温度", "order": 1, "step": 0.1},
     )
     max_tokens: int = Field(
-        default=200,
-        description="只要一个 JSON，200 足够",
+        default=800,
+        description=(
+            "活动决策的输出上限（token）。**默认 800，不要退回 200**：v1.23.4 真机教训"
+            "——200 在会先写一段推理/散文再给 JSON 的模型上会被截断，宿主只打一行"
+            "「达到最大输出 token 限制」的 warning，插件侧看到的是「输出无法解析」，"
+            "于是连续失败 18 次、生活状态冻结数小时（截断是确定性的，重试不会好）"
+        ),
         json_schema_extra={"label": "最大 token", "order": 2, "step": 50},
     )
     timeout_ms: int = Field(
@@ -1304,12 +1311,26 @@ class ApplyConfig(PluginConfigBase):
     only_active_sessions: bool = Field(
         default=True,
         description=(
-            "只干预「有活动迹象」的会话（本次启动后收到过消息，或记忆里本来就在管）。"
-            "宿主 chat.get_all_streams 会返回**全部历史会话**，真机上几十上百个历史会话"
-            "都没有 heartflow chat：对它们写入必然被宿主静默 no-op（只记一条 warning），"
-            "既刷日志又白跑 RPC。关掉则恢复「所有会话都先写一遍」的旧行为"
+            "只干预「有活动迹象」的会话（在 active_window_hours 小时内收到过消息，"
+            "或记忆里本来就在管）。宿主 chat.get_all_streams 会返回**全部历史会话**，"
+            "真机上几十上百个历史会话都没有 heartflow chat：对它们写入必然被宿主静默 "
+            "no-op（只记一条 warning），既刷日志又白跑 RPC。"
+            "关掉则恢复「所有会话都先写一遍」的旧行为"
         ),
         json_schema_extra={"label": "只干预活跃会话", "order": 6},
+    )
+    active_window_hours: int = Field(
+        default=72,
+        description=(
+            "「有活动迹象」的时间窗口：会话最后一次有消息（或最后一次主动开口）距现在"
+            "超过这个小时数就不再干预。只对 [apply].only_active_sessions=true 生效。\n\n"
+            "v1.23.2 为什么加这条：旧的判定是「state.sessions 里有没有这条记录」，而那个"
+            "字典的 14 天清理只在超过 500 条时才跑——真机只有十几个会话，等于**永不清理**，"
+            "于是「历史上收过一条消息的会话」会永久算活跃（真机实测 18 个会话一轮，"
+            "其中多数早就没人说话了，名单外的僵尸会话也混在里面反复撞宿主策略）。\n\n"
+            "0 = 不限时间（退回旧行为，只要见过就算活跃）"
+        ),
+        json_schema_extra={"label": "活跃判定窗口（小时）", "order": 7, "step": 24},
     )
 
     _norm_target_chats = _str_list_validator("target_chats")
@@ -2395,6 +2416,23 @@ class MemoryConfig(PluginConfigBase):
     )
 
 
+class CatchupConfig(PluginConfigBase):
+    """``[catchup]``：睡醒补答（v1.23.0）。主动补答在自然醒时触发 Planner，被动回填注入她下一次回复；配额与 ``[proactive]`` 分开计——补答回答的是「有人断在半截等你」。"""
+
+    __ui_label__ = "睡醒补答"; __ui_icon__ = "moon"; __ui_order__ = 27
+    enabled: bool = Field(default=True, description="记录她睡着时（私聊 / 群聊被 @）进来的消息并在醒来补答；关 = 回到「睡就是睡」", json_schema_extra={"label": "启用补答", "order": 0})
+    active_enabled: bool = Field(default=False, description="自然醒时**主动**触发 Planner（原文进任务描述，措辞与是否开口由宿主决定）。默认关 = 只做被动回填，先确认真机效果再打开", json_schema_extra={"label": "醒来主动补答", "order": 1})
+    per_wake_max: int = Field(default=5, description="一次睡醒最多主动补几个会话", json_schema_extra={"label": "单次睡醒上限", "order": 2, "step": 1})
+    per_person_daily: int = Field(default=1, description="同一个人每天最多被主动补一次；0 与 1 同义", json_schema_extra={"label": "每人每日上限", "order": 3, "step": 1})
+    global_daily_max: int = Field(default=6, description="补答自己的每日总上限（与主动开口分开计）；0 = 不设上限。默认 6 ≈ 两次睡醒 × 3 个会话", json_schema_extra={"label": "补答每日上限", "order": 4, "step": 1})
+    late_degrade_hours: float = Field(default=6.0, description="迟到超过它（小时）不再主动补，只留被动回填；0 = 不设上限。隔一整天再提就很奇怪了", json_schema_extra={"label": "迟到降级（小时）", "order": 5, "step": 1})
+    keep_per_person: int = Field(default=5, description="每人最多保留的原文条数；0 = 全留", json_schema_extra={"label": "每人保留条数", "order": 6, "step": 1})
+    max_chars: int = Field(default=200, description="单条原文的截断长度；0 = 不截断", json_schema_extra={"label": "单条截断（字符）", "order": 7, "step": 50})
+    retention_hours: float = Field(default=24.0, description="条目保留时长（小时），超过即删；它是「重启后补上个星期留言」的唯一兜底", json_schema_extra={"label": "条目保留（小时）", "order": 8, "step": 1})
+    requote_limit: int = Field(default=0, description="塞给 Planner / 回填时最多引几条原文。**默认 0 = 不复述**：那些消息本来就在宿主的对话历史里，再说一遍会让同一句话出现两次；调大只用于「历史被裁剪」的兜底", json_schema_extra={"label": "引用原文条数", "order": 9, "step": 1})
+    stagger_max_seconds: int = Field(default=120, description="多个会话在同一次睡醒命中时按它随机散开（秒），避免同刻给宿主丢多个主动任务；0 = 不散开", json_schema_extra={"label": "触发错开（秒）", "order": 10, "step": 20})
+    persona_chars: int = Field(default=200, description="把多少人设摘要塞进补答的任务描述（0 = 不塞）；只影响口吻，不替代宿主的完整人设", json_schema_extra={"label": "人设摘要（字符）", "order": 11, "step": 50})
+
 class LifeFrequencyConfig(PluginConfigBase):
     """插件配置根模型。
 
@@ -2425,6 +2463,7 @@ class LifeFrequencyConfig(PluginConfigBase):
     dream: DreamConfig = Field(default_factory=DreamConfig)
     motives: MotivesConfig = Field(default_factory=MotivesConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    catchup: CatchupConfig = Field(default_factory=CatchupConfig)
     # ⚠ 必须是**顶层**节：SDK 只在顶层把 "是配置模型类" 的字段展开成 section
     # （`maibot_sdk/config.py:209-227`），嵌在别的节里的配置对象会退化成
     # `type=object` 的普通字段、不带 `properties`，WebUI 只能把它渲染成
@@ -2633,6 +2672,7 @@ _WEBUI_SECTION_WHEN = {
         "默认关闭——开着但宿主没记忆库，等于每次巡检白查一遍。"
     ),
     "schedule": "有固定班表（上下班时间、通勤、午休、周末双休）时才打开。",
+    "catchup": "想让她「睡醒记得别人找过她」时才动：默认只做被动回填，要她主动开口再打开主动补答。",
 }
 
 

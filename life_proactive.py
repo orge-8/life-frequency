@@ -63,6 +63,8 @@ REASON_PENDING = "pending"
 REASON_ATTEMPT_COOLDOWN = "attempt_cooldown"
 #: v1.18.0：对方连续未回应达到硬上限，彻底停口（对方回复即恢复）。
 REASON_UNANSWERED_CAP = "unanswered_cap"
+#: v1.23.2：宿主**策略**不受理这个会话（例如不在适配器名单里），冷却期内不开口。
+REASON_HOST_DENIED = "host_denied"
 
 #: 台账专用的非「沉默原因」键：一次开口被确认说出去了。
 LEDGER_SENT = "sent"
@@ -82,6 +84,8 @@ SKIP_REASON_LABELS: dict[str, str] = {
     REASON_UNANSWERED_CAP: "对方连续没回应，先不打扰了",
     REASON_SILENCE: "对方刚说过话，先不插嘴",
     REASON_LOW_SCORE: "素材权重+状态偏置没到阈值",
+    # v1.23.2：宿主策略拒绝（例如「适配器名单禁止创建聊天运行实例」）后的冷却
+    REASON_HOST_DENIED: "宿主策略不受理（名单外会话，冷却中）",
     LEDGER_SENT: "已经开口了",
     LEDGER_NOT_SENT: "话到嘴边没说出口",
 }
@@ -762,3 +766,123 @@ def ledger_lines(ledger: Mapping[str, Any], *, limit: int = 10) -> list[str]:
             f"{label} ×{level}：{count} 次" if level else f"{label}：{count} 次"
         )
     return lines
+
+
+# ------------------------------------------------- 主动开口：宿主策略拒绝后的冷却
+#
+# 真机教训（2026-10-23）：宿主对不在适配器名单里的会话抛
+# ``HeartflowPolicyDeniedError: 适配器名单禁止创建聊天运行实例``，插件侧看到的是
+# ``proactive.trigger`` 返回 ``success=False``（外加 IPC 层打的一整条 traceback）。
+# 名单插件读不到，只能**被拒一次就记住**，冷却期内不再拿它当候选。
+PROACTIVE_DENIED_COOLDOWN = 1800.0
+#: 冷却表上限（真机会话数远小于它；纯粹防止字典无限增长）
+PROACTIVE_DENIED_LIMIT = 200
+#: 判定「这是宿主**策略**拒绝，不是一次抖动」的文本标记。
+#
+# ⚠ 必须区分：``success=False`` 既可能是「宿主故障」这类**瞬时**失败（归
+# ``[proactive].failure_cooldown_minutes`` 管，可配 0 = 每周期重试），也可能是
+# 「适配器名单禁止创建聊天运行实例」这类**永久**策略拒绝（重试一万次同一结果）。
+# 不加区分地一律进冷却，等于用一个隐藏的 30 分钟闸盖掉用户配置的
+# ``failure_cooldown_minutes=0`` —— 那是功能扩张，不是降噪（v1.23.2 第一版实现
+# 正是这么打挂 ``test_proactive_race`` 两条的）。认不出就按抖动处理。
+POLICY_DENIAL_MARKERS = (
+    "禁止", "名单", "不允许", "不接受", "策略", "policy", "denied", "deny",
+    "forbidden", "not allowed",
+)
+def looks_like_policy_denial(error: Any) -> bool:
+    """这次失败是不是宿主**策略**性的永久拒绝（而不是一次抖动）。
+
+    认不出就按抖动处理——宁可多试一次，也不要用一个隐藏的 30 分钟闸
+    盖掉用户配置的 ``failure_cooldown_minutes``。
+    """
+
+    text = str(error or "").lower()
+    if not text:
+        return False
+    return any(marker in text for marker in POLICY_DENIAL_MARKERS)
+
+
+class ProactiveDeniedTracker:
+    """记住哪些会话的主动开口刚被宿主**策略**拒了。
+
+    只影响主动开口：被动回复与倍率下发照旧（名单外会话的倍率写入会被宿主静默
+    no-op，那由 ``unbacked`` 退避管，是另一条线）。
+
+    v1.23.4：这张表**可落盘**（``LifeState.proactive_denied``）。理由是真机实测：
+    冷却只在内存里 ⇒ 每次重启对名单外会话各撞一次墙（一条
+    ``maisaka.context.append`` 满栈 traceback + 一次失败的主动任务）。会话名单本身
+    插件读不到，重启后唯一还能用的已知结论就是这张表。
+    """
+
+    def __init__(
+        self,
+        cooldown: float = PROACTIVE_DENIED_COOLDOWN,
+        limit: int = PROACTIVE_DENIED_LIMIT,
+    ) -> None:
+        self.cooldown = max(0.0, float(cooldown))
+        self.limit = max(1, int(limit))
+        self.until: dict[str, float] = {}
+
+    def restore(self, raw: object, *, now: float) -> int:
+        """从状态文件接回冷却表（v1.23.4）；返回**接回了几条**（过期项直接丢掉）。
+
+        坏数据一律忽略而不是让加载失败：这张表只是降噪用的记忆，
+        少一条的代价是多重试一次，丢整份状态的代价是生活模型从零开始。
+        """
+
+        if not isinstance(raw, dict):
+            return 0
+        kept: dict[str, float] = {}
+        for key, value in raw.items():
+            session_id = str(key or "").strip()
+            if not session_id or isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            until = float(value)
+            if not math.isfinite(until) or until <= float(now):
+                continue
+            kept[session_id] = until
+            if len(kept) >= self.limit:
+                break
+        self.until.update(kept)
+        return len(kept)
+
+    def snapshot(self, *, now: float) -> dict[str, float]:
+        """导出**未过期**的冷却表（供落盘）；顺手清掉过期项。"""
+
+        self.until = {
+            key: until for key, until in self.until.items() if until > float(now)
+        }
+        return dict(self.until)
+
+    def note(self, session_id: str, now: float) -> None:
+        """记下这个会话被拒了。"""
+
+        if not session_id:
+            return
+        if len(self.until) >= self.limit and session_id not in self.until:
+            # 顺手清过期项；还超上限就只更新已有条目，不无限增长
+            self.until = {
+                key: until for key, until in self.until.items() if until > now
+            }
+            if len(self.until) >= self.limit:
+                return
+        self.until[str(session_id)] = float(now) + self.cooldown
+
+    def apply_if_policy(self, session_id: str, now: float, error: Any) -> bool:
+        """失败出口的统一收口：认出是策略拒绝才记。返回有没有记。"""
+
+        if not looks_like_policy_denial(error):
+            return False
+        self.note(session_id, now)
+        return True
+
+    def is_denied(self, session_id: str, now: float) -> bool:
+        """这个会话是不是刚被拒过、还在冷却里（顺手清过期项）。"""
+
+        until = float(self.until.get(session_id, 0.0))
+        if until <= 0.0:
+            return False
+        if until > now:
+            return True
+        del self.until[session_id]
+        return False

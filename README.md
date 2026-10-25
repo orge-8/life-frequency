@@ -787,8 +787,6 @@ maisaka.proactive.trigger  llm.generate  config.get  api.call
 `api.call` 只用于可选联动（经济 / 社交经历）里**只读**调用 budget-pacer / better-diary
 的公开 API；对方未安装时相应维度自动降级，不影响其余功能。
 
----
-
 ## 与其它插件共存
 
 倍率是**乘性合成**（不覆盖别人写进去的值），素材是**加分不压制**，静默时段有 `silence_floor` 兜底。与四类上游只读 API（`budget-pacer` / `better-diary` / 外面的世界 / 唤醒）的详细契约见 [`docs/interop.md`](docs/interop.md)。
@@ -1084,10 +1082,11 @@ python run_gates.py --plugin .        # 三门禁一起跑
 
 ## 版本历史
 
-完整版本历史见 [CHANGELOG.md](CHANGELOG.md)（每条都带当时的验证数据与真机观测）。
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)（每条都带当时的验证数据与真机观测）；睡醒补答（v1.23.0）的配置与「不要当 bug 的四件事」也写在那里。
 
 | 版本 | 一句话 |
 |---|---|
+| 1.23.0 | **睡醒补答 + 主人专属唤醒**：`wake_private_scope` 三态（off/admin/anyone）决定谁能私聊叫醒她，主人可越过 `quiet_hours`；睡着时的私聊与群 @ 存进 `sleep_backlog`，自然醒时按会话各触发一次 Planner（措辞交给宿主、她有权沉默）或注入下一次回复，迟到 >6h 只做被动回填 |
 | 1.22.5 | **自定义 WebUI 页面**（webui.json 协议 v2，宿主 ≥1.3.3）：顶部工作区「生活频率」tab——状态总览 / 倍率拆解 / 情绪体力归因 / 关系档案四段 + 暂停·恢复按钮（与 `/生活 暂停`、`/生活 恢复` 同一份执行体，重置/重锚刻意不上页面），每 5 秒自动刷新。新增 `life_webui.py` 投影层（四条硬契约：绑定字段恒存在 / text·stat 只吃标量 / 不抛异常 / 与命令卡同源对账）与 3 个零参数静态 `@API`（`life.dashboard` / `life.pause` / `life.resume`）+ 13 条回归；`declarative_basic` 能力、`check_plugin` 配对启发式（命名空间 API 名按尾段对齐）与能力反推（webui.json `required_capabilities` 来源）、结构预算（plugin.py 7,400 行 / payload 1.2 MB 且 webui.json 入计量）四处门禁同步修订 |
 | 1.22.4 | **长期记忆的作用域自证**（插件中心审核阻塞项）：`knowledge.search` 的 `person_id` / `respect_filter` 不在 SDK 公开签名里（只有 `search(query, limit=5)`），宿主「接受并生效 / 接受但忽略 / 直接报错」三种行为都可能存在。插件不再把「不串人」押在宿主兑现上：拿到非空结果时用一个不可能属于真人的哨兵 `person_id` 发同一条查询做对照——结果一致即判定作用域失效并**整层停用**（不是退回无作用域检索，那正是串人本身）；宿主直接报「unexpected keyword」同样停用；结论未定时按严格模式只收点名本人的条目。逻辑下沉到 `life_memory.py`，`plugin.py` 反减 23 行。顺带修 `max_version` 的 `1.99.99` / `2.99.99`（插件中心硬阻断项）为实测范围 `1.3.2` / `2.8.2` |
 | 1.22.3 | **冷群话头改独占选材**：会话判定为冷时，话头越过权重比较直接进候选（0.55 拼不过事件 0.30–0.85 与关系维护 0.70，「冷了就抛一条」会退化成「几乎永远不抛」）；独占只改选材，静默时段/每日上限/最小间隔/退避/评分闸全部照旧 |
