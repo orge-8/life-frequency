@@ -110,68 +110,80 @@ def test_settle_never_double_counts_sleep_when_waking():
 # ---------------------------------------------------------------- 熬夜与体力上限
 
 
-def test_short_sleep_counts_as_staying_up():
-    """睡不够就记一笔熬夜：判据是「最近 24 小时累计」，且只在**睡醒时**判。"""
+def test_short_sleep_no_longer_adds_a_debt_night():
+    """v1.24.0：醒来**不再**记一笔熬夜——睡债只按窗口内的实际睡眠时间算。
+
+    这里钉三件事：① 旧计数器退役（冻结在 0，原值另存留档）；
+    ② 账本照实记下这段 100 分钟；③ 缺觉按时间算出来是「两晚多」，
+    还不到压低上限的三晚——「一次没睡够」不再是整数惩罚。
+    """
 
     at = ts(2026, 2, 8, 4, 0)
-    state = make_state(at=at, activity=A.SLEEP, sleep_started_at=at)
-    S.settle(state, now=at + 100 * 60, config=cfg(), events=[], rng=random.Random(1))
-    assert state.sleep_debt_nights == 0, "还睡着，不该判"
-
+    config = cfg(offline_gap_minutes=0)  # 一步 100 分钟：别被判成停机间隙
+    state = make_state(
+        at=at, activity=A.SLEEP, sleep_started_at=at, sleep_tracking_since=at - 3 * 86400,
+    )
+    # 前两晚各睡满 8 小时，只有这一觉睡得短（账本按时间顺序追加）
+    for end in (at - 2 * 86400.0, at - 86400.0):
+        S._add_sleep_interval(state, start=end - 8 * 3600.0, end=end)
+    S.settle(state, now=at + 100 * 60, config=config, events=[], rng=random.Random(1))
     S.apply_activity(
         state,
         A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
         now=at + 100 * 60,
-        config=cfg(),
+        config=config,
     )
-    assert state.sleep_debt_nights == 1, "只睡了 100 分钟 < 300"
-    assert state.energy_cap == pytest.approx(10.0), "1 天还不够压低上限"
+
+    assert state.sleep_debt_nights == 0, "旧「醒来记一晚」已退役"
+    assert state.legacy_sleep_debt_nights == 0
+    assert S.sleep_in_window(state, now=at + 100 * 60, hours=72) == 8 * 60 * 2 + 100
+    deficit, reason = S.sleep_deficit_minutes(state, now=at + 100 * 60, config=config)
+    assert reason == ""
+    assert deficit == pytest.approx(24 * 60 - (8 * 60 * 2 + 100))
+    nights, _ = S.sleep_deficit_nights(state, now=at + 100 * 60, config=config)
+    assert nights == pytest.approx(deficit / 180.0)
+    assert nights < 3.0
+
+    # 旧入口退役但可导入：不改状态、返回冻结字段
+    before = state.to_dict()
+    assert S.grade_sleep_debt(state, now=at + 100 * 60, config=config) == 0
+    assert state.to_dict() == before
 
 
-def test_enough_sleep_resets_debt():
-    """v1.15.0（PR-S1）**滞回**：一晚好觉只清 ``sleep_debt_recovery_step`` 晚债。
+def test_enough_sleep_keeps_the_time_based_deficit_at_zero():
+    """v1.24.0：连睡够三晚 ⇒ 窗口内实际睡眠 = 目标睡眠，缺觉归零、上限不被压。
 
-    旧行为（一晚清零）在默认「体力满即醒 + 最短睡眠目标」下会把连熬三晚洗白得太快；
-    连熬要连睡几晚才还清。``sleep_debt_recovery_step=0`` 可回到旧行为（下面第二条）。
+    旧模型按「醒来次数」加减（一晚好觉只还一晚债）；新模型只看时间，
+    所以这里直接铺账本验证口径，而不是模拟醒来事件。
     """
 
     at = ts(2026, 2, 8, 4, 0)
-    state = make_state(at=at, activity=A.SLEEP, sleep_started_at=at, sleep_debt_nights=2)
-    S.settle(state, now=at + 8 * 3600, config=cfg(), events=[], rng=random.Random(1))
-    S.apply_activity(
-        state,
-        A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
-        now=at + 8 * 3600,
-        config=cfg(),
-    )
-    assert state.sleep_debt_nights == 1, "一期好觉只还 1 晚债（2 → 1）"
+    config = cfg()
+    state = make_state(at=at, activity=A.DAILY, sleep_tracking_since=at - 3 * 86400)
+    for end in (at - 54 * 3600.0, at - 30 * 3600.0, at - 6 * 3600.0):
+        S._add_sleep_interval(state, start=end - 8 * 3600.0, end=end)
+
+    assert S.sleep_in_window(state, now=at, hours=72) == 24 * 60
+    assert S.sleep_deficit_minutes(state, now=at, config=config) == (0, "")
+    assert S.sleep_deficit_nights(state, now=at, config=config) == (0.0, "")
+    S._refresh_energy_cap(state, now=at, config=config)
     assert state.energy_cap == pytest.approx(10.0)
+    assert S.health_label(state, at, config) == "健康"
 
-    # 再来一晚好觉 → 还清
-    second = at + 30 * 3600
-    state.activity = A.SLEEP
-    state.sleep_started_at = second
-    state.last_tick_at = second
-    state.sleep_minutes_today = 0
-    S.settle(state, now=second + 8 * 3600, config=cfg(), events=[], rng=random.Random(1))
-    S.apply_activity(
-        state,
-        A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
-        now=second + 8 * 3600,
-        config=cfg(),
-    )
-    assert state.sleep_debt_nights == 0
 
-    # 旧行为：step=0 = 一晚直接清零
-    legacy = make_state(at=at, activity=A.SLEEP, sleep_started_at=at, sleep_debt_nights=2)
-    S.settle(legacy, now=at + 8 * 3600, config=cfg(sleep_debt_recovery_step=0), events=[], rng=random.Random(1))
-    S.apply_activity(
-        legacy,
-        A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
-        now=at + 8 * 3600,
-        config=cfg(sleep_debt_recovery_step=0),
-    )
-    assert legacy.sleep_debt_nights == 0
+def test_sleep_deficit_is_undefined_while_records_are_short():
+    """升级后的头 72 小时记录不足 ⇒ 不出欠债结论、不压上限（不拿残缺数据硬算）。"""
+
+    at = ts(2026, 2, 8, 4, 0)
+    config = cfg()
+    state = make_state(at=at, activity=A.DAILY, sleep_tracking_since=at - 20 * 3600)
+    S._add_sleep_interval(state, start=at - 12 * 3600.0, end=at - 4 * 3600.0)
+
+    deficit, reason = S.sleep_deficit_minutes(state, now=at, config=config)
+    assert deficit is None and "记录" in reason
+    S._refresh_energy_cap(state, now=at, config=config)
+    assert state.energy_cap == pytest.approx(10.0)
+    assert "睡眠记录不足" in S.health_label(state, at, config)
 
 
 def test_sleep_debt_ignores_life_day_boundary():
@@ -200,47 +212,57 @@ def test_sleep_debt_ignores_life_day_boundary():
 
 
 def test_three_sleepless_nights_lower_energy_cap():
-    """连续三次「最近 24 小时睡眠不足」⇒ 体力上限被压到 8.5。"""
+    """窗口内累计缺觉达到三晚 ⇒ 生活日边界把体力上限压到 8.5（按时间口径）。"""
 
     config = cfg()
-    state = make_state(at=ts(2026, 2, 8, 12, 5), activity=A.DAILY)
-    for index in range(3):
-        start = ts(2026, 2, 8 + index, 12, 5)
-        state.activity = A.SLEEP
-        state.sleep_started_at = start
-        state.energy = 9.5
-        S.settle(state, now=start + 3600, config=config, events=[], rng=random.Random(1))
-        S.apply_activity(
-            state,
-            A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
-            now=start + 3600,
-            config=config,
-        )
-    assert state.sleep_debt_nights == 3
+    at = ts(2026, 2, 8, 11, 55)  # 跨 12:00 生活日边界
+    state = make_state(at=at, activity=A.DAILY, energy=9.5,
+                       sleep_tracking_since=at - 3 * 86400)
+    for end in (at - 12 * 3600.0, at - 36 * 3600.0, at - 60 * 3600.0):
+        S._add_sleep_interval(state, start=end - 3600.0, end=end)
+
+    nights, _ = S.sleep_deficit_nights(state, now=at, config=config)
+    assert nights is not None and nights >= 3.0
+    S.settle(state, now=at + 600, config=config, events=[], rng=random.Random(1))
+    assert state.day_key == "2026-02-08"
     assert state.energy_cap == pytest.approx(8.5)
     assert state.energy <= 8.5
 
 
-def test_sleep_debt_threshold_is_configurable():
-    strict = cfg(sleep_debt_threshold_minutes=480)
+def test_sleep_debt_threshold_scales_the_night_size():
+    """``sleep_debt_threshold_minutes`` 现在只决定「一晚缺多少分钟」，不再判熬夜。
+
+    同样缺 3 小时：默认阈值（8h − 5h = 3h/晚）刚好一晚，不压上限；
+    阈值 480 分钟（8h − 8h → 下限 30 分钟/晚）就是六晚，立刻压上限。
+    """
+
     at = ts(2026, 2, 8, 4, 0)
-    state = make_state(at=at, activity=A.SLEEP, sleep_started_at=at)
-    S.settle(state, now=at + 7 * 3600, config=strict, events=[], rng=random.Random(1))
-    S.apply_activity(
-        state,
-        A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
-        now=at + 7 * 3600,
-        config=strict,
-    )
-    assert state.sleep_debt_nights == 1  # 420 分钟 < 480 分钟
+    state = make_state(at=at, activity=A.DAILY, sleep_tracking_since=at - 3 * 86400)
+    for end in (at - 54 * 3600.0, at - 30 * 3600.0, at - 6 * 3600.0):
+        S._add_sleep_interval(state, start=end - 7 * 3600.0, end=end)
+
+    assert S._deficit_night_minutes(cfg()) == 180.0
+    assert S._deficit_night_minutes(cfg(sleep_debt_threshold_minutes=480)) == 30.0
+
+    assert S.sleep_deficit_nights(state, now=at, config=cfg()) == (1.0, "")
+    strict = cfg(sleep_debt_threshold_minutes=480)
+    assert S.sleep_deficit_nights(state, now=at, config=strict) == (6.0, "")
+
+    S._refresh_energy_cap(state, now=at, config=cfg())
+    assert state.energy_cap == pytest.approx(10.0)
+    S._refresh_energy_cap(state, now=at, config=strict)
+    assert state.energy_cap == pytest.approx(8.5)
 
 
 def test_split_sleep_within_24h_is_counted_together():
-    """拆成两段睡（3 小时 + 3 小时）在滑动窗口下合起来算，最终不记熬夜。"""
+    """拆成两段睡（3 小时 + 3 小时）在时间口径下合起来算：缺觉只剩 2 小时。"""
 
-    config = cfg()
+    config = cfg(sleep_deficit_window_hours=24, offline_gap_minutes=0)
     first = ts(2026, 10, 2, 2, 0)
-    state = make_state(at=first, activity=A.SLEEP, sleep_started_at=first)
+    state = make_state(
+        at=first, activity=A.SLEEP, sleep_started_at=first,
+        sleep_tracking_since=first - 86400,
+    )
     S.settle(state, now=first + 3 * 3600, config=config, events=[], rng=random.Random(1))
     S.apply_activity(
         state,
@@ -248,11 +270,16 @@ def test_split_sleep_within_24h_is_counted_together():
         now=first + 3 * 3600,
         config=config,
     )
-    assert state.sleep_debt_nights == 1, "第一段只有 3 小时，先记一笔"
+    assert state.sleep_debt_nights == 0, "旧「醒来记一晚」不再发生"
 
     second = first + 6 * 3600
-    state.activity = A.SLEEP
-    state.sleep_started_at = second
+    S.settle(state, now=second, config=config, events=[], rng=random.Random(1))
+    S.apply_activity(
+        state,
+        A.ActivityDecision(activity=A.SLEEP, source=A.SOURCE_LLM),
+        now=second,
+        config=config,
+    )
     S.settle(state, now=second + 3 * 3600, config=config, events=[], rng=random.Random(1))
     S.apply_activity(
         state,
@@ -260,7 +287,12 @@ def test_split_sleep_within_24h_is_counted_together():
         now=second + 3 * 3600,
         config=config,
     )
-    assert state.sleep_debt_nights == 0, "两段合计 6 小时 ≥ 5，归零"
+
+    now = second + 3 * 3600
+    assert S.sleep_in_window(state, now=now, hours=24) == 6 * 60
+    assert S.sleep_deficit_minutes(state, now=now, config=config) == (2 * 60, "")
+    restored = S.LifeState.from_dict(state.to_dict())
+    assert restored.sleep_ledger == state.sleep_ledger, "账本必须能原样落盘恢复"
 
 
 # ---------------------------------------------------------------- 体力
@@ -593,7 +625,14 @@ def test_recent_event_tiers_survive_hostile_state():
 def test_cold_roll_can_trigger_and_is_bounded():
     at = ts(2026, 2, 8, 2, 5)
     state = make_state(at=at, activity=A.DAILY)
-    config = cfg(cold_base_risk=1.0, cold_min_days=1, cold_max_days=3)
+    # 这是“高风险必然触发”的机制测试，显式放开 v1.25.0 的默认 20% 日上限；
+    # 正常配置仍受 cold_daily_risk_cap 保护。
+    config = cfg(
+        cold_base_risk=1.0,
+        cold_min_days=1,
+        cold_max_days=3,
+        cold_daily_risk_cap=0.95,
+    )
     S.settle(state, now=at + 600, config=config, events=[], rng=random.Random(4))
     assert S.is_cold(state, at + 600) is True
     assert 1 <= state.cold_days <= 3
@@ -621,8 +660,13 @@ def test_cold_roll_happens_once_per_day():
 
 def test_health_label_reflects_state():
     at = ts(2026, 2, 8, 14, 0)
-    healthy = make_state(at=at, activity=A.DAILY)
-    assert S.health_label(healthy, at, cfg()) == "健康"
+    fresh = make_state(at=at, activity=A.DAILY)
+    assert "睡眠记录不足" in S.health_label(fresh, at, cfg()), "没有记录就不许假装健康"
+
+    enough = make_state(at=at, activity=A.DAILY, sleep_tracking_since=at - 3 * 86400)
+    for end in (at - 54 * 3600.0, at - 30 * 3600.0, at - 6 * 3600.0):
+        S._add_sleep_interval(enough, start=end - 8 * 3600.0, end=end)
+    assert S.health_label(enough, at, cfg()) == "健康"
 
     # v1.14.0：精确口径（状态卡）给出阶段 + 第几天 + 剩余小时
     cold = make_state(
@@ -635,8 +679,71 @@ def test_health_label_reflects_state():
     prompt = S.health_label_prompt(cold, at, cfg())
     assert "第 2 天" in prompt and "小时" not in prompt and "约剩" not in prompt
 
-    deprived = make_state(at=at, activity=A.DAILY, sleep_debt_nights=3)
-    assert "熬夜" in S.health_label(deprived, at, cfg())
+    deprived = make_state(at=at, activity=A.DAILY, sleep_tracking_since=at - 3 * 86400)
+    for end in (at - 54 * 3600.0, at - 30 * 3600.0, at - 6 * 3600.0):
+        S._add_sleep_interval(deprived, start=end - 5 * 3600.0, end=end)
+    text = S.health_label(deprived, at, cfg())
+    assert "累计缺觉" in text and "9.0 小时" in text
+    assert "体力上限被压低到 8.5" in text
+
+
+# ---------------------------------------------------------------- 感冒风险合成（v1.25.0）
+
+
+def test_cold_daily_risk_separates_sleep_debt_and_low_energy():
+    config = cfg(
+        cold_base_risk=0.01,
+        cold_sleep_debt_risk=0.03,
+        cold_low_energy_risk=0.04,
+        cold_daily_risk_cap=0.20,
+    )
+    assert S.cold_daily_risk(
+        config, sleep_debt_nights=0, low_energy=False
+    ) == pytest.approx(0.01)
+    assert S.cold_daily_risk(
+        config, sleep_debt_nights=2, low_energy=False
+    ) == pytest.approx(0.07)
+    assert S.cold_daily_risk(
+        config, sleep_debt_nights=0, low_energy=True
+    ) == pytest.approx(0.05)
+    assert S.cold_daily_risk(
+        config, sleep_debt_nights=2, low_energy=True
+    ) == pytest.approx(0.11)
+
+
+def test_cold_daily_risk_caps_after_season_and_ignores_nonfinite():
+    config = cfg(
+        cold_base_risk=0.10,
+        cold_sleep_debt_risk=0.05,
+        cold_low_energy_risk=0.05,
+        cold_daily_risk_cap=0.12,
+    )
+    # 原始 0.30，先乘季节 1.5，再由日上限压到 0.12。
+    assert S.cold_daily_risk(
+        config, sleep_debt_nights=3, low_energy=True, month_factor=1.5
+    ) == pytest.approx(0.12)
+    assert S.cold_daily_risk(
+        config, sleep_debt_nights=float("nan"), low_energy=False, month_factor=0.0
+    ) == pytest.approx(0.0)
+    wide = cfg(
+        cold_base_risk=0.10,
+        cold_sleep_debt_risk=0.05,
+        cold_low_energy_risk=0.05,
+        cold_daily_risk_cap=0.95,
+    )
+    assert S.cold_daily_risk(
+        wide, sleep_debt_nights=1, low_energy=False, month_factor=float("inf")
+    ) == pytest.approx(wide.cold_base_risk + wide.cold_sleep_debt_risk)
+
+
+def test_cold_risk_defaults_match_the_occasional_illness_budget():
+    config = S.SimConfig()
+    assert config.cold_base_risk == pytest.approx(0.012)
+    assert config.cold_sleep_debt_risk == pytest.approx(0.03)
+    assert config.cold_low_energy_risk == pytest.approx(0.03)
+    assert config.cold_daily_risk_cap == pytest.approx(0.20)
+    assert config.cold_immunity_days == 7
+    assert config.cold_convalescent_factor == pytest.approx(0.75)
 
 
 # ---------------------------------------------------------------- 病程（v1.14.0）
@@ -681,14 +788,18 @@ def test_cold_stage_rest_score_flows_forward_and_backward():
     config = cfg()
 
     # 睡够 + 在养病 ⇒ 休息分 2 ⇒ 向好（初起直接跳好转）
-    good = _cold_state(at)
+    good = _cold_state(at, sleep_tracking_since=at - 3 * 86400)
+    for end in (at - 30 * 3600.0, at - 6 * 3600.0, at + 18 * 3600.0):
+        S._add_sleep_interval(good, start=end - 8 * 3600.0, end=end)
     S.settle_cold_stage(good, now=at + 86400, config=config, rng=random.Random(1))
     assert good.cold_stage == A.COLD_RECOVERING
     assert good.cold_until < at + 3 * 86400.0, "向好应当小幅提前预期痊愈时刻"
     assert any("退烧" in item["label"] for item in good.recent_events)
 
-    # 熬夜 + 体力过低 ⇒ 向坏
-    bad = _cold_state(at, sleep_debt_nights=2, energy=1.0)
+    # 缺觉（时间口径）+ 体力过低 ⇒ 向坏
+    bad = _cold_state(at, energy=1.0, sleep_tracking_since=at - 3 * 86400)
+    for end in (at - 60 * 3600.0, at - 36 * 3600.0, at - 12 * 3600.0):
+        S._add_sleep_interval(bad, start=end - 3600.0, end=end)
     S.settle_cold_stage(bad, now=at + 86400, config=config, rng=random.Random(1))
     assert bad.cold_stage == A.COLD_WORSENING
     assert bad.cold_until > at + 3 * 86400.0, "向坏应当小幅推后预期痊愈时刻"
@@ -747,6 +858,11 @@ def test_cold_heals_into_convalescence_and_immunity():
     config = cfg(cold_immunity_days=5, cold_convalescent_hours=24)
     state = _cold_state(at, stage=A.COLD_RECOVERING, days=1)
     S.finish_cold(state, now=at + 86400, config=config)
+    later = at + 86400 + 25 * 3600
+    # 新模型下「健康」要先有足够的睡眠记录：补三晚满觉，别让「记录不足」冒充缺觉
+    state.sleep_tracking_since = later - 4 * 86400
+    for end in (later - 54 * 3600.0, later - 30 * 3600.0, later - 6 * 3600.0):
+        S._add_sleep_interval(state, start=end - 8 * 3600.0, end=end)
     assert state.cold_stage == "" and state.cold_until == 0.0
     assert state.cold_immunity_until == at + 86400 + 5 * 86400.0
     assert S.in_convalescence(state, at + 86400 + 3600) is True
@@ -756,7 +872,6 @@ def test_cold_heals_into_convalescence_and_immunity():
     assert "余韵" in S.health_label_admin(state, at + 86400 + 3600, config)
     assert any("好了" in item["label"] for item in state.recent_events)
     # 余韵过后回到健康——但免疫期还剩几天（状态卡要能看到，否则「她怎么又不病」无从解释）
-    later = at + 86400 + 25 * 3600
     assert S.in_convalescence(state, later) is False
     assert "免疫期" in S.health_label_admin(state, later, config)
     assert S.health_label_prompt(state, later, config) == "健康"
@@ -803,7 +918,11 @@ def test_season_factor_scales_the_risk():
     for month_factor, expected in ((0.0, False), (8.0, True)):
         state = make_state(at=at, activity=A.DAILY)
         config = replace(
-            cfg(cold_base_risk=0.2, cold_sleep_debt_risk=0.0),
+            cfg(
+                cold_base_risk=0.2,
+                cold_sleep_debt_risk=0.0,
+                cold_daily_risk_cap=0.95,
+            ),
             cold_season_factors={"2": month_factor},
         )
         S.settle(state, now=at + 600, config=config, events=[], rng=random.Random(99))
@@ -1165,14 +1284,15 @@ def test_sleep_cap_holds_across_the_day_boundary():
     """
 
     for label, set_activity_since in (("regular", True), ("stale activity_since=0", False)):
-        # energy_full_wake 在本用例里关掉：这里钉的是「12 小时上限跨生活日边界仍然
-        # 生效」这一条回归；体力满提前醒是另一条行为（见 test_energy_full_wake_*）。
-        config = cfg(day_boundary_hour=12, max_sleep_hours=12.0, energy_full_wake=False)
+        # 困意拉满（睡着时按 0.058/h 消退，12 小时只降到 0.30）⇒ 自然醒不会先发生，
+        # 这里钉的是「12 小时上限跨生活日边界仍然生效」这一条兜底。
+        config = cfg(day_boundary_hour=12, max_sleep_hours=12.0)
         start = ts(2026, 1, 1, 3, 0)
         state = S.LifeState()
         state.activity = A.SLEEP
         state.sleep_started_at = start
         state.last_tick_at = start
+        state.sleep_need = 1.0
         if set_activity_since:
             state.activity_since = start
         state.day_key = S.day_key_of(S.local_datetime(start, TZ), 12)
@@ -1193,8 +1313,8 @@ def test_sleep_cap_holds_across_the_day_boundary():
         assert slept == pytest.approx(12.0, abs=0.2), f"{label}: 连续睡了 {slept:.1f} 小时"
 
 
-def test_energy_full_wake_fires_before_the_sleep_cap():
-    """体力回满（且睡满最短时长）就先醒，不等 12 小时上限（energy_full_wake 默认开）。"""
+def test_natural_wake_fires_before_the_sleep_cap():
+    """困意退到醒来阈以下（且睡满最短时长）就自然醒，不等 12 小时上限。"""
 
     config = cfg(day_boundary_hour=12, max_sleep_hours=12.0)
     start = ts(2026, 1, 1, 3, 0)
@@ -1203,6 +1323,7 @@ def test_energy_full_wake_fires_before_the_sleep_cap():
     state.sleep_started_at = start
     state.activity_since = start
     state.last_tick_at = start
+    state.sleep_need = 0.30
     state.day_key = S.day_key_of(S.local_datetime(start, TZ), 12)
 
     woke = None
@@ -1414,15 +1535,16 @@ def test_settle_offline_gap_can_be_disabled():
 
 
 def test_sleep_ledger_prunes_and_roundtrips():
-    """账本要能落盘恢复，并且只留与 24 小时窗口还有交集的条目。"""
+    """账本要能落盘恢复，且超出保留期（192 小时，长于 72 小时欠债窗口）的条目被裁掉。"""
 
-    at = ts(2026, 10, 2, 8, 0)
+    at = ts(2026, 10, 8, 8, 0)
     state = make_state(at=at, activity=A.DAILY)
-    S.record_sleep_episode(state, now=at, minutes=300)
-    S.record_sleep_episode(state, now=at + 26 * 3600, minutes=420)
+    S._add_sleep_interval(state, start=at - 200 * 3600.0, end=at - 197 * 3600.0)
+    S._add_sleep_interval(state, start=at - 7 * 3600.0, end=at)
+    S._trim_sleep_ledger(state, now=at)
 
-    assert len(state.sleep_ledger) == 1, "旧条目该被清掉"
-    assert S.sleep_in_window(state, now=at + 26 * 3600) == 420
+    assert len(state.sleep_ledger) == 1, "200 小时前的条目该被清掉"
+    assert S.sleep_in_window(state, now=at) == 420
     restored = S.LifeState.from_dict(state.to_dict())
     assert restored.sleep_ledger == state.sleep_ledger
 
@@ -1430,36 +1552,88 @@ def test_sleep_ledger_prunes_and_roundtrips():
 def test_sleep_in_window_counts_overlap_only():
     at = ts(2026, 10, 2, 8, 0)
     state = make_state(at=at, activity=A.DAILY)
-    S.record_sleep_episode(state, now=at - 2 * 3600, minutes=120)   # 04:00→06:00
-    S.record_sleep_episode(state, now=at, minutes=300)              # 03:00→08:00
+    S._add_sleep_interval(state, start=at - 5 * 3600.0, end=at)              # 03:00→08:00
+    S._add_sleep_interval(state, start=at - 4 * 3600.0, end=at - 2 * 3600.0)  # 04:00→06:00（内含）
 
-    assert S.sleep_in_window(state, now=at) == 420
+    assert S.sleep_in_window(state, now=at) == 300
     assert S.sleep_in_window(state, now=at, hours=1.0) == 60, "只算 07:00→08:00 的交集"
 
 
-def test_two_nights_a_day_apart_do_not_stack():
-    """回归（探针实拍）：相邻两夜只隔约 24 小时，窗口不能把上一夜整段算进来。
+def test_sleep_ledger_keeps_all_episodes_in_window():
+    at = ts(2026, 10, 2, 8, 0)
+    state = make_state(at=at, activity=A.DAILY)
+    S._add_sleep_interval(state, start=at - 360 * 60.0, end=at)
+    for index in range(1, 9):
+        end = at + index * 20 * 60
+        S._add_sleep_interval(state, start=end - 10 * 60.0, end=end)
+    assert len(state.sleep_ledger) == 9, "不再有 8 段的截断"
+    assert S.sleep_in_window(state, now=at + 160 * 60) == 440
 
-    错误写法会把「上一夜 + 这一夜」相加，于是每天只睡 4 小时的人显示 8 小时、
-    熬夜永远攒不出来（错误结果 1/0/0，正确应为 1/2/3）。
+
+def test_sleep_ledger_preserves_gaps_and_merges_adjacent_seconds():
+    state = S.LifeState.from_dict({"sleep_ledger": [
+        {"start": 0, "end": 60},
+        {"start": 120, "end": 180},
+        {"start": 180, "end": 240},
+    ]})
+    assert len(state.sleep_ledger) == 2, "首尾相接（间隔 ≤1 秒）必须合并成一觉"
+    assert state.sleep_ledger[1]["start"] == 120 and state.sleep_ledger[1]["end"] == 240
+    assert S.sleep_in_window(state, now=240) == 3
+    assert S.sleep_in_window(state, now=240, hours=0) == 0
+    assert S.sleep_in_window(state, now=150) == 2
+
+
+def test_sleep_ledger_duplicate_and_overlapping_records_are_idempotent():
+    at = ts(2026, 10, 2, 8, 0)
+    state = make_state(at=at, activity=A.DAILY)
+    for start in (at - 7200.0, at - 7200.0, at - 3600.0):
+        S._add_sleep_interval(state, start=start, end=at)
+    assert S.sleep_in_window(state, now=at) == 120
+    assert len(state.sleep_ledger) == 1
+    restored = S.LifeState.from_dict(state.to_dict())
+    assert restored.sleep_ledger == state.sleep_ledger
+    assert S.sleep_in_window(restored, now=at, hours=1) == 60
+
+
+@pytest.mark.parametrize("bad", [
+    {}, {"start": 1000}, {"end": 2000},
+    {"start": 2000, "end": 1000}, {"start": 1000, "end": 1000},
+    {"start": -1000, "end": 2000}, {"start": True, "end": 2000},
+    {"start": 1000, "end": float("inf")},
+    {"start": 1000, "end": 10 ** 1000},
+])
+def test_sleep_ledger_recovery_rejects_invalid_intervals(bad):
+    good = {"start": 1000.0, "end": 4600.0, "minutes": 60}
+    state = S.LifeState.from_dict({"sleep_ledger": [bad, good]})
+    assert state.sleep_ledger == [good]
+    assert S.sleep_in_window(state, now=4600.0) == 60
+
+
+def test_state_recovery_ignores_object_attributes():
+    state = S.LifeState.from_dict({"__dict__": {}, "energy": 7.0, "to_dict": {}})
+    assert state.energy == 7.0
+    assert state.sleep_ledger == []
+    assert state.to_dict()["energy"] == 7.0
+
+
+def test_two_nights_a_day_apart_do_not_stack():
+    """回归（探针实拍）：相邻两夜只隔约 24 小时，窗口不能把上一夜整段重复算进来。
+
+    每天只睡 4 小时的人，72 小时窗口里的实际睡眠必须是 12 小时（不是 24 小时），
+    缺觉 12 小时 = 四晚，上限被压到 8.5。
     """
 
     config = cfg()
-    state = make_state(at=ts(2026, 10, 2, 4, 0), activity=A.DAILY)
-    debts = []
-    for index in range(3):
-        start = ts(2026, 10, 2 + index, 4, 0)
-        state.activity = A.SLEEP
-        state.sleep_started_at = start
-        S.settle(state, now=start + 4 * 3600, config=config, events=[], rng=random.Random(1))
-        S.apply_activity(
-            state,
-            A.ActivityDecision(activity=A.DAILY, source=A.SOURCE_LLM),
-            now=start + 4 * 3600,
-            config=config,
-        )
-        debts.append(state.sleep_debt_nights)
-    assert debts == [1, 2, 3], debts
+    now = ts(2026, 10, 4, 8, 0)
+    state = make_state(at=now, activity=A.DAILY, sleep_tracking_since=now - 3 * 86400)
+    for end in (now - 60 * 3600.0, now - 36 * 3600.0, now - 12 * 3600.0):
+        S._add_sleep_interval(state, start=end - 4 * 3600.0, end=end)
+
+    assert S.sleep_in_window(state, now=now, hours=72) == 12 * 60
+    deficit, reason = S.sleep_deficit_minutes(state, now=now, config=config)
+    assert reason == "" and deficit == 12 * 60
+    assert S.sleep_deficit_nights(state, now=now, config=config) == (4.0, "")
+    S._refresh_energy_cap(state, now=now, config=config)
     assert state.energy_cap == pytest.approx(8.5)
 
 
@@ -1483,8 +1657,12 @@ def test_corrupt_sleep_ledger_entries_are_dropped():
     assert S.sleep_in_window(state, now=end) == 300
 
 
-def test_wake_without_anchor_falls_back_to_day_total():
-    """旧状态没有 sleep_started_at 时，用当日累计判一次，并且不进账本（避免重复计）。"""
+def test_wake_without_anchor_does_not_invent_ledger_entries():
+    """旧状态没有 ``sleep_started_at``：醒来时**不许**凭当日累计补一笔账。
+
+    账本只认 ``settle`` 实际结算过的区间。按「当日已睡 100 分钟」反推一段睡眠，
+    会同时造出跨停机间隙的假区间并和逐步记账重复计数（v1.24.0 的真实故障机理）。
+    """
 
     at = ts(2026, 2, 8, 4, 0)
     state = make_state(at=at, activity=A.SLEEP, sleep_started_at=0.0, sleep_minutes_today=100)
@@ -1494,8 +1672,9 @@ def test_wake_without_anchor_falls_back_to_day_total():
         now=at + 600,
         config=cfg(),
     )
-    assert state.sleep_debt_nights == 1
-    assert state.sleep_ledger == [], "兜底路径不计账本"
+    assert state.sleep_ledger == [], "旧锚点兜底不许写账本"
+    assert state.sleep_debt_nights == 0
+    assert state.continuous_awake_minutes == 0
 
 
 # ---------------------------------------------------------------- 提示词里的「选择影响」事实
@@ -1519,12 +1698,13 @@ def test_effect_lines_track_config():
     """
 
     text = _effects()
-    # 体力表（settle 用的同一张）、睡眠上限、熬夜阈值、体力上限、情绪参数
+    # 体力表（settle 用的同一张）、睡眠上限、缺觉口径、体力上限、情绪参数
     assert "睡觉 +1.20" in text
     assert "打游戏 -0.70" in text
     assert "深夜做题 -1.20" in text
-    assert "12 小时" in text
-    assert "低于 5 小时" in text
+    assert "单次连续睡眠到 12 小时" in text
+    assert "每晚会 3 小时" in text
+    assert "记录不足时不会声称缺觉" in text
     assert "8.5" in text
     assert "0.20/10 分钟" in text
     assert "40%" in text
@@ -1532,7 +1712,6 @@ def test_effect_lines_track_config():
     # 反向：整份配置换一套，行文必须整体跟着变
     changed = S.SimConfig(
         max_sleep_hours=9.0,
-        min_awake_hours_per_day=6.0,
         sleep_debt_threshold_minutes=240,
         sleep_deprived_energy_cap=7.5,
         cold_base_risk=0.5,
@@ -1546,8 +1725,7 @@ def test_effect_lines_track_config():
     )
     assert "睡觉 +2.00" in other and "工作 -3.00" in other
     assert "9 小时" in other and "12 小时" not in other
-    assert "6 小时" in other
-    assert "低于 4 小时" in other
+    assert "每晚会 4 小时" in other
     assert "7.5" in other
     assert "5:00" in other and "50%" in other
     assert "0.50/10 分钟" in other and "90%" in other
@@ -1572,11 +1750,9 @@ def test_effect_lines_state_the_at_wake_and_money_facts():
         S.activity_effect_lines(scheduled, activity_factors={A.SLEEP: 0.0})
     )
 
-    # ④ 体力满立刻唤醒关掉时，不该再声称「回到上限就立刻醒」
-    no_auto = S.SimConfig(energy_full_wake=False)
-    assert "立刻醒" not in "\n".join(
-        S.activity_effect_lines(no_auto, activity_factors={A.SLEEP: 0.0})
-    )
+    # ④ 体力回满不再等于睡够——这句话必须在，否则模型会按旧因果催刚回血的她起床
+    assert "回满也不代表睡够了" in _effects()
+    assert "困意" in _effects(), "睡不睡由困意决定要写明"
 
 
 def test_effect_lines_quote_the_activity_factor_range_not_a_hardcoded_one():
@@ -1651,16 +1827,15 @@ def test_fatigue_ramp_makes_a_quiet_day_actually_tired():
     assert old.energy - new.energy > 3.0, "差距必须显著，否则这条机制等于没生效"
 
 
-def test_quiet_day_now_ends_in_sleep_without_the_sleep_window():
-    """行为验收（M1）：困意由身体驱动——把睡眠窗口关掉她照样会睡着。
+def test_quiet_day_now_ends_in_sleep_without_any_hard_window():
+    """行为验收（M1）：困意由身体驱动——**没有任何硬性睡眠时段**她也会睡着。
 
-    这样才证明她是因为**累**睡的，而不是被窗口拖上床的。
+    v1.24.0 起 ``sleep_window`` 已退役，这里直接把最闲的一条路走 24 小时：
+    只靠 ``sleep_need`` 累积 + 昼夜节律就到入睡阈，证明她是因为**困**睡的。
     """
 
     at = ts(2026, 2, 8, 8, 0)
-    config = cfg(fatigue_ramp_curve=RAMP_CURVE, sleep_window=(0, 0))
-    assert not A.in_window(at_minutes := 8 * 60, config.sleep_window)
-
+    config = cfg(fatigue_ramp_curve=RAMP_CURVE)
     state = make_state(at=at, activity=A.DAZE, energy=8.0)
     slept_at = None
     for step in range(1, 25 * 6 + 1):
@@ -1671,28 +1846,23 @@ def test_quiet_day_now_ends_in_sleep_without_the_sleep_window():
             slept_at = now
             break
 
-    assert slept_at is not None, f"连续发呆一整天也睡不着（{at_minutes} 起算）"
+    assert slept_at is not None, "连续发呆一整天也睡不着 = 困意没有驱动入睡"
     assert slept_at - at <= 24 * 3600
-    # 睡着时**不算疲劳**（躺着是回血），计数也冻结着；醒来才清零
-    assert state.continuous_awake_minutes > 0
+    assert state.sleep_need >= (
+        config.sleep_need_onset - config.sleep_circadian_strength - 1e-9
+    ), "睡着那一刻困意确实到位了（节律最多帮她 ±strength）"
+    # 入睡这一刻连续清醒就归零（这段清醒到此结束）；睡着期间由 settle 的
+    # asleep 分支保证不再累积
+    assert state.continuous_awake_minutes == 0
     S.apply_activity(
         state, A.ActivityDecision(A.DAILY, source=A.SOURCE_LLM),
         now=slept_at + 600, config=config,
     )
     assert state.continuous_awake_minutes == 0, "一觉结束就该重新起算"
 
-    # 旧行为：同一条路走 30 小时也睡不着（体力只由活动表驱动）
-    old_config = cfg(sleep_window=(0, 0))
-    old = make_state(at=at, activity=A.DAZE, energy=8.0)
-    for step in range(1, 30 * 6 + 1):
-        now = at + 600 * step
-        S.settle(old, now=now, config=old_config, events=(), rng=random.Random(1))
-        S.enforce_and_apply(old, now=now, config=old_config, decision=None)
-    assert not S.is_asleep(old.activity), "关掉曲线就该保持旧行为（永远不累）"
 
-
-def test_continuous_awake_minutes_survive_the_day_boundary_but_not_a_nap():
-    """连续清醒是**跨生活日**的量：12:00 边界不清零，睡一觉才清零。"""
+def test_continuous_awake_minutes_survive_the_day_boundary_and_reset_on_sleep():
+    """连续清醒是**跨生活日**的量：12:00 边界不清零，进入睡眠（含小睡）才清零。"""
 
     at = ts(2026, 2, 8, 10, 0)  # 跨 12:00 边界
     state = make_state(at=at, activity=A.DAILY, energy=8.0)
@@ -1701,16 +1871,14 @@ def test_continuous_awake_minutes_survive_the_day_boundary_but_not_a_nap():
     assert state.awake_minutes_today < 240, "当日计数器在 12:00 被清零了"
     assert state.continuous_awake_minutes == 240, "连续清醒不该被边界切断"
 
-    # 一觉结束（醒来）才清零：刚睡下不算，否则「睡到一半的疲劳」会被凭空抹平
+    # v1.24.0：一进睡眠（含小睡）这段连续清醒就结束——她确实停下来休息了。
+    # 醒来后再从头累积；「睡着期间冻结」由 settle 的 asleep 分支保证。
     S.apply_activity(
         state, A.ActivityDecision(A.NAP, source=A.SOURCE_LLM), now=at + 4 * 3600, config=cfg()
     )
-    assert state.continuous_awake_minutes == 240, "睡下那一刻还在累（睡着期间冻结）"
-    S.apply_activity(
-        state, A.ActivityDecision(A.DAILY, source=A.SOURCE_LLM),
-        now=at + 4 * 3600 + 1800, config=cfg(),
-    )
-    assert state.continuous_awake_minutes == 0, "小睡醒来同样重新起算"
+    assert state.continuous_awake_minutes == 0, "进入睡眠即结束这一段连续清醒"
+    S.settle(state, now=at + 4 * 3600 + 1800, config=cfg(), events=[], rng=random.Random(1))
+    assert state.continuous_awake_minutes == 0, "睡着期间不再累积"
 
 
 def test_offline_gap_neither_grows_nor_resets_the_awake_counter():

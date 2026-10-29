@@ -89,6 +89,7 @@ class CatchupHostMixin:
         self._catchup_queue: list[tuple[float, str]] = []
         #: 错开执行的后台任务。同一时刻只保留一个，避免两次睡醒叠出两条并发链。
         self._catchup_task: Any = None
+        self._catchup_generation: int = 0
         #: person_id → 已注入过的行 id 上界（防止每轮回复都重复提同一句）
         self._catchup_injected: dict[str, int] = {}
         #: person_id → 最近几条原文的内存镜像（回复侧注入是同步路径，不能读库）
@@ -273,6 +274,11 @@ class CatchupHostMixin:
         if not rules.enabled or self._routine_store is None:
             self._catchup_pending_wake = False
             return
+        if (self._stopping or not self.config.plugin.enabled or self._is_paused()
+                or is_asleep(self._state.activity)):
+            return
+        if self._catchup_task is not None and not self._catchup_task.done():
+            return
 
         armed = bool(self._catchup_pending_wake)
         self._catchup_pending_wake = False
@@ -281,10 +287,14 @@ class CatchupHostMixin:
         if not armed and not first_scan:
             return
 
+        generation = self._catchup_generation
         store = self._routine_store
         retention = max(0.0, float(rules.retention_hours)) * 3600.0
         since = (float(now) - retention) if retention > 0.0 else 0.0
         rows = await asyncio.to_thread(store.pending_sleep_sessions, since=since)
+        if generation != self._catchup_generation:
+            self._module_log("debug", "%s 补答扫描期间配置或生命周期变化，放弃旧结果", _PLUGIN_TAG)
+            return
         if not rows:
             return
 
@@ -298,6 +308,9 @@ class CatchupHostMixin:
         for row in rows:
             person_id = str(row.get("person_id") or "")
             entries = await asyncio.to_thread(store.peek_sleep_backlog, person_id, limit=50)
+            if generation != self._catchup_generation:
+                self._module_log("debug", "%s 补答扫描期间配置或生命周期变化，放弃旧结果", _PLUGIN_TAG)
+                return
             if not entries:
                 continue
             merged = catchup_merge_entries(entries, keep=max(1, int(rules.keep_per_person)))
@@ -382,14 +395,29 @@ class CatchupHostMixin:
         未执行的偏移（条目仍在库里，下次启动扫描会重排），这是刻意的取舍。
         """
 
+        if self._stopping:
+            return
+        if self._catchup_task is not None and not self._catchup_task.done():
+            self._catchup_pending_wake = True
+            self._module_log("debug", "%s 上批补答仍在执行，本次留待下轮重排", _PLUGIN_TAG)
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
+            self._module_log("warning", "%s 补答后台任务无法启动：%s", _PLUGIN_TAG, exc)
+            return
+        started = time.monotonic()
+
         async def runner() -> None:
             for offset, candidate in planned:
-                if offset > 0:
-                    try:
-                        await asyncio.sleep(float(offset))
-                    except asyncio.CancelledError:
-                        raise
-                if not self.config.plugin.enabled or self._is_paused():
+                delay = started + float(offset) - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                rules = self._catchup_rules()
+                if (self._stopping or not self.config.plugin.enabled or self._is_paused()
+                        or is_asleep(self._state.activity)
+                        or not rules.enabled or not rules.active_enabled):
+                    self._module_log("debug", "%s 补答条件已变化，未处理条目留在积压库", _PLUGIN_TAG)
                     return
                 try:
                     await self._catchup_trigger(
@@ -400,10 +428,24 @@ class CatchupHostMixin:
                         "%s 补答触发失败 session=%s：%s", _PLUGIN_TAG, candidate.session_id, exc
                     )
 
+        self._catchup_task = loop.create_task(runner())
+
+    async def _cancel_catchup_flush(self) -> None:
+        self._catchup_generation += 1
+        task = self._catchup_task
+        if task is None:
+            return
+        task.cancel()
         try:
-            self._catchup_task = asyncio.create_task(runner())
-        except RuntimeError as exc:  # 没有运行中的事件循环（测试/直跑）
-            self._module_log("debug", "%s 补答后台任务无法启动：%s", _PLUGIN_TAG, exc)
+            await task
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+        except Exception as exc:
+            self._module_log("warning", "%s 补答后台任务退出异常：%s", _PLUGIN_TAG, exc)
+        finally:
+            if self._catchup_task is task:
+                self._catchup_task = None
 
     async def _catchup_trigger(
         self, candidate: CatchupCandidate, *, now: float, sleep_minutes: float = 0.0

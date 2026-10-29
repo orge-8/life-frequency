@@ -108,8 +108,8 @@ def simulate(config: S.SimConfig, *, days: int, seed: int = 20261010) -> dict:
             local_minutes = facts.now_minutes
             proposal = A.rule_based_activity(
                 now_minutes=local_minutes,
-                energy=facts.energy,
-                sleep_energy_threshold=config.sleep_energy_threshold,
+                sleep_need=float(facts.sleep_need),
+                sleep_need_onset=config.sleep_need_onset,
             )
             S.enforce_and_apply(state, now=now, config=config, decision=proposal)
         if state.activity == A.SLEEP and previous != A.SLEEP:

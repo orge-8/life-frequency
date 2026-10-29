@@ -61,10 +61,9 @@ def facts_at(moment: datetime, config: A.ScheduleConfig | None = None) -> A.Sche
 
 def policy(**overrides) -> A.EnforcePolicy:
     base = dict(
-        sleep_window=(0, 1440),
-        sleep_energy_threshold=3.0,
-        min_awake_hours_per_day=8.0,
         min_dwell_minutes=60,
+        sleep_need_onset=0.62,
+        sleep_need_wake=0.16,
         schedule=work_config(),
     )
     base.update(overrides)
@@ -187,7 +186,7 @@ def test_energy_delta_covers_every_activity():
 def test_rule_seed_matches_the_schedule_phase(hour, minute, expected_activity):
     moment = MONDAY.replace(hour=hour, minute=minute)
     seed = A.rule_based_activity(
-        now_minutes=hour * 60 + minute, energy=6.5,
+        now_minutes=hour * 60 + minute, sleep_need=0.3,
         schedule=facts_at(moment), work_scene="在电台值守",
     )
     assert seed.activity == expected_activity, seed
@@ -196,12 +195,12 @@ def test_rule_seed_matches_the_schedule_phase(hour, minute, expected_activity):
 def test_rule_seed_uses_the_configured_work_scene_only_for_work():
     schedule = facts_at(MONDAY.replace(hour=10, minute=30))
     assert A.rule_based_activity(
-        now_minutes=10 * 60 + 30, energy=6.5, schedule=schedule, work_scene="在电台值守"
+        now_minutes=10 * 60 + 30, sleep_need=0.3, schedule=schedule, work_scene="在电台值守"
     ).scene == "在电台值守"
     # 其它相位的场景是内置文案，不该被 work_scene 顶掉
     commute = facts_at(MONDAY.replace(hour=9))
     assert A.rule_based_activity(
-        now_minutes=9 * 60, energy=6.5, schedule=commute, work_scene="在电台值守"
+        now_minutes=9 * 60, sleep_need=0.3, schedule=commute, work_scene="在电台值守"
     ).scene != "在电台值守"
 
 
@@ -242,8 +241,8 @@ def test_rest_day_and_disabled_schedule_block_nothing():
 def test_health_exception_still_wins_for_sleep_in_every_duty_phase():
     for moment in (MONDAY.replace(hour=8), MONDAY.replace(hour=9),
                    MONDAY.replace(hour=10, minute=30), MONDAY.replace(hour=12, minute=30)):
-        tired = activity_facts(schedule=facts_at(moment), energy=1.0)
-        sick = activity_facts(schedule=facts_at(moment), sick=True)
+        tired = activity_facts(schedule=facts_at(moment), sleep_need=0.90)
+        sick = activity_facts(schedule=facts_at(moment), sick=True, sleep_need=0.90)
         assert A.activity_blocked_by_schedule(A.SLEEP, tired, policy()) == "", moment
         assert A.activity_blocked_by_schedule(A.SLEEP, sick, policy()) == "", moment
 
@@ -521,6 +520,20 @@ def test_replace_mode_deleted_activity_is_neutral_at_compute():
 
 
 # ================= F. 行为：在岗真的比日常更安静 =================
+
+
+def test_derived_configs_are_cached_and_invalidated_on_rebuild():
+    """v1.25.0：每 tick 多次取配置不应反复解析；热更新必须让缓存失效。"""
+
+    _module, plugin = _make_plugin()
+    sim_first = plugin._sim_config()
+    factor_first = plugin._factor_config()
+    assert plugin._sim_config() is sim_first
+    assert plugin._factor_config() is factor_first
+
+    plugin._rebuild_from_config()
+    assert plugin._sim_config() is not sim_first
+    assert plugin._factor_config() is not factor_first
 
 
 def test_work_factor_actually_lowers_the_multiplier():

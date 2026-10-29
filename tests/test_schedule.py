@@ -70,10 +70,9 @@ def facts_at(moment: datetime, config: A.ScheduleConfig | None = None) -> A.Sche
 
 def policy(**overrides) -> A.EnforcePolicy:
     base = dict(
-        sleep_window=(0, 1440),          # 「随时都够格睡」——把判据单独留给班表
-        sleep_energy_threshold=3.0,
-        min_awake_hours_per_day=8.0,
         min_dwell_minutes=60,
+        sleep_need_onset=0.62,
+        sleep_need_wake=0.16,
         schedule=work_config(),
     )
     base.update(overrides)
@@ -86,6 +85,7 @@ def activity_facts(**overrides) -> A.ActivityFacts:
         minutes_in_activity=120,
         now_minutes=10 * 60,
         energy=7.0,
+        sleep_need=0.25,
         sick=False,
         sleep_minutes_today=0,
         awake_minutes_today=600,
@@ -305,11 +305,11 @@ def test_sleep_is_blocked_during_work_but_excused_by_health():
     work = activity_facts()
     assert A.activity_blocked_by_schedule(A.SLEEP, work, policy()), "上班时段不能睡"
 
-    tired = activity_facts(energy=2.0)
-    assert A.activity_blocked_by_schedule(A.SLEEP, tired, policy()) == "", "体力撑不住可以睡"
+    sleepy = activity_facts(sleep_need=0.90)
+    assert A.activity_blocked_by_schedule(A.SLEEP, sleepy, policy()) == "", "真的困了就可以睡"
 
-    sick = activity_facts(sick=True)
-    assert A.activity_blocked_by_schedule(A.SLEEP, sick, policy()) == "", "生病可以睡"
+    sick = activity_facts(sick=True, sleep_need=0.90)
+    assert A.activity_blocked_by_schedule(A.SLEEP, sick, policy()) == "", "生病且困了可以睡"
 
     before_sleep = activity_facts()
     assert A.activity_blocked_by_schedule(A.BEFORE_SLEEP, before_sleep, policy())
@@ -385,11 +385,16 @@ def test_enforce_rejects_desk_fun_and_pulls_her_out_of_it():
 
 
 def test_enforce_allows_health_exception_to_win():
-    tired = activity_facts(energy=1.5)
-    assert A.enforce(tired, A.ActivityDecision(A.SLEEP, "撑不住了"), policy()).activity == A.SLEEP
+    sleepy = activity_facts(sleep_need=0.90)
+    assert A.enforce(sleepy, A.ActivityDecision(A.SLEEP, "撑不住了"), policy()).activity == A.SLEEP
 
+    # 只生病不等于必须睡：困意没到阈时，提议睡觉会被收口回养病
     sick = activity_facts(sick=True)
-    assert A.enforce(sick, A.ActivityDecision(A.SLEEP, "病了"), policy()).activity == A.SLEEP
+    assert A.enforce(sick, A.ActivityDecision(A.SLEEP, "病了"), policy()).activity == A.SICK_REST
+    sick_sleepy = activity_facts(sick=True, sleep_need=0.90)
+    assert A.enforce(
+        sick_sleepy, A.ActivityDecision(A.SLEEP, "病了又困"), policy()
+    ).activity == A.SLEEP
 
 
 def test_enforce_lets_her_relax_on_lunch_break():
@@ -403,14 +408,14 @@ def test_enforce_lets_her_relax_on_lunch_break():
 def test_enforce_is_unchanged_when_schedule_is_off():
     """回归：默认（班表关闭）行为必须与加这一层之前逐字一致。"""
 
-    facts = activity_facts(schedule=A.ScheduleFacts())
-    # sleep_window 放开 + 清醒够 + 体力正常 ⇒ 想睡就睡（旧行为）
+    facts = activity_facts(schedule=A.ScheduleFacts(), sleep_need=0.90)
+    # 班表关闭时只看困意（体力/时段不再参与）
     assert A.enforce(facts, A.ActivityDecision(A.SLEEP, "困"), policy()).activity == A.SLEEP
     assert A.enforce(facts, A.ActivityDecision(A.GAME, "玩"), policy()).activity == A.GAME
 
 
 def test_enforce_on_weekend_ignores_the_schedule():
-    weekend = activity_facts(schedule=facts_at(SATURDAY.replace(hour=10)))
+    weekend = activity_facts(schedule=facts_at(SATURDAY.replace(hour=10)), sleep_need=0.90)
     assert A.enforce(weekend, A.ActivityDecision(A.SLEEP, "补觉"), policy()).activity == A.SLEEP
     assert A.enforce(weekend, A.ActivityDecision(A.GAME, "开黑"), policy()).activity == A.GAME
 
@@ -421,30 +426,30 @@ def test_enforce_on_weekend_ignores_the_schedule():
 def test_rules_seed_puts_her_at_work_instead_of_the_student_window():
     schedule = facts_at(MONDAY.replace(hour=10, minute=30))
     seed = A.rule_based_activity(
-        now_minutes=10 * 60 + 30, energy=6.5, schedule=schedule, work_scene="在电台值守"
+        now_minutes=10 * 60 + 30, sleep_need=0.3, schedule=schedule, work_scene="在电台值守"
     )
     assert seed.activity == A.WORK, seed
     assert seed.scene == "在电台值守"
     assert "在岗" in seed.note, seed.note
 
     # 内置时段表在同一时刻给的是「深夜做题（睡不着）」——正是要修掉的行为
-    table_only = A.rule_based_activity(now_minutes=10 * 60 + 30, energy=6.5)
+    table_only = A.rule_based_activity(now_minutes=10 * 60 + 30, sleep_need=0.3)
     assert table_only.activity == A.NIGHT_STUDY
 
 
 def test_rules_seed_handles_commute_and_lunch_scenes():
     commute = A.rule_based_activity(
-        now_minutes=9 * 60, energy=6.5, schedule=facts_at(MONDAY.replace(hour=9))
+        now_minutes=9 * 60, sleep_need=0.3, schedule=facts_at(MONDAY.replace(hour=9))
     )
     assert commute.activity == A.COMMUTE and "路上" in commute.scene, commute
 
     lunch = A.rule_based_activity(
-        now_minutes=12 * 60 + 30, energy=6.5, schedule=facts_at(MONDAY.replace(hour=12, minute=30))
+        now_minutes=12 * 60 + 30, sleep_need=0.3, schedule=facts_at(MONDAY.replace(hour=12, minute=30))
     )
     assert lunch.activity == A.LUNCH and "午休" in lunch.scene, lunch
 
     off_work = A.rule_based_activity(
-        now_minutes=18 * 60 + 45, energy=6.5, schedule=facts_at(MONDAY.replace(hour=18, minute=45))
+        now_minutes=18 * 60 + 45, sleep_need=0.3, schedule=facts_at(MONDAY.replace(hour=18, minute=45))
     )
     assert off_work.activity == A.OFF_WORK and "回家" in off_work.scene, off_work
 
@@ -453,29 +458,29 @@ def test_rules_seed_does_not_send_her_to_bed_before_work():
     """出门前的准备时间不该再由学生时段表安排（它会给「深夜做题」甚至睡）。"""
 
     morning = A.rule_based_activity(
-        now_minutes=8 * 60 + 30, energy=6.5, schedule=facts_at(MONDAY.replace(hour=8, minute=30))
+        now_minutes=8 * 60 + 30, sleep_need=0.3, schedule=facts_at(MONDAY.replace(hour=8, minute=30))
     )
     assert morning.activity == A.DAILY, morning
     assert "出门" in morning.scene
 
     # 同一时刻、低体力：健康优先，仍然允许睡（班表窗口内的例外）
-    tired_facts = activity_facts(
-        schedule=facts_at(MONDAY.replace(hour=8, minute=30)), energy=1.0
+    sleepy_facts = activity_facts(
+        schedule=facts_at(MONDAY.replace(hour=8, minute=30)), sleep_need=0.90
     )
-    assert A.activity_blocked_by_schedule(A.SLEEP, tired_facts, policy()) == ""
+    assert A.activity_blocked_by_schedule(A.SLEEP, sleepy_facts, policy()) == ""
 
     # 深夜（自由时间）交回时段表
     night = A.rule_based_activity(
-        now_minutes=6 * 60, energy=6.5, schedule=facts_at(MONDAY.replace(hour=6))
+        now_minutes=6 * 60, sleep_need=0.3, schedule=facts_at(MONDAY.replace(hour=6))
     )
-    table_only = A.rule_based_activity(now_minutes=6 * 60, energy=6.5)
+    table_only = A.rule_based_activity(now_minutes=6 * 60, sleep_need=0.3)
     assert night.activity == table_only.activity
 
 
 def test_rules_seed_keeps_the_old_table_on_weekend():
     schedule = facts_at(SATURDAY.replace(hour=10, minute=30))
-    weekend = A.rule_based_activity(now_minutes=10 * 60 + 30, energy=6.5, schedule=schedule)
-    table_only = A.rule_based_activity(now_minutes=10 * 60 + 30, energy=6.5)
+    weekend = A.rule_based_activity(now_minutes=10 * 60 + 30, sleep_need=0.3, schedule=schedule)
+    table_only = A.rule_based_activity(now_minutes=10 * 60 + 30, sleep_need=0.3)
     assert weekend.activity == table_only.activity, "休息日就该回到原来的时段表"
 
 
@@ -831,25 +836,15 @@ def test_recent_events_keep_maps_into_sim_config():
     _module, plugin, _host = _make_plugin()
     assert plugin._sim_config().recent_events_keep == 300
 
+    # v1.25.0：_sim_config 按配置版本缓存；真实热更新会走 _rebuild_from_config，
+    # 直接改 pydantic 字段的测试也必须显式失效缓存，避免读到旧派生对象。
     plugin.config.activity.llm.recent_events_keep = 500
+    plugin._rebuild_from_config()
     assert plugin._sim_config().recent_events_keep == 500
 
     plugin.config.activity.llm.recent_events_keep = -3
+    plugin._rebuild_from_config()
     assert plugin._sim_config().recent_events_keep == 0
-
-
-def test_energy_full_wake_maps_into_sim_config():
-    """``[simulation] energy_full_wake`` → ``SimConfig`` → 强制层策略，默认开。"""
-
-    _module, plugin, _host = _make_plugin()
-    assert plugin._sim_config().energy_full_wake is True
-    sim = plugin._sim_config()
-    assert sim.energy_full_wake is True
-
-    plugin.config.simulation.energy_full_wake = False
-    assert plugin._sim_config().energy_full_wake is False
-    policy = S.build_enforce_policy(plugin._sim_config())
-    assert policy.energy_full_wake is False
 
 
 def test_plugin_warns_once_on_bad_workdays():
@@ -938,9 +933,9 @@ def test_reseed_uses_the_schedule_instead_of_the_student_table():
         _module, plugin, _host = _make_plugin()
         now = local_ts(MONDAY.replace(hour=10, minute=30))
         plugin._state.llm_last_success_at = now - 48 * 3600   # 模型长时间没成功
-        plugin._state.activity = A.SLEEP
+        plugin._state.activity = A.DAILY
         plugin._state.activity_since = now - 3600
-        plugin._state.sleep_started_at = now - 3600
+        plugin._state.sleep_need = 0.25
         config = plugin._sim_config()
         plugin._reseed_activity_if_stale(now, config)
         assert plugin._state.activity != A.NIGHT_STUDY, "重新取种子又回到学生作息"

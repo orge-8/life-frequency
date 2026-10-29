@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """L3：作息活动——时间辅助、提示词、解析、强制层、时段表。"""
 
+from dataclasses import replace as _dc_replace
+
 import pytest
 
 import life_activity as A
@@ -148,9 +150,10 @@ def _prompt_input(**overrides):
         energy=3.1,
         energy_cap=8.5,
         health_label="感冒中（约剩 6.0 小时）",
-        sleep_debt_nights=2,
         sleep_minutes_today=270,
         awake_minutes_today=600,
+        continuous_awake_minutes=600,
+        sleep_need=0.55,
         recent_event_tiers=(
             ("近（12 小时内）", ("02-07 18:10 煮糊了：煮着煮着忘了，锅底糊了一层",)),
         ),
@@ -234,12 +237,15 @@ def test_build_prompt_mentions_switch_block_reason():
 
 def _policy(**overrides):
     base = dict(
-        sleep_window=(3 * 60, 11 * 60),
-        sleep_energy_threshold=3.0,
         max_sleep_hours=12.0,
-        min_awake_hours_per_day=8.0,
         min_dwell_minutes=60,
         min_sleep_minutes=180,
+        # 身体驱动（v1.24.0）：睡不睡只看困意，旧时段/体力/清醒下限已退役
+        sleep_need_onset=0.62,
+        sleep_need_wake=0.16,
+        nap_need_threshold=0.42,
+        sleep_circadian_strength=0.05,
+        sleep_deferral_minutes=15,
     )
     base.update(overrides)
     return A.EnforcePolicy(**base)
@@ -255,6 +261,8 @@ def _facts(**overrides):
         sick=False,
         sleep_minutes_today=0,
         awake_minutes_today=10 * 60,
+        # 默认「不困」：14:00 的节律偏移是 −0.05，0.25 离入睡阈 0.62 还远
+        sleep_need=0.25,
     )
     base.update(overrides)
     return A.ActivityFacts(**base)
@@ -264,97 +272,61 @@ def _request(activity, scene="", source=A.SOURCE_LLM):
     return A.ActivityDecision(activity=activity, scene=scene, source=source, note="test")
 
 
-# ---------------------------------------------------------------- 感冒与入睡短路（v1.19.0 PR-AF-1）
+def _replace_facts(facts, **overrides):
+    return _dc_replace(facts, **overrides)
 
 
-@pytest.mark.parametrize(
-    "kwargs,expected",
-    [
-        # 不生病：恒 False（未感冒路径逐位不变）
-        (dict(sick=False), False),
-        (dict(sick=False, cold_stage=A.COLD_ONSET), False),
-        # 初起：默认**不**短路
-        (dict(sick=True, cold_stage=A.COLD_ONSET), False),
-        # 加重 / 好转：保留短路（那两段该多躺）
-        (dict(sick=True, cold_stage=A.COLD_WORSENING), True),
-        (dict(sick=True, cold_stage=A.COLD_RECOVERING), True),
-        # 旧状态兼容：只填 sick=True 无段位 ⇒ 归一为 worsening ⇒ 短路（存量不变）
-        (dict(sick=True), True),
-        (dict(sick=True, cold_stage=""), True),
-        (dict(sick=True, cold_stage="乱写的段位"), True),
-    ],
-)
-def test_sick_sleep_short_circuit_by_stage(kwargs, expected):
-    assert A._sick_sleep_short_circuit(_facts(**kwargs), _policy()) is expected
+# ---------------------------------------------------------------- 感冒与入睡压力（v1.24.0）
 
 
-def test_sick_sleep_short_circuit_escape_hatch():
-    """``cold_onset_awake_floor=False`` 是逃生舱：初起回到 v1.18.1 的一刀切短路。"""
+def test_sick_pressure_by_stage():
+    """病程对入睡压力的加成：加重/好转 +0.15，初起 +0.04；不生病不加。"""
 
-    onset = _facts(sick=True, cold_stage=A.COLD_ONSET)
-    assert A._sick_sleep_short_circuit(onset, _policy(cold_onset_awake_floor=True)) is False
-    assert A._sick_sleep_short_circuit(onset, _policy(cold_onset_awake_floor=False)) is True
-    # 开关只管初起：加重期怎么设都短路
-    worse = _facts(sick=True, cold_stage=A.COLD_WORSENING)
-    assert A._sick_sleep_short_circuit(worse, _policy(cold_onset_awake_floor=True)) is True
-    assert A._sick_sleep_short_circuit(worse, _policy(cold_onset_awake_floor=False)) is True
-
-
-def test_sick_sleep_short_circuit_defaults_when_policy_missing():
-    """``policy=None`` 按默认（True = 不短路）处理，便于纯模块调用。"""
-
-    assert A._sick_sleep_short_circuit(_facts(sick=True, cold_stage=A.COLD_ONSET), None) is False
-    assert A._sick_sleep_short_circuit(_facts(sick=True, cold_stage=A.COLD_WORSENING), None) is True
+    policy = _policy()
+    assert A.sleep_pressure(_facts(sick=False, sleep_need=0.30), policy) == pytest.approx(
+        0.30 + A._circadian_bias(_facts(sleep_need=0.30), policy)
+    )
+    onset = A.sleep_pressure(_facts(sick=True, cold_stage=A.COLD_ONSET, sleep_need=0.30), policy)
+    worse = A.sleep_pressure(_facts(sick=True, cold_stage=A.COLD_WORSENING, sleep_need=0.30), policy)
+    recovering = A.sleep_pressure(
+        _facts(sick=True, cold_stage=A.COLD_RECOVERING, sleep_need=0.30), policy
+    )
+    assert onset == pytest.approx(worse - 0.11, abs=1e-9)
+    assert recovering == pytest.approx(worse, abs=1e-9)
 
 
-def test_onset_no_longer_bypasses_awake_floor():
-    """核心回归：初起 + 今日清醒不足 ⇒ **拒绝**入睡（v1.18.1 会放行）。
-
-    真机实测：初起也短路时，她睡到体力满醒来、下一 tick 因病中立刻躺回去，
-    ``continuous_awake_minutes`` 长期恒为 10 分钟。
-    """
+def test_onset_does_not_bypass_low_need():
+    """初起期困意不够时也**不**放行入睡：病程加成很小，不能替代困意。"""
 
     out = A.enforce(
-        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET,
-               awake_minutes_today=30, energy=8.0),
+        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET, sleep_need=0.30),
         _request(A.SLEEP),
         _policy(),
     )
-    assert out.activity == A.DAILY, "初起且清醒不足，不该立刻躺回去"
-    assert "清醒不足" in out.note
-    assert "初起" in out.note, "拒睡原因要带病程阶段，否则排查时无法区分"
+    assert out.activity == A.DAILY
+    assert "还不困" in out.note
 
 
-def test_worsening_still_bypasses_awake_floor():
-    """加重期保留短路：清醒不足也放行。"""
+def test_worsening_still_allows_sleep_by_pressure():
+    """加重期困意中等就能睡：+0.15 的病程加成让它过线。"""
 
     out = A.enforce(
-        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_WORSENING,
-               awake_minutes_today=30, energy=8.0),
+        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_WORSENING, sleep_need=0.55),
         _request(A.SLEEP),
         _policy(),
     )
     assert out.activity == A.SLEEP
 
 
-def test_onset_can_still_sleep_by_energy_or_awake_floor():
-    """初起不是「不许睡」：清醒够了、或体力掉到阈值以下，照常能睡。"""
+def test_onset_can_still_sleep_when_sleepy():
+    """初起不是「不许睡」：困意本身够就照常睡。"""
 
-    awake_enough = A.enforce(
-        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET,
-               awake_minutes_today=9 * 60, energy=8.0, now_minutes=5 * 60),
+    out = A.enforce(
+        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET, sleep_need=0.65),
         _request(A.SLEEP),
         _policy(),
     )
-    assert awake_enough.activity == A.SLEEP, "清醒够了、又在睡眠时段内，就该能睡"
-
-    drained = A.enforce(
-        _facts(activity=A.DAILY, sick=True, cold_stage=A.COLD_ONSET,
-               awake_minutes_today=30, energy=2.0),
-        _request(A.SLEEP),
-        _policy(),
-    )
-    assert drained.activity == A.SLEEP, "体力掉到阈值以下仍然放行（健康优先）"
+    assert out.activity == A.SLEEP
 
 
 def test_enforce_retains_previous_when_no_valid_request():
@@ -398,58 +370,46 @@ def test_enforce_sick_still_forces_sick_rest_without_llm_decision():
 
 def test_enforce_sick_may_still_sleep():
     out = A.enforce(
-        _facts(sick=True, activity=A.DAILY, now_minutes=4 * 60, awake_minutes_today=10 * 60),
+        _facts(sick=True, activity=A.DAILY, sleep_need=0.6),
         _request(A.SLEEP),
         _policy(),
     )
     assert out.activity == A.SLEEP
 
 
-def test_enforce_sleep_allowed_in_window():
+def test_enforce_sleep_allowed_at_any_hour_when_sleepy():
+    """睡眠时段已退役：凌晨与下午**同一条判据**——困意到线就能睡。"""
+
+    for now_minutes in (4 * 60, 15 * 60):
+        out = A.enforce(
+            _facts(activity=A.DAILY, now_minutes=now_minutes, sleep_need=0.70),
+            _request(A.SLEEP),
+            _policy(),
+        )
+        assert out.activity == A.SLEEP, now_minutes
+
+
+def test_full_energy_does_not_block_sleep():
+    """体力满不再等于「睡不着」：睡不睡只看困意。"""
+
     out = A.enforce(
-        _facts(activity=A.DAILY, now_minutes=4 * 60, energy=8.0, awake_minutes_today=10 * 60),
+        _facts(activity=A.DAILY, now_minutes=15 * 60, energy=10.0, sleep_need=0.70),
         _request(A.SLEEP),
         _policy(),
     )
     assert out.activity == A.SLEEP
 
 
-def test_enforce_sleep_allowed_when_exhausted_outside_window():
-    out = A.enforce(
-        _facts(activity=A.DAILY, now_minutes=15 * 60, energy=1.0, awake_minutes_today=10 * 60),
-        _request(A.SLEEP),
-        _policy(),
-    )
-    assert out.activity == A.SLEEP
-
-
-def test_enforce_exhausted_overrides_awake_floor():
-    """健康优先：累到阈值以下就直接放行，清醒下限不再拦（v1.3.1 修正）。
-
-    真机事故：体力 0.6/10、正处于睡眠窗口，却因为计数器被停机间隙清零
-    （`awake_minutes_today` 只有 216 分钟）而被判「今日清醒不足」——见
-    `life_sim._skip_offline_gap` 与 `README` 的 v1.3.1 变更说明。
-    """
+def test_low_energy_does_not_force_sleep():
+    """体力低不再等于「必须睡」：清醒且不困时，提议入睡照样被拒。"""
 
     out = A.enforce(
-        _facts(activity=A.DAILY, now_minutes=4 * 60, energy=1.0, awake_minutes_today=60),
-        _request(A.SLEEP),
-        _policy(),
-    )
-    assert out.activity == A.SLEEP
-    assert out.source == A.SOURCE_LLM
-
-
-def test_enforce_awake_floor_still_blocks_in_window_nap():
-    """下限的本意仍要守住：体力正常时，刚醒就想睡照样拒。"""
-
-    out = A.enforce(
-        _facts(activity=A.DAILY, now_minutes=4 * 60, energy=8.0, awake_minutes_today=60),
+        _facts(activity=A.DAILY, now_minutes=15 * 60, energy=0.5, sleep_need=0.25),
         _request(A.SLEEP),
         _policy(),
     )
     assert out.activity == A.DAILY
-    assert "清醒不足" in out.note
+    assert "还不困" in out.note
 
 
 def test_enforce_initiates_sleep_without_llm_decision():
@@ -459,30 +419,20 @@ def test_enforce_initiates_sleep_without_llm_decision():
     """
 
     out = A.enforce(
-        _facts(activity=A.GAME, now_minutes=4 * 60, energy=6.0, awake_minutes_today=10 * 60),
+        _facts(activity=A.GAME, now_minutes=4 * 60, sleep_need=0.70),
         None,
         _policy(),
     )
     assert out.activity == A.SLEEP
     assert out.source == A.SOURCE_ENFORCED
-    assert "硬约束送她入睡" in out.note
+    assert "送她入睡" in out.note
 
 
-def test_enforce_does_not_initiate_sleep_when_awake_floor_not_met():
-    """发起睡眠也要过清醒下限：刚醒 + 体力正常时不能替模型把她按回去睡。"""
+def test_enforce_does_not_initiate_sleep_when_not_sleepy():
+    """发起睡眠也要困意到线：不困时不能替模型把她按到床上。"""
 
     out = A.enforce(
-        _facts(activity=A.GAME, now_minutes=4 * 60, energy=6.0, awake_minutes_today=60),
-        None,
-        _policy(),
-    )
-    assert out.activity == A.GAME
-    assert out.source == A.SOURCE_RETAINED
-
-
-def test_enforce_does_not_initiate_sleep_outside_window_with_normal_energy():
-    out = A.enforce(
-        _facts(activity=A.GAME, now_minutes=15 * 60, energy=6.0, awake_minutes_today=10 * 60),
+        _facts(activity=A.GAME, now_minutes=4 * 60, sleep_need=0.30),
         None,
         _policy(),
     )
@@ -501,31 +451,60 @@ def test_pointless_ask_is_provably_equivalent():
     """
 
     skip_cases = [
-        ("清醒且未满停留期", dict(activity=A.GAME, minutes_in_activity=10, now_minutes=15 * 60, energy=6.0)),
-        ("清醒且差一分钟到停留期", dict(activity=A.DAILY, minutes_in_activity=59, now_minutes=15 * 60, energy=8.0)),
-        ("睡眠未满最短时长", dict(activity=A.SLEEP, minutes_in_activity=60, minutes_in_sleep=60, now_minutes=4 * 60)),
+        ("清醒且未满停留期", dict(activity=A.GAME, minutes_in_activity=10, now_minutes=15 * 60)),
+        ("清醒且差一分钟到停留期", dict(activity=A.DAILY, minutes_in_activity=59, now_minutes=15 * 60)),
         (
-            "已睡够上限",
+            "睡眠未满最短时长",
+            dict(
+                activity=A.SLEEP,
+                minutes_in_activity=60,
+                minutes_in_sleep=60,
+                now_minutes=4 * 60,
+            ),
+        ),
+        (
+            "本次睡眠达异常上限",
             dict(
                 activity=A.SLEEP,
                 minutes_in_activity=800,
                 minutes_in_sleep=800,
                 sleep_minutes_today=800,
+                sleep_need=0.9,
                 now_minutes=4 * 60,
             ),
         ),
         (
-            "体力已满且睡够目标",
+            "睡够时长但困意未退",
             dict(
                 activity=A.SLEEP,
-                minutes_in_activity=420,
-                minutes_in_sleep=420,
-                sleep_minutes_today=420,
-                energy=10.0,
+                minutes_in_activity=400,
+                minutes_in_sleep=400,
+                sleep_minutes_today=400,
+                sleep_need=0.40,
                 now_minutes=4 * 60,
             ),
         ),
-        ("体力耗尽", dict(activity=A.GAME, minutes_in_activity=120, now_minutes=15 * 60, energy=0.2)),
+        (
+            "打断窗口内且该睡了（预算已用完）",
+            dict(
+                activity=A.CHATTING,
+                minutes_in_activity=10,
+                in_interrupt=True,
+                sleep_need=0.70,
+                sleep_defer_expired=True,
+                now_minutes=4 * 60,
+            ),
+        ),
+        (
+            "打断窗口内、还没到该睡",
+            dict(
+                activity=A.CHATTING,
+                minutes_in_activity=10,
+                in_interrupt=True,
+                sleep_need=0.30,
+                now_minutes=4 * 60,
+            ),
+        ),
     ]
     for label, overrides in skip_cases:
         facts = _facts(**overrides)
@@ -543,19 +522,16 @@ def test_pointless_ask_is_provably_equivalent():
     # 反过来：这些情况下问一次**有**意义，不许被判成白问
     must_ask = [
         ("生病", dict(sick=True)),
-        ("在睡眠窗口内", dict(activity=A.DAILY, minutes_in_activity=10, now_minutes=4 * 60, energy=8.0)),
-        ("已过停留期", dict(activity=A.GAME, minutes_in_activity=120, now_minutes=15 * 60, energy=6.0)),
-        ("体力低于入睡阈值", dict(activity=A.GAME, minutes_in_activity=10, now_minutes=15 * 60, energy=1.0)),
-        # v1.15.0（PR-S1）：体力满了但还没睡够最短睡眠目标 ⇒ 提议「醒来」会被拒，
-        # 而提议别的活动会放行 ⇒ 这一轮问模型**有意义**（不该被判成白问）
+        ("困了（该睡了）", dict(activity=A.DAILY, minutes_in_activity=10, sleep_need=0.70)),
+        ("已过停留期", dict(activity=A.GAME, minutes_in_activity=120, now_minutes=15 * 60)),
         (
-            "满体力但没睡够目标",
+            "睡够且困意已退（可能自然醒）",
             dict(
                 activity=A.SLEEP,
-                minutes_in_activity=200,
-                minutes_in_sleep=200,
-                sleep_minutes_today=200,
-                energy=10.0,
+                minutes_in_activity=300,
+                minutes_in_sleep=300,
+                sleep_minutes_today=300,
+                sleep_need=0.10,
                 now_minutes=4 * 60,
             ),
         ),
@@ -564,9 +540,9 @@ def test_pointless_ask_is_provably_equivalent():
         assert A.request_is_pointless(_facts(**overrides), _policy()) == "", f"{label}：不该被判成白问"
 
 
-def test_enforce_refuses_sleep_outside_window_with_normal_energy():
+def test_enforce_refuses_sleep_when_not_sleepy():
     out = A.enforce(
-        _facts(activity=A.MUSIC, now_minutes=15 * 60, energy=8.0, awake_minutes_today=10 * 60),
+        _facts(activity=A.MUSIC, now_minutes=15 * 60, sleep_need=0.30),
         _request(A.SLEEP),
         _policy(),
     )
@@ -575,197 +551,225 @@ def test_enforce_refuses_sleep_outside_window_with_normal_energy():
 
 
 def test_enforce_keeps_sleeping_until_min_sleep():
+    """困意已经很低，但没睡满最短时长 ⇒ 模型也不能叫醒（两个条件缺一不可）。"""
+
     out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=60, sleep_minutes_today=60),
+        _facts(activity=A.SLEEP, minutes_in_activity=60, sleep_minutes_today=60,
+               continuous_sleep_minutes=60, sleep_need=0.05),
         _request(A.DAILY),
         _policy(),
     )
     assert out.activity == A.SLEEP
-    assert "未满" in out.note
+    assert "还没睡够" in out.note
 
 
 def test_enforce_keeps_sleeping_when_model_says_sleep():
     out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=400, sleep_minutes_today=400),
+        _facts(activity=A.SLEEP, minutes_in_activity=400, sleep_minutes_today=400,
+               continuous_sleep_minutes=400, sleep_need=0.50),
         _request(A.SLEEP),
         _policy(),
     )
     assert out.activity == A.SLEEP
 
 
-def test_enforce_forces_wake_past_max_sleep():
+def test_enforce_forces_wake_past_max_single_sleep():
     out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=400, sleep_minutes_today=13 * 60),
+        _facts(activity=A.SLEEP, minutes_in_activity=800, minutes_in_sleep=800,
+               continuous_sleep_minutes=800, sleep_minutes_today=800, sleep_need=0.95),
         _request(A.SLEEP),
         _policy(),
     )
-    assert out.activity == A.DAILY
+    assert out.activity == A.DAZE, "长睡眠被异常叫醒后先赖床"
     assert out.source == A.SOURCE_ENFORCED
     assert "强制唤醒" in out.note
+    assert out.wake_kind == "abnormal"
 
 
-def test_enforce_daily_cap_wakes_even_when_current_nap_is_young():
-    """v1.5.1：日累计到上限就唤醒，不再要求「当前一觉也满最短时长」。
-
-    真机 2026-10-03 实测（多相小睡 + 12:00 生活日边界）：日累计 11:47 就到
-    720 分钟，但当前一觉才 82 分钟（< min_sleep=120），旧 AND 条件把唤醒拖过
-    12:00 边界、计数被清零，当天的上限账整段抹掉——账本实测一天睡 12.8 小时。
-    """
+def test_sleep_cap_uses_settled_minutes_not_the_anchor():
+    """``minutes_in_sleep`` 是锚点口径（可能把停机时间算进去）；结算过就用结算值。"""
 
     out = A.enforce(
-        _facts(
-            activity=A.SLEEP,
-            minutes_in_activity=82,
-            minutes_in_sleep=82,
-            sleep_minutes_today=12 * 60 + 5,
-        ),
-        _request(A.SLEEP),
-        _policy(),
-    )
-    assert out.activity == A.DAILY
-    assert out.source == A.SOURCE_ENFORCED
-    assert "强制唤醒" in out.note
-
-
-def test_enforce_daily_cap_under_keeps_young_nap_sleeping():
-    """反向：日累计未到顶、当前一觉也短 → 继续睡（v1.1.1 的保护不回退）。"""
-
-    out = A.enforce(
-        _facts(
-            activity=A.SLEEP,
-            minutes_in_activity=82,
-            sleep_minutes_today=12 * 60 - 5,
-        ),
+        _facts(activity=A.SLEEP, minutes_in_activity=900, minutes_in_sleep=900,
+               continuous_sleep_minutes=90, sleep_need=0.80),
         _request(A.DAILY),
         _policy(),
     )
     assert out.activity == A.SLEEP
-    assert "未满" in out.note
+    assert "还没睡够" in out.note
+
+
+def test_daily_sleep_total_no_longer_wakes():
+    """日累计只做展示：它到 12 小时也不再叫醒当前这一觉（旧 10 分钟循环的真因）。"""
+
+    out = A.enforce(
+        _facts(activity=A.SLEEP, minutes_in_activity=82, minutes_in_sleep=82,
+               continuous_sleep_minutes=82, sleep_minutes_today=12 * 60 + 5,
+               sleep_need=0.50),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.SLEEP
+    assert "仍在睡眠，保持" in out.note
 
 
 def test_enforce_forced_wake_lands_in_sick_rest_when_sick():
     out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=400, sleep_minutes_today=13 * 60, sick=True),
+        _facts(activity=A.SLEEP, minutes_in_activity=800, minutes_in_sleep=800,
+               continuous_sleep_minutes=800, sleep_minutes_today=800, sick=True),
         _request(A.SLEEP),
         _policy(),
     )
     assert out.activity == A.SICK_REST
 
 
-def test_enforce_allows_wake_after_min_sleep():
+def test_enforce_allows_natural_wake_after_min_sleep():
+    """睡满最短时长**且**困意退到醒来阈以下，模型提议醒来才被接受。"""
+
     out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=300, sleep_minutes_today=300),
+        _facts(activity=A.SLEEP, minutes_in_activity=300, minutes_in_sleep=300,
+               continuous_sleep_minutes=300, sleep_minutes_today=300, sleep_need=0.10),
         _request(A.DAILY),
         _policy(),
     )
     assert out.activity == A.DAILY
+    assert out.wake_kind == "natural"
 
 
-def test_enforce_energy_full_wake_when_slept_enough():
-    """体力回满 + 睡满最短时长 → 强制唤醒（默认开，不依赖模型提议）。"""
-
-    out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200, energy=10.0),
-        _request(A.SLEEP),
-        _policy(),
-    )
-    assert out.activity == A.DAILY
-    assert out.source == A.SOURCE_ENFORCED
-    assert "体力已满" in out.note
-    # 上限是动态值： ActivityFacts.energy_cap 改成 8.5（熬夜 3 晚后）时 8.5 就算满
-    out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200,
-               energy=8.5, energy_cap=8.5),
-        None,
-        _policy(),
-    )
-    assert out.activity == A.DAILY
-    assert "体力已满" in out.note
-
-
-def test_enforce_energy_full_wake_lands_in_sick_rest_when_sick():
-    out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200,
-               energy=10.0, sick=True),
-        None,
-        _policy(),
-    )
-    assert out.activity == A.SICK_REST
-
-
-def test_enforce_energy_full_wake_wakes_immediately():
-    """v1.6.0：体力回满**立刻**唤醒，不再要求睡满最短时长。
-
-    真机实拍（2026-10-04 状态卡）：体力 10.0/10、本次睡眠已持续 73 分钟仍在睡，
-    而这段时间不恢复任何东西。门槛去掉后：满体力 + 刚睡下 10 分钟也叫醒她；
-    体力没满则仍受最短时长保护（刚睡下不会被拖起来）。
-    """
+def test_full_energy_never_wakes_a_sleeping_character():
+    """体力满 ≠ 睡够了：满体力下继续睡，没有任何唤醒判定。"""
 
     out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=10, sleep_minutes_today=10, energy=10.0),
+        _facts(activity=A.SLEEP, minutes_in_activity=200, minutes_in_sleep=200,
+               continuous_sleep_minutes=200, sleep_minutes_today=200,
+               energy=10.0, sleep_need=0.50),
         None,
         _policy(),
-    )
-    assert out.activity == A.DAILY
-    assert out.source == A.SOURCE_ENFORCED
-    assert "体力已满" in out.note
-
-    still = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=10, sleep_minutes_today=10, energy=9.9),
-        None,
-        _policy(),
-    )
-    assert still.activity == A.SLEEP
-
-
-def test_enforce_energy_full_wake_can_be_disabled():
-    out = A.enforce(
-        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200, energy=10.0),
-        None,
-        _policy(energy_full_wake=False),
     )
     assert out.activity == A.SLEEP
     assert out.source == A.SOURCE_RETAINED
 
 
-def test_energy_full_wake_is_never_a_pointless_ask():
-    """体力满 = 必然唤醒（问了也白问）；体力没满且没睡够时长 = 必然继续睡。"""
+def test_full_energy_does_not_report_a_forced_wake():
+    """「体力已满 ⇒ 必然唤醒」已退役：白问判定里不许再出现这条理由。"""
 
-    due = A.request_is_pointless(
-        _facts(activity=A.SLEEP, minutes_in_activity=200, sleep_minutes_today=200, energy=10.0),
+    reason = A.request_is_pointless(
+        _facts(activity=A.SLEEP, minutes_in_activity=200, minutes_in_sleep=200,
+               continuous_sleep_minutes=200, energy=10.0, sleep_need=0.50),
         _policy(),
     )
-    assert "必然强制唤醒" in due
-    # 体力没满 + 没睡够最短时长 → 继续睡
-    too_early = A.request_is_pointless(
-        _facts(activity=A.SLEEP, minutes_in_activity=60, sleep_minutes_today=60, energy=6.0),
+    assert "强制唤醒" not in reason
+    assert "继续睡" in reason
+
+
+def test_high_need_keeps_sleeping_despite_model_proposal():
+    """困意没退，睡多久都不算够——模型提议醒来必须被拒。"""
+
+    out = A.enforce(
+        _facts(activity=A.SLEEP, minutes_in_activity=600, minutes_in_sleep=600,
+               continuous_sleep_minutes=600, sleep_need=0.55),
+        _request(A.DAILY),
         _policy(),
     )
-    assert "继续睡" in too_early
-    # v1.6.0：满体力、刚睡下，现在也是「必然唤醒」——不再等到睡满最短时长
-    fresh_full = A.request_is_pointless(
-        _facts(activity=A.SLEEP, minutes_in_activity=10, sleep_minutes_today=10, energy=10.0),
-        _policy(),
-    )
-    assert "必然强制唤醒" in fresh_full
+    assert out.activity == A.SLEEP
+    assert "还没睡够" in out.note
 
 
 def test_enforce_never_freezes_when_llm_dies_while_asleep():
-    """模型永久失效时她也必须按时醒来——这是「失败即保持」的安全阀。"""
+    """模型永久失效时她也必须按时醒来——异常上限是最后的安全阀。"""
 
-    state = _facts(activity=A.SLEEP, minutes_in_activity=1000, sleep_minutes_today=13 * 60)
-    out = A.enforce(state, None, _policy())
+    state = _facts(activity=A.SLEEP, minutes_in_activity=1000, minutes_in_sleep=1000,
+                   continuous_sleep_minutes=1000, sleep_minutes_today=1000)
+    out = A.enforce(state, None, _policy(wake_daze_minutes=0))
     assert out.activity == A.DAILY
+
+
+# ---------------------------------------------------------------- 睡前陪聊与赖床（v1.24.0）
+
+
+def test_bedtime_budget_opens_once_then_holds_then_sleeps():
+    chatting = _facts(activity=A.CHATTING, minutes_in_activity=10, in_interrupt=True,
+                      sleep_need=0.70, now_minutes=4 * 60)
+    opened = A.enforce(chatting, None, _policy())
+    assert opened.activity == A.CHATTING
+    assert opened.defer == "open"
+    assert "15 分钟" in opened.note
+
+    holding = A.enforce(
+        _replace_facts(chatting, sleep_defer_active=True), None, _policy()
+    )
+    assert holding.activity == A.CHATTING
+    assert holding.defer == "hold"
+
+    expired = A.enforce(
+        _replace_facts(chatting, sleep_defer_expired=True), None, _policy()
+    )
+    assert expired.activity == A.SLEEP
+    assert "已用完" in expired.note
+
+
+def test_bedtime_budget_not_opened_when_not_sleepy():
+    out = A.enforce(
+        _facts(activity=A.CHATTING, minutes_in_activity=10, in_interrupt=True,
+               sleep_need=0.30, now_minutes=4 * 60),
+        None,
+        _policy(),
+    )
+    assert out.activity == A.CHATTING
+    assert out.defer == ""
+
+
+def test_wake_grace_prevents_immediate_resleep():
+    out = A.enforce(
+        _facts(activity=A.DAZE, wake_grace=True, sleep_need=0.80),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.DAZE
+    assert "先别马上又躺回去" in out.note
+
+
+def test_wake_grace_holds_daze_without_proposal():
+    out = A.enforce(
+        _facts(activity=A.DAZE, wake_grace=True, sleep_need=0.80),
+        None,
+        _policy(),
+    )
+    assert out.activity == A.DAZE
+    assert out.source == A.SOURCE_RETAINED
+
+
+def test_insomnia_turns_sleep_into_before_sleep():
+    out = A.enforce(
+        _facts(activity=A.DAILY, sleep_need=0.70, insomnia_roll=True),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.BEFORE_SLEEP
+    assert "睡不着" in out.note
+
+
+def test_extreme_need_overrides_insomnia_roll():
+    out = A.enforce(
+        _facts(activity=A.DAILY, sleep_need=0.95, insomnia_roll=True),
+        _request(A.SLEEP),
+        _policy(),
+    )
+    assert out.activity == A.SLEEP
 
 
 # ---------------------------------------------------------------- 时段表
 
 
-def test_rule_table_sleeps_only_when_tired():
-    tired = A.rule_based_activity(now_minutes=4 * 60, energy=2.0)
-    awake = A.rule_based_activity(now_minutes=4 * 60, energy=8.0)
+def test_rule_table_sleeps_only_when_sleepy():
+    """冷却种子：睡眠只看困意，不看钟点。"""
+
+    tired = A.rule_based_activity(now_minutes=4 * 60, sleep_need=0.70)
+    awake = A.rule_based_activity(now_minutes=4 * 60, sleep_need=0.30)
     assert tired.activity == A.SLEEP
-    assert awake.activity == A.NIGHT_STUDY
+    assert awake.activity == A.NIGHT_STUDY, "旧睡眠时段的钟点也只给醒着的种子"
+    assert A.rule_based_activity(now_minutes=15 * 60, sleep_need=0.70).activity == A.SLEEP
+    assert A.rule_based_activity(now_minutes=12 * 60, sleep_need=0.10).activity == A.DAZE
 
 
 @pytest.mark.parametrize(
@@ -783,7 +787,7 @@ def test_rule_table_sleeps_only_when_tired():
     ],
 )
 def test_rule_table_slots(now_minutes, expected):
-    assert A.rule_based_activity(now_minutes=now_minutes, energy=8.0).activity == expected
+    assert A.rule_based_activity(now_minutes=now_minutes, sleep_need=0.30).activity == expected
 
 
 def test_rule_table_is_deterministic_and_sick_aware():
@@ -797,6 +801,42 @@ def test_is_awake():
 
 
 # ---------------------------------------------------------------- 病程分层（v1.14.0）
+
+
+def test_healthy_sick_rest_exits_to_daily():
+    """病好之后 ``sick_rest`` 不是可以赖着的活动：立刻退出并换掉病中场景。"""
+
+    out = A.enforce(
+        _facts(activity=A.SICK_REST, sick=False, sleep_need=0.20),
+        None,
+        _policy(),
+    )
+    assert out.activity == A.DAILY
+    assert out.source == A.SOURCE_ENFORCED
+    assert "病好了" in out.note
+    assert out.scene and "躺着" not in out.scene
+
+
+def test_healthy_sick_rest_goes_to_sleep_when_sleepy():
+    out = A.enforce(
+        _facts(activity=A.SICK_REST, sick=False, sleep_need=0.70),
+        None,
+        _policy(),
+    )
+    assert out.activity == A.SLEEP
+    assert "病好了" in out.note
+
+
+def test_healthy_sick_rest_proposal_is_ignored():
+    """健康时提议养病 = 无效提议，不能凭空进入病中状态。"""
+
+    out = A.enforce(
+        _facts(activity=A.MUSIC, sick=False, sleep_need=0.20),
+        _request(A.SICK_REST),
+        _policy(),
+    )
+    assert out.activity == A.MUSIC
+    assert out.source == A.SOURCE_RETAINED
 
 
 def test_onset_does_not_force_sick_rest():
@@ -813,7 +853,8 @@ def test_worsening_blocks_everything_but_sleep_and_meal():
     policy = _policy()
     for activity in A.ALLOWED_ACTIVITIES:
         out = A.enforce(
-            _facts(sick=True, cold_stage=A.COLD_WORSENING, activity=A.DAILY),
+            _facts(sick=True, cold_stage=A.COLD_WORSENING, activity=A.DAILY,
+                   sleep_need=0.70 if activity == A.SLEEP else 0.25),
             _request(activity),
             policy,
         )
@@ -834,7 +875,8 @@ def test_recovering_allows_light_activities_only():
     policy = _policy()
     for activity in (A.DAILY, A.DAZE, A.MUSIC, A.SLEEP, A.MEAL):
         out = A.enforce(
-            _facts(sick=True, cold_stage=A.COLD_RECOVERING, activity=A.DAILY),
+            _facts(sick=True, cold_stage=A.COLD_RECOVERING, activity=A.DAILY,
+                   sleep_need=0.70 if activity == A.SLEEP else 0.25),
             _request(activity),
             policy,
         )

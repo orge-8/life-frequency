@@ -236,6 +236,9 @@ class FactorConfig:
     material_bonus: float = 0.15
     material_bonus_cap: float = 0.45
     sleep_debt_cap_nights: int = 3
+    #: 病后余韵期的频率因子（v1.25.0）。余韵不是生病，但也不该瞬间回到 1.0；
+    #: 0.75 表示刚从重病恢复时仍比平时安静四分之一。1.0 = 关闭过渡。
+    convalescent_factor: float = 0.75
     # 硬闸（睡眠 / 静默时段）落地时的倍率下限。0 = 真静默：宿主 _is_reply_frequency_silent()
     # 为真，不跑 Planner/Replyer，但**其它插件**的 maisaka.proactive.trigger 会被静默消费掉
     # （group-welcome 的欢迎语就是这么丢的）。>0 则不再静默，代价见 README「与其它插件共存」。
@@ -299,6 +302,7 @@ def compute_adjust(
     sleep_debt_nights: int,
     cold_stage: str = "",
     date_factor: float,
+    convalescent: bool = False,
     material_count: float,
     now_minutes: int,
     config: FactorConfig,
@@ -380,7 +384,17 @@ def compute_adjust(
         deprived = float(config.health_factors.get("sleep_deprived", 1.0))
         factors.append(("熬夜上限被压低", deprived))
         health_factor *= deprived
-    if not sick and int(sleep_debt_nights) < int(config.sleep_debt_cap_nights):
+    if convalescent and not sick:
+        # v1.25.0：病程结束后的余韵不按「生病」再乘一次，只保留一个温和的
+        # 过渡因子；这样健康因子不会从 worsening 的 0.15 一步跳回 1.0。
+        transition = max(0.2, min(1.0, float(config.convalescent_factor)))
+        factors.append(("病后余韵", transition))
+        health_factor *= transition
+    if (
+        not sick
+        and not convalescent
+        and int(sleep_debt_nights) < int(config.sleep_debt_cap_nights)
+    ):
         factors.append(("健康", health_factor))
     raw *= health_factor
 

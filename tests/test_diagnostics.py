@@ -126,8 +126,9 @@ def _write_healthy(base: pathlib.Path, now: float) -> None:
             S.enforce_and_apply(
                 state, now=moment, config=config,
                 decision=A.rule_based_activity(
-                    now_minutes=facts.now_minutes, energy=facts.energy,
-                    sleep_energy_threshold=config.sleep_energy_threshold,
+                    now_minutes=facts.now_minutes,
+                    sleep_need=float(facts.sleep_need),
+                    sleep_need_onset=config.sleep_need_onset,
                 ),
             )
     # 真机里这些字段由 plugin 侧维护；夹具补上「健康值」，否则会误报成模型故障
@@ -365,11 +366,10 @@ def test_real_world_problems_are_all_reported(tmp_path):
     now = time.time()
     data = _write_real_world(tmp_path, now)
     code, report, _name = _run(tmp_path, data)
-    # v1.19.0（PR-AF-1 配套）起，全天睡眠窗与「没写倍率」在该设计目标下是**预期配置**，
-    # 不再算 FAIL ⇒ 这里不再要求 code == 1，而是要求「真问题一条不少地在报告里」，
-    # 同时**不许**再出现全天睡眠窗的 FAIL。
+    # v1.24.0：睡眠时段退役（睡不睡只看困意），诊断不再按窗口长短判作息——
+    # 无论 24h 还是 03:00-11:00 都只报一条「已退役」，不许再出「覆盖全天」的告警。
     assert "总判定" in report
-    assert "sleep_window 覆盖一天中的 24.0 小时（≈ 全天）" not in report
+    assert "sleep_window 覆盖一天中的" not in report
     assert code in (0, 1)
 
     for needle in (
@@ -379,23 +379,17 @@ def test_real_world_problems_are_all_reported(tmp_path):
     ):
         assert needle in report, needle
 
-    # v1.19.0（PR-AF-1 配套）：全天睡眠窗与「没写倍率」不再被当成故障——
-    # 当设计目标是「状态驱动、不看钟点」时，24h 覆盖等价于取消时间限制；
-    # dry_run 是有意的观测阶段选择，「没写倍率」是它的必然后果。它们改报 OK，
-    # 并给出「怎么切回旧口径」的开关。
+    # v1.24.0：窗口字段保留但不再参与判定，报告必须说清楚「改它没用」；
+    # dry_run 是有意的观测阶段选择，改报 OK。
     for needle in (
-        "sleep_window 覆盖 24.0 小时（钟点作息未启用，按设计放过）",
+        "sleep_window 已退役（v1.24.0 起作息由困意决定）",
         "演算模式下不写宿主（符合预期）",
     ):
         assert needle in report, needle
 
-    # 反过来：明确要钟点作息时，旧判据必须回来（否则切回旧口径没有验证）。
-    clocky = _write_real_world(tmp_path, now)
-    text = (clocky / "config.toml").read_text(encoding="utf-8")
-    text += "\n[diagnostics]\nclock_aware = true\n"
-    (clocky / "config.toml").write_text(text, encoding="utf-8")
-    _code2, report2, _n2 = _run(tmp_path, clocky)
-    assert "sleep_window 覆盖一天中的 24.0 小时（≈ 全天）" in report2
+    # 生效配置里也不许再列 sleep_window——列出来等于宣称它还在起作用。
+    assert "| `sleep_window` |" not in report
+    assert "| `sleep_need_onset` |" in report
 
 
 def test_no_runtime_data_never_claims_normal_operation(tmp_path):

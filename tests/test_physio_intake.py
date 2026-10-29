@@ -289,12 +289,11 @@ def test_physio_window_and_routine_share_one_meal():
 
 def _dwell_policy(**overrides):
     base = dict(
-        sleep_window=(3 * 60, 11 * 60),
-        sleep_energy_threshold=3.0,
         max_sleep_hours=12.0,
-        min_awake_hours_per_day=8.0,
         min_dwell_minutes=60,
         min_sleep_minutes=180,
+        sleep_need_onset=0.62,
+        sleep_need_wake=0.16,
     )
     base.update(overrides)
     return A.EnforcePolicy(**base)

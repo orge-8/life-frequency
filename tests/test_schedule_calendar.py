@@ -165,8 +165,8 @@ def test_enforce_facts_passes_the_override_through():
     assert aware.schedule.is_workday is False
     assert aware.schedule.phase == A.SCHEDULE_REST_DAY
     assert any("国庆节" in line for line in aware.schedule.prompt_lines)
-    # rest_day 也自动跟着变（原来只看班表工作日，现在吃日历）
-    assert aware.rest_day is True
+    # 休息日的判定完全跟着日历走（rest_day 事实已随体力唤醒一起退役）
+    assert aware.schedule.phase == A.SCHEDULE_REST_DAY
 
     reason = S.pointless_ask_reason(
         state, now=now, config=config, workday_override=False, day_name="国庆节"

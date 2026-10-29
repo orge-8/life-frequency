@@ -349,3 +349,151 @@ def test_wake_private_scope_resolution(scope, legacy, admins, uid, expected):
         resolved == "admin" and stub._is_admin_user(uid, platform="qq")
     )
     assert allowed is expected
+
+
+class _FlushStub(CatchupHostMixin):
+    def __init__(self):
+        from life_sim import LifeState
+
+        self._init_catchup()
+        self._stopping = False
+        self._state = LifeState()
+        self.config = types.SimpleNamespace(plugin=types.SimpleNamespace(enabled=True))
+        self.logs = []
+
+    def _module_log(self, level, text, *args):
+        self.logs.append((level, text % args))
+
+    def _is_paused(self):
+        return False
+
+    def _catchup_rules(self):
+        return _rules()
+
+
+def test_flush_offsets_use_batch_clock_and_isolate_failure(monkeypatch):
+    import asyncio
+    import life_catchup_host as H
+
+    async def run():
+        stub = _FlushStub()
+        clock = [100.0]
+        seen = []
+        waits = []
+
+        async def sleep(delay):
+            waits.append(delay)
+            clock[0] += delay
+
+        async def trigger(candidate, **kwargs):
+            seen.append((candidate.session_id, clock[0] - 100.0))
+            clock[0] += 2.0
+            if candidate.session_id == "s0":
+                raise RuntimeError("injected failure")
+
+        stub._catchup_trigger = trigger
+        with monkeypatch.context() as patch:
+            patch.setattr(H.time, "monotonic", lambda: clock[0])
+            patch.setattr(H.asyncio, "sleep", sleep)
+            stub._spawn_catchup_flush(
+                [(delay, _candidate(f"s{i}", f"p{i}")) for i, delay in enumerate([10, 5, 20])],
+                now=1000.0, sleep_minutes=120,
+            )
+            await stub._catchup_task
+        assert seen == [("s0", 10.0), ("s1", 12.0), ("s2", 20.0)]
+        assert waits == [10.0, 6.0]
+        assert any("injected failure" in message for _, message in stub.logs)
+
+    asyncio.run(run())
+
+
+def test_flush_does_not_replace_active_task():
+    import asyncio
+
+    async def run():
+        stub = _FlushStub()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        seen = []
+
+        async def trigger(candidate, **kwargs):
+            seen.append(candidate.session_id)
+            entered.set()
+            await release.wait()
+
+        stub._catchup_trigger = trigger
+        stub._spawn_catchup_flush([(0, _candidate("s1", "p1"))], now=1000, sleep_minutes=120)
+        first = stub._catchup_task
+        await asyncio.wait_for(entered.wait(), 1)
+        try:
+            stub._spawn_catchup_flush([(0, _candidate("s2", "p2"))], now=1000, sleep_minutes=120)
+            assert stub._catchup_task is first
+            assert stub._catchup_pending_wake is True
+            assert seen == ["s1"]
+        finally:
+            release.set()
+            await asyncio.gather(first, stub._catchup_task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_config_cancellation_invalidates_scan_in_flight(monkeypatch):
+    import asyncio
+    import life_catchup_host as H
+    from life_sim import SimConfig
+
+    async def run():
+        stub = _FlushStub()
+        stub._routine_store = S.MemoryStore()
+        stub._routine_store.add_sleep_backlog("p1", "s1", at=1000.0, text="在吗")
+        stub._relation_familiarity = {}
+        stub._sim_config = lambda: SimConfig()
+        scheduled = []
+        stub._spawn_catchup_flush = lambda *args, **kwargs: scheduled.append(args)
+
+        async def query(fn, *args, **kwargs):
+            result = fn(*args, **kwargs)
+            await stub._cancel_catchup_flush()
+            stub._catchup_scanned = False
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(H.asyncio, "to_thread", query)
+            await stub._maybe_catchup(1000.0)
+        assert scheduled == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stop", ["stopping", "sleep", "disabled", "paused", "catchup_disabled"])
+def test_flush_rechecks_state_after_wait(monkeypatch, stop):
+    import asyncio
+    import life_catchup_host as H
+
+    async def run():
+        stub = _FlushStub()
+        seen = []
+
+        async def trigger(candidate, **kwargs):
+            seen.append(candidate.session_id)
+
+        async def sleep(delay):
+            if stop == "stopping":
+                stub._stopping = True
+            elif stop == "sleep":
+                stub._state.activity = "sleep"
+            elif stop == "disabled":
+                stub.config.plugin.enabled = False
+            elif stop == "paused":
+                stub._is_paused = lambda: True
+            else:
+                stub._catchup_rules = lambda: _rules(active_enabled=False)
+
+        stub._catchup_trigger = trigger
+        with monkeypatch.context() as patch:
+            patch.setattr(H.asyncio, "sleep", sleep)
+            stub._spawn_catchup_flush([(10, _candidate("s1", "p1"))], now=1000, sleep_minutes=120)
+            await stub._catchup_task
+        assert seen == []
+
+    asyncio.run(run())

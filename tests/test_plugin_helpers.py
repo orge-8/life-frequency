@@ -140,6 +140,10 @@ def test_config_model_defaults_are_present():
     assert config.security.admin_ids == []
     assert config.proactive.enabled is False
     assert config.prompt.inject_enabled is True
+    # v1.25.0：病程风险拆分与恢复过渡字段必须出现在默认配置里。
+    assert config.health.cold_low_energy_risk == pytest.approx(0.03)
+    assert config.health.cold_daily_risk_cap == pytest.approx(0.20)
+    assert config.health.cold_convalescent_factor == pytest.approx(0.75)
 
 
 def test_config_model_nested_section_is_addressable():

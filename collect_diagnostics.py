@@ -771,47 +771,14 @@ def collect_config(report: Report, path: pathlib.Path | None, pure: "PurePlugin"
     raw_window = str(simulation.get("sleep_window") or "").strip()
     detail["sleep_window"] = raw_window
     if raw_window:
-        match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$", raw_window)
-        if not match:
-            report.add("WARN", "sleep_window 无法解析（会回退默认 03:00-11:00）",
-                       evidence=raw_window, fix='写成 "HH:MM-HH:MM"', scope="配置")
-        else:
-            start = int(match.group(1)) * 60 + int(match.group(2))
-            end = int(match.group(3)) * 60 + int(match.group(4))
-            span = (end - start) % 1440
-            if span == 0:
-                report.add("WARN", "sleep_window 是零长度窗口（等于没有睡眠时段）",
-                           evidence=raw_window, fix='例如 "03:00-11:00"', scope="配置")
-            elif span >= 20 * 60:
-                # v1.19.0（PR-AF-1 配套）：24h/长窗口本身**不是**故障。当设计目标是
-                # 「状态驱动、不看钟点」时，24h 覆盖等价于「取消时间限制」，是自洽的；
-                # 只有当你确实想要钟点作息时它才是问题。默认按前者放过，
-                # ``[diagnostics] clock_aware = true`` 切回旧判据。
-                if diagnostics.get("clock_aware", False):
-                    report.add("FAIL", f"sleep_window 覆盖一天中的 {span / 60:.1f} 小时"
-                                       "（≈ 全天）",
-                               evidence=f"{raw_window}：她几乎**随时**都有资格入睡，"
-                                        "清醒时段会被睡眠吃掉（真机实测：活动长期是 sleep）",
-                               fix='改成真实作息，例如 "03:00-11:00"', scope="配置")
-                else:
-                    report.add("OK", f"sleep_window 覆盖 {span / 60:.1f} 小时"
-                                     "（钟点作息未启用，按设计放过）",
-                               evidence=f"{raw_window}：当前设计目标是不看钟点、由状态决定，"
-                                        "全天覆盖等价于取消时间限制，属预期配置。"
-                                        "真要按钟点作息：把它收窄，或把 "
-                                        "[diagnostics] clock_aware 打开恢复旧告警",
-                               scope="配置")
-            elif span >= 16 * 60:
-                if diagnostics.get("clock_aware", False):
-                    report.add("WARN", f"sleep_window 覆盖一天中的 {span / 60:.1f} 小时",
-                               evidence=f"{raw_window}（她在窗口内会被判定为「该睡」）",
-                               fix="确认这是有意的（过长会把大部分活动挤成睡眠）", scope="配置")
-                else:
-                    report.add("OK", f"sleep_window 覆盖 {span / 60:.1f} 小时"
-                                     "（钟点作息未启用，按设计放过）",
-                               evidence=f"{raw_window}；若要恢复旧告警，"
-                                        "打开 [diagnostics] clock_aware",
-                               scope="配置")
+        # v1.24.0：睡眠时段退役，睡不睡只看困意（sleep_need / 昼夜偏置 / 生病）。
+        # 字段仍留在配置里是为了不打断旧配置，但它**不再参与任何判定**；继续按
+        # 窗口长短判「作息是否合理」等于告诉用户改一个不生效的开关。
+        report.add("OK", "sleep_window 已退役（v1.24.0 起作息由困意决定）",
+                   evidence=f"配置里是 {raw_window}；它不再影响入睡——全天覆盖与窄窗口一样",
+                   fix="想调作息改 [simulation] 的 sleep_need_onset / sleep_need_wake / "
+                       "sleep_target_hours；窗口字段可原样保留（会被忽略）",
+                   scope="配置")
 
     quiet = frequency.get("quiet_hours")
     if isinstance(quiet, list) and quiet:
@@ -971,7 +938,11 @@ def _state_checks(report: Report, state: Mapping[str, Any], *, tz: int, now: flo
                    "sleep_minutes_today": as_int(state.get("sleep_minutes_today")),
                    "awake_minutes_today": as_int(state.get("awake_minutes_today")),
                    "continuous_awake_minutes": as_int(state.get("continuous_awake_minutes")),
+                   # v1.24.0：睡不睡只看困意；旧「按醒来次数加减」的睡债已退役，
+                   # 迁移时原值转进 legacy 字段留档（仅作证据，不参与任何判定）。
+                   "sleep_need": as_float(state.get("sleep_need")),
                    "sleep_debt_nights": as_int(state.get("sleep_debt_nights")),
+                   "legacy_sleep_debt_nights": as_int(state.get("legacy_sleep_debt_nights")),
                    "stress": as_float(state.get("stress")),
                    "loneliness": as_float(state.get("loneliness")),
                    "social_battery": as_float(state.get("social_battery")),
@@ -983,6 +954,12 @@ def _state_checks(report: Report, state: Mapping[str, Any], *, tz: int, now: flo
     if energy > cap + 1e-6:
         report.add("WARN", f"{label}：体力超过上限", evidence=f"{energy:.2f} > {cap:.2f}",
                    fix="正常不会发生（settle 会钳）；确认状态文件没被手改", scope="状态")
+    if as_int(state.get("sleep_debt_nights")) > 0:
+        report.add("WARN", f"{label}：旧「按醒来次数」的睡债仍在状态里",
+                   evidence=f"sleep_debt_nights = {as_int(state.get('sleep_debt_nights'))}"
+                            "（v1.24.0 起缺觉只按时间口径重算，这个值应为 0）",
+                   fix="确认状态文件没被手改；插件加载时会把它转进 "
+                       "legacy_sleep_debt_nights 并清零", scope="状态")
     afterglow_cap = as_float(_section(config, "emotion_energy").get("afterglow_cap"), 0.6) or 0.6
     if abs(afterglow) > afterglow_cap + 1e-6:
         report.add("WARN", f"{label}：余波超过配置上限", evidence=f"{afterglow:+.2f}（上限 ±{afterglow_cap}）",
@@ -1011,7 +988,8 @@ def _state_checks(report: Report, state: Mapping[str, Any], *, tz: int, now: flo
         if awake_minutes > 30 * 60:
             report.add("FAIL", f"{label}：连续清醒 {awake_minutes / 60:.1f} 小时仍未入睡",
                        evidence="清醒疲劳会把体力持续压低，说明睡眠链路没有生效",
-                       fix="看日志有没有「强制入睡」；确认 sleep_window 与睡眠阈值配置合理",
+                       fix="看日志有没有「强制入睡」；确认 [simulation] sleep_need_onset / "
+                           "sleep_need_wake 没被改到极端值（睡不睡只看困意）",
                        scope="状态")
         elif awake_minutes > 20 * 60:
             report.add("WARN", f"{label}：连续清醒 {awake_minutes / 60:.1f} 小时",
@@ -1147,11 +1125,13 @@ def _state_checks(report: Report, state: Mapping[str, Any], *, tz: int, now: flo
                    scope="状态")
 
     # ---- 各种临时窗口（能看出机制是否在跑）----
+    # v1.24.0：``rested_until``（体力满后的抑制）已退役，换成本轮真正生效的
+    # 「睡前陪聊预算」（sleep_defer_until）；否则窗口表会把一个死字段显示成机制。
     windows = {
         "被 @ 唤醒窗口": as_float(state.get("at_wake_until"), 0.0) or 0.0,
         "赖床宽限窗": as_float(state.get("wake_grace_until"), 0.0) or 0.0,
         "打断窗口": as_float(state.get("interrupt_until"), 0.0) or 0.0,
-        "躺够一轮的抑制": as_float(state.get("rested_until"), 0.0) or 0.0,
+        "睡前陪聊预算": as_float(state.get("sleep_defer_until"), 0.0) or 0.0,
     }
     detail["windows"] = {key: value for key, value in windows.items() if value}
     detail["interrupted_from"] = state.get("interrupted_from")
@@ -1744,8 +1724,9 @@ def offline_simulate(report: Report, plugin_dir: pathlib.Path, *, hours: float,
             facts = pure.sim.enforce_facts(state, now=now_step, config=config_obj)
             if not facts.sick:
                 proposal = pure.activity.rule_based_activity(
-                    now_minutes=facts.now_minutes, energy=facts.energy,
-                    sleep_energy_threshold=config_obj.sleep_energy_threshold,
+                    now_minutes=facts.now_minutes,
+                    sleep_need=float(facts.sleep_need),
+                    sleep_need_onset=config_obj.sleep_need_onset,
                 )
                 pure.sim.enforce_and_apply(state, now=now_step, config=config_obj,
                                            decision=proposal)
@@ -1938,7 +1919,16 @@ def build_report(plugin_dir: pathlib.Path, *, data_dir: pathlib.Path | None,
     config_detail["effective"] = {
         "tick_seconds": as_int(_section(config_payload, "simulation").get("tick_seconds"), 600),
         "tz_offset_minutes": tz,
-        "sleep_window": _section(config_payload, "simulation").get("sleep_window"),
+        # v1.24.0：睡不睡只看这四个值（外加昼夜偏置与生病）。sleep_window 已退役，
+        # 不再列进「生效配置」——列出来会让人以为它还在起作用。
+        "sleep_need_onset": as_float(
+            _section(config_payload, "simulation").get("sleep_need_onset"), 0.62),
+        "sleep_need_wake": as_float(
+            _section(config_payload, "simulation").get("sleep_need_wake"), 0.16),
+        "sleep_target_hours": as_float(
+            _section(config_payload, "simulation").get("sleep_target_hours"), 8.0),
+        "sleep_deferral_minutes": as_int(
+            _section(config_payload, "simulation").get("sleep_deferral_minutes"), 15),
         "sleep_energy_threshold": _section(config_payload, "simulation").get(
             "sleep_energy_threshold"),
         "filter_mode": _section(config_payload, "apply").get("filter_mode"),
@@ -2205,7 +2195,13 @@ def render_markdown(report: Report, *, now: float, tz: int, code: Mapping[str, A
         lines.append(f"| 今日已睡 / 清醒 | {state.get('sleep_minutes_today')} 分钟 / "
                      f"{state.get('awake_minutes_today')} 分钟（连续清醒 "
                      f"{(state.get('continuous_awake_minutes') or 0) / 60:.1f} 小时） |")
-        lines.append(f"| 熬夜债 | {state.get('sleep_debt_nights')} 晚 |")
+        need = state.get("sleep_need")
+        lines.append(f"| 困意 | {need:.2f}（0=不困，1=最困；睡不睡只看它） |"
+                     if isinstance(need, (int, float)) else "| 困意 | — |")
+        legacy_nights = state.get("legacy_sleep_debt_nights") or 0
+        lines.append(f"| 熬夜债 | {state.get('sleep_debt_nights')} 晚"
+                     + (f"（旧模型留档 {legacy_nights} 晚，仅作证据）" if legacy_nights else "")
+                     + " |")
         lines.append(f"| 内心 | 压力 {state.get('stress')} / 孤独 {state.get('loneliness')}"
                      f" / 电量 {state.get('social_battery')} |")
         lines.append(f"| 生活循环 | 最近推进距今 "
@@ -3269,7 +3265,7 @@ def take_sample(ctx: WatchContext, *, now: float, sample_index: int, uptime: flo
                       fix="宿主读不出配置会退回默认值：先修 TOML 语法", scope="配置")
     else:
         check.add("WARN", "监控：未找到 config.toml",
-                  evidence="判定退回内置默认值（tick 600s / sleep_window 03:00-11:00 …），"
+                  evidence="判定退回内置默认值（tick 600s / 困意阈 0.62 / 时段表 …），"
                            "阈值可能与真机不一致",
                   fix="用 --config 指定宿主落盘的配置", scope="配置")
     tz = as_int(_section(config_payload, "simulation").get("tz_offset_minutes"), 480)
@@ -3791,7 +3787,7 @@ def dynamics_findings(rows: Sequence[Mapping[str, Any]],
                       *, config: Mapping[str, Any]) -> list[dict[str, Any]]:
     """v1.19.0（PR-AF-1 配套）：**循环动力学**判据（跨样本，六条）。
 
-    配置侧判据只看得见表面的 ``sleep_window`` / ``dry_run``；真正决定「她过得好不好」
+    配置侧判据只看得见表面的 ``dry_run`` / 静默时段；真正决定「她过得好不好」
     的是跨样本的循环形态——清醒能不能维持、内心维度是否在动、体力是否失去弹性。
     真机 2026-10-13 的教训是：这三条全绿、配置看着正常，而她 82.8% 的时间在睡觉、
     孤独 152/152 恒为 0、清醒只剩 1 个 tick。

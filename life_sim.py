@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import random
 import re
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -49,11 +49,8 @@ try:  # 包式加载（Runner 真机）
         EnforcePolicy,
         ScheduleConfig,
         enforce,
-        in_window,
         is_asleep,
         is_awake,
-        minutes_until_window_exit,
-        NIGHT_BREAK_RESUME_SECONDS,
         normalize_cold_stage,
         normalize_side,
         on_sick_leave,
@@ -91,11 +88,8 @@ except ImportError:  # 平铺兜底（脚本直跑 / 测试）
         EnforcePolicy,
         ScheduleConfig,
         enforce,
-        in_window,
         is_asleep,
         is_awake,
-        minutes_until_window_exit,
-        NIGHT_BREAK_RESUME_SECONDS,
         normalize_cold_stage,
         normalize_side,
         on_sick_leave,
@@ -108,14 +102,20 @@ except ImportError:  # 平铺兜底（脚本直跑 / 测试）
     from life_factors import interpolate  # type: ignore[no-redef]
     from life_physio import settle_satiety  # type: ignore[no-redef]
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_TZ_OFFSET_MINUTES = 480  # UTC+8
 BASELINE_EMOTION = 5.0
 EMOTION_MAX = 10.0
 ENERGY_MAX = 10.0
+#: 睡眠账本的保留时长（秒）。欠债窗口默认 72 小时，账本必须比它长，
+#: 否则窗口边缘的睡眠段会被提前裁掉、欠债凭空变大。
+SLEEP_LEDGER_RETENTION_HOURS = 24.0 * 8.0
 #: 连续清醒分钟数的上限（v1.16.0 M1 的字段防御）。365 天足够长，更大的值只可能是
 #: 坏状态文件——一个 ``1e18`` 会让疲劳曲线取到端点值，她从此再也睡不着。
 MAX_CONTINUOUS_AWAKE_MINUTES = 366 * 24 * 60
+#: 夜醒后的「同一夜」窗口（秒）：这段时间里再睡下算**续上一觉**（保留入睡锚点
+#: 与已结算时长），不按一次全新的睡眠从零起算。
+NIGHT_BREAK_RESUME_SECONDS = 3600.0
 #: 高压崩溃事件的键（v1.16.2 M3a）——与病程各阶段键同层级的确定性事件标识。
 STRESS_BREAKDOWN = "stress_breakdown"
 
@@ -297,28 +297,34 @@ class SimConfig:
     offline_gap_minutes: int = 30
     tz_offset_minutes: int = DEFAULT_TZ_OFFSET_MINUTES
     day_boundary_hour: int = 12
-    sleep_window: tuple[int, int] = (3 * 60, 11 * 60)
-    sleep_window_text: str = "03:00-11:00"
+    #: 低体力参考线：只用于**病程/感冒风险**（低于它更容易加重或中招），
+    #: 不再参与入睡资格。睡不睡只看困意（``sleep_need`` 系列）。
     sleep_energy_threshold: float = 3.0
     max_sleep_hours: float = 12.0
-    min_awake_hours_per_day: float = 8.0
-    #: 感冒**初起**是否也不短路「每日清醒下限」（v1.19.0 PR-AF-1，默认 True）。
-    #: False = 回到 v1.18.1 的「生病即短路」一刀切。详见
-    #: ``life_activity._sick_sleep_short_circuit``。
-    cold_onset_awake_floor: bool = True
+
+    # ---- 身体驱动睡眠（v1.24.0）----
+    #: 困意（0–1，独立于体力）。醒着按 ``sleep_need_awake_gain_per_hour`` 累积，
+    #: 睡着按 ``sleep_need_sleep_recovery_per_hour`` 消退；小睡只按比例消退。
+    sleep_need_onset: float = 0.62
+    sleep_need_wake: float = 0.16
+    sleep_need_awake_gain_per_hour: float = 0.029
+    sleep_need_sleep_recovery_per_hour: float = 0.058
+    sleep_need_nap_recovery_ratio: float = 0.40
+    #: 小睡资格线：困意达到它才成立（不再用体力阈值）。
+    sleep_need_nap_threshold: float = 0.42
+    #: 昼夜节律对**入睡倾向**的软偏置（峰值 03:00 加、谷值 15:00 减）。
+    #: 只影响「什么时候更容易困」，**不禁止白天睡**、也不单独叫醒她。
+    sleep_circadian_strength: float = 0.05
+    #: 睡前陪聊预算（分钟）：第一次「该睡了」但正在回消息时开一个截止时刻，
+    #: 最多顺延这么久；新消息不会重置它。
+    sleep_deferral_minutes: int = 15
+    #: 欠债口径（时间）：最近窗口内「目标睡眠 − 实际睡眠」的正差额。
+    sleep_target_hours: float = 8.0
+    sleep_deficit_window_hours: float = 72.0
+    #: 窗口内「未知时间」超过它就不出欠债结论（显示「记录不足」）。
+    sleep_unknown_tolerance_minutes: float = 60.0
     min_dwell_minutes: int = 60
     min_sleep_minutes: int = 180
-    #: 睡眠中体力恢复到上限就强制唤醒（v1.6.0：**不再要求睡满最短时长**——
-    #: 体力满了继续躺只是空转，真机实测她带着 10.0/10 又睡了 73 分钟）。
-    #: 默认开；关掉则回到「模型提议醒 / 睡满每日上限」两条路。
-    energy_full_wake: bool = True
-    #: 「体力满唤醒」的最短睡眠目标（小时，v1.15.0 PR-S1）。0 = v1.6.0 旧行为。
-    #: 默认 6.5：断开「熬夜帽压低上限 → 睡得更短 → 债还不清」的正反馈。
-    energy_full_wake_min_hours: float = 6.5
-    #: 休息日在最短睡眠目标上额外顺延的分钟数（v1.15.0 PR-R4）；0 = 不区分。
-    rest_day_sleep_extension_minutes: float = 60.0
-    #: 体力 ≤ 它就无视模型提议强制入睡（v1.15.0 PR-S3）；0 = 关闭。
-    sleep_hard_floor: float = 0.5
     #: 习惯表 / 生理窗能不能把她从睡眠里叫起来（v1.15.0 PR-S2）。
     #: 默认 False = 睡眠优先。
     routine_can_wake: bool = False
@@ -329,7 +335,6 @@ class SimConfig:
     nap_enabled: bool = True
     nap_min_minutes: int = 20
     nap_max_minutes: int = 90
-    nap_energy_threshold: float = 4.0
     #: 入睡困难（v1.15.0 PR-R2）：压力 ≥ 阈值时按概率把入睡收口成「睡不着」。
     insomnia_enabled: bool = True
     insomnia_stress_threshold: float = 7.0
@@ -420,12 +425,19 @@ class SimConfig:
     cold_check_hour: int = 2
     cold_min_days: int = 1
     cold_max_days: int = 3
-    cold_base_risk: float = 0.05
-    cold_sleep_debt_risk: float = 0.08
+    cold_base_risk: float = 0.012
+    cold_sleep_debt_risk: float = 0.03
+    #: 低体力风险与缺觉风险分开（v1.25.0）：旧版共用一个参数，最坏情况
+    #: 5% + 3×8% + 8% = 37%/日。拆分后每个成因只出一次。
+    cold_low_energy_risk: float = 0.03
+    #: 单日风险的最终上限；季节倍率之后仍受它约束。
+    cold_daily_risk_cap: float = 0.20
+    #: 余韵期频率因子（不是病程阶段）；避免 0.15 → 1.0 的单步跳变。
+    cold_convalescent_factor: float = 0.75
 
     # ---- 病程系统（v1.14.0）----
     #: 痊愈后几天内不再掷中招骰子（修「病好第二天就能无缝再病」）。
-    cold_immunity_days: int = 5
+    cold_immunity_days: int = 7
     #: 阶段 → 健康因子（初起/加重/好转）。空 = 回退 ``[health] health_factors.cold``。
     cold_stage_factors: dict[str, float] = field(
         default_factory=lambda: {"onset": 0.7, "worsening": 0.15, "recovering": 0.5}
@@ -558,54 +570,39 @@ def activity_effect_lines(
         "不同活动会抽到不同的事）。"
     )
 
-    # ---- 今日已睡 / 清醒 + 睡眠怎么结束 ----
+    # ---- 今日已睡 / 清醒 + 睡眠怎么结束（v1.24.0：身体驱动）----
     lines.append(
-        f"今日已睡/清醒：睡觉与小睡都计入「已睡」，其余活动都计入「清醒」；"
-        f"已睡累计（或这一觉连续）到 {config.max_sleep_hours:g} 小时会被强制叫醒；"
-        f"清醒不足 {config.min_awake_hours_per_day:g} 小时则不许入睡"
-        f"（生病或体力低于 {config.sleep_energy_threshold:g} 时不受此限）。"
+        f"今日已睡/清醒：睡觉与小睡都计入「已睡」，其余活动都计入「清醒」。"
+        f"睡不睡由**困意**决定：困意到 {config.sleep_need_onset:.2f} 就会睡；"
+        f"本次连续睡满 {config.min_sleep_minutes} 分钟**且**困意退到 "
+        f"{config.sleep_need_wake:.2f} 以下才自然醒。体力低只影响她的状态与消耗，"
+        "回满也不代表睡够了；没有硬性睡眠时段，白天能睡、夜里也能醒着。"
+        f"单次连续睡眠到 {config.max_sleep_hours:g} 小时会被异常叫醒"
+        "（这只是防卡死的兜底，不是常规作息）。"
     )
-    if config.energy_full_wake:
-        min_hours = max(0.0, float(getattr(config, "energy_full_wake_min_hours", 0.0) or 0.0))
-        if min_hours > 0:
-            extra = ""
-            rest_extra = max(
-                0.0, float(getattr(config, "rest_day_sleep_extension_minutes", 0.0) or 0.0)
-            )
-            if rest_extra > 0:
-                extra = f"（休息日多睡 {rest_extra / 60.0:g} 小时）"
-            lines.append(
-                f"睡觉怎么结束：体力回到上限**且**睡够 {min_hours:g} 小时才醒{extra}"
-                f"（上限随熬夜天数变，见下条）；或睡满 {config.max_sleep_hours:g} 小时被强制唤醒。"
-            )
-        else:
-            lines.append(
-                "睡觉怎么结束：体力回到上限就立刻醒（上限随熬夜天数变，见下条），"
-                f"不会睡到自然醒；或睡满 {config.max_sleep_hours:g} 小时被强制唤醒。"
-            )
 
-    # ---- 小睡（v1.15.0 PR-R1）----
+    # ---- 小睡（v1.15.0 PR-R1；v1.24.0 改为困意门槛）----
     if bool(getattr(config, "nap_enabled", False)):
         nap_delta = _as_float(dict(config.energy_delta_per_hour).get(NAP), 0.0) or 0.0
+        ratio = max(0.0, min(1.0, float(config.sleep_need_nap_recovery_ratio)))
         lines.append(
-            f"小睡：白天（睡眠时段之外）真的困了才眯一会儿，最多 "
+            f"小睡：困意到 {config.sleep_need_nap_threshold:.2f} 就能眯一会儿，最多 "
             f"{max(1, int(config.nap_max_minutes))} 分钟；体力每小时 "
-            f"{nap_delta:+.2f}（比睡觉弱）、不做梦，睡着时同样完全静默。"
+            f"{nap_delta:+.2f}（比睡觉弱），困意只按 {ratio:.0%} 消退（补不了整觉）、"
+            "不做梦，睡着时同样完全静默。"
         )
 
-    # ---- 熬夜与体力上限 ----
-    recovery = max(0, int(getattr(config, "sleep_debt_recovery_step", 0) or 0))
-    recovery_text = (
-        f"睡够的一晚会清掉 {recovery} 晚熬夜债（连熬要多睡几晚才还清）"
-        if recovery > 0
-        else "睡够的一晚会把熬夜天数直接清零"
+    # ---- 缺觉与体力上限（v1.24.0：按时间算，不按醒来次数）----
+    night_minutes = max(
+        30.0,
+        config.sleep_target_hours * 60.0 - float(config.sleep_debt_threshold_minutes),
     )
     lines.append(
-        f"熬夜与上限：每次睡醒按最近 24 小时实际睡够多少判，低于 "
-        f"{config.sleep_debt_threshold_minutes / 60.0:g} 小时算一夜没睡够；"
-        f"{recovery_text}；连 {config.sleep_debt_cap_nights} 夜会把体力上限从 "
-        f"{config.energy_max:g} 压到 {config.sleep_deprived_energy_cap:g}"
-        f"（上限变低也更容易感冒）。"
+        f"缺觉与上限：按最近 {config.sleep_deficit_window_hours:g} 小时**实际睡了多少**"
+        f"与目标（{config.sleep_target_hours:g} 小时/天）的差额算；差额累计到约 "
+        f"{config.sleep_debt_cap_nights:g} 晚（每晚会 {night_minutes / 60.0:g} 小时）"
+        f"就把体力上限从 {config.energy_max:g} 压到 "
+        f"{config.sleep_deprived_energy_cap:g}，也更容易感冒。记录不足时不会声称缺觉。"
     )
 
     # ---- 感冒（v1.14.0：分阶段的病程，不再是「一段连续的只能养病」）----
@@ -613,8 +610,9 @@ def activity_effect_lines(
         f"感冒：每天 {config.cold_check_hour}:00 之后判一次，基础 "
         f"{_clamp(config.cold_base_risk, 0.0, 1.0):.0%}，每有一晚没睡够 +"
         f"{_clamp(config.cold_sleep_debt_risk, 0.0, 1.0):.0%}，"
-        f"体力低于 {config.sleep_energy_threshold:g} 时再 +"
-        f"{_clamp(config.cold_sleep_debt_risk, 0.0, 1.0):.0%}；中招大约 "
+        f"体力低于 {config.sleep_energy_threshold:g} 时另 +"
+        f"{_clamp(config.cold_low_energy_risk, 0.0, 1.0):.0%}；"
+        f"单日总风险封顶 {_clamp(config.cold_daily_risk_cap, 0.05, 0.95):.0%}；中招大约 "
         f"{config.cold_min_days}~{max(config.cold_min_days, config.cold_max_days)} 天，"
         "病程分三段：初起（嗓子不舒服但还能做事）、加重（只能躺着养病）、"
         "好转（能起来做点轻的）；每天按她睡够没有、有没有在休息"
@@ -691,27 +689,22 @@ def build_enforce_policy(config: SimConfig) -> EnforcePolicy:
     """把 SimConfig 里与 ``enforce`` 有关的部分抽出来。"""
 
     return EnforcePolicy(
-        sleep_window=config.sleep_window,
-        sleep_energy_threshold=config.sleep_energy_threshold,
         max_sleep_hours=config.max_sleep_hours,
-        min_awake_hours_per_day=config.min_awake_hours_per_day,
-        cold_onset_awake_floor=bool(getattr(config, "cold_onset_awake_floor", True)),
         min_dwell_minutes=config.min_dwell_minutes,
         min_sleep_minutes=config.min_sleep_minutes,
-        energy_full_wake=config.energy_full_wake,
-        # v1.15.0（睡眠改进方案）：时长目标 / 硬底线 / 赖床 / 小睡 / 失眠 + 两个
-        # 「睡眠优先」开关。默认值即方案推荐值，全部可配、可关。
-        energy_full_wake_min_hours=config.energy_full_wake_min_hours,
-        rest_day_sleep_extension_minutes=config.rest_day_sleep_extension_minutes,
-        sleep_hard_floor=config.sleep_hard_floor,
         routine_can_wake=config.routine_can_wake,
         physio_can_wake=config.physio_can_wake,
         wake_daze_minutes=config.wake_daze_minutes,
         nap_enabled=config.nap_enabled,
         nap_min_minutes=config.nap_min_minutes,
         nap_max_minutes=config.nap_max_minutes,
-        nap_energy_threshold=config.nap_energy_threshold,
         insomnia_enabled=config.insomnia_enabled,
+        # v1.24.0：身体驱动睡眠的阈值与预算。
+        sleep_need_onset=config.sleep_need_onset,
+        sleep_need_wake=config.sleep_need_wake,
+        nap_need_threshold=config.sleep_need_nap_threshold,
+        sleep_circadian_strength=config.sleep_circadian_strength,
+        sleep_deferral_minutes=max(0, int(config.sleep_deferral_minutes)),
         schedule=config.schedule,
         # v1.14.0（病程 §3.4）：加重/好转期算「请了病假」，班表的在岗约束对她挂起。
         cold_sick_leave=bool(config.cold_sick_leave),
@@ -774,7 +767,10 @@ def _as_float(value: object, default: float | None = None) -> float | None:
         # bool 是 int 的子类：状态里的 true/false 不该被当成 1.0/0.0 的数值字段
         return default
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            return default
         return number if math.isfinite(number) else default
     if isinstance(value, str):
         try:
@@ -811,6 +807,95 @@ def _sanitize_records(items: object, *, fields: tuple[str, ...]) -> list[dict[st
         if not bad:
             cleaned.append(record)
     return cleaned
+
+
+def _normalize_sleep_ledger(items: object) -> list[dict[str, Any]]:
+    intervals = []
+    for item in items if isinstance(items, list) else ():
+        if not isinstance(item, dict):
+            continue
+        start = _as_float(item.get("start"))
+        end = _as_float(item.get("end"))
+        if start is not None and end is not None and 0.0 <= start < end:
+            intervals.append((start, end))
+    merged: list[dict[str, Any]] = []
+    for start, end in sorted(intervals):
+        # 相邻（间隔 ≤1 秒）也算连续：settle 的步长首尾相接，序列化往返后可能
+        # 带出亚秒级误差，不该因此把一觉拆成两段。真正的中断（夜醒、清醒）远大于它。
+        if merged and start <= merged[-1]["end"] + 1.0:
+            merged[-1]["end"] = max(merged[-1]["end"], end)
+            merged[-1]["minutes"] = int(round((merged[-1]["end"] - merged[-1]["start"]) / 60.0))
+        else:
+            merged.append({"start": start, "end": end, "minutes": int(round((end - start) / 60.0))})
+    return merged
+
+
+def _add_sleep_interval(state: LifeState, *, start: float, end: float) -> None:
+    """把 ``settle`` **实际结算**的一段睡眠并入账本，相邻区间直接续上。
+
+    v1.24.0：账本是睡眠的唯一事实源。它只认逐步结算过的区间，因此
+    「停机间隙不算睡眠」是结构性成立的——不靠事后拿旧锚点去减。
+    """
+
+    start = float(start)
+    end = float(end)
+    if not (math.isfinite(start) and math.isfinite(end) and start < end):
+        return
+    cutoff = end - SLEEP_LEDGER_RETENTION_HOURS * 3600.0
+    ledger = [
+        dict(item)
+        for item in _normalize_sleep_ledger(state.sleep_ledger)
+        if float(item["end"]) > cutoff
+    ]
+    if ledger and start <= float(ledger[-1]["end"]) + 1.0:
+        ledger[-1]["end"] = max(float(ledger[-1]["end"]), end)
+        ledger[-1]["minutes"] = int(
+            round((float(ledger[-1]["end"]) - float(ledger[-1]["start"])) / 60.0)
+        )
+    else:
+        ledger.append(
+            {"start": start, "end": end, "minutes": int(round((end - start) / 60.0))}
+        )
+    state.sleep_ledger = ledger
+
+
+def _trim_sleep_ledger(state: LifeState, *, now: float) -> None:
+    """裁掉超出保留期的账本/未知区间条目（保留期比欠债窗口长，见常量说明）。"""
+
+    cutoff = float(now) - SLEEP_LEDGER_RETENTION_HOURS * 3600.0
+    state.sleep_ledger = [
+        dict(item)
+        for item in _normalize_sleep_ledger(state.sleep_ledger)
+        if float(item["end"]) > cutoff
+    ]
+    state.sleep_unknown = [
+        dict(item)
+        for item in _normalize_sleep_ledger(state.sleep_unknown)
+        if float(item["end"]) > cutoff
+    ]
+
+
+def _mark_unknown_span(state: LifeState, *, start: float, end: float) -> None:
+    """记一段**无从判断**的时间（停机 / 时钟回拨），只用于完整性判定。
+
+    它绝不进睡眠账本：那段时间她在不在睡无从知道，按当前活动猜会凭空造出
+    睡眠或清醒。欠债评估看到它就直接说「记录不足」。
+    """
+
+    start = float(start)
+    end = float(end)
+    if not (math.isfinite(start) and math.isfinite(end) and start < end):
+        return
+    cutoff = end - SLEEP_LEDGER_RETENTION_HOURS * 3600.0
+    spans = [
+        dict(item)
+        for item in _normalize_sleep_ledger(state.sleep_unknown)
+        if float(item["end"]) > cutoff
+    ]
+    spans.append(
+        {"start": start, "end": end, "minutes": int(round((end - start) / 60.0))}
+    )
+    state.sleep_unknown = _normalize_sleep_ledger(spans)[-500:]
 
 
 def _sanitize_adjust_map(raw: object) -> dict[str, float]:
@@ -966,8 +1051,8 @@ class LifeState:
     #: 最近一次「半夜醒了一下」的时刻（epoch 秒；叙事与状态卡用，不参与倍率）。
     last_night_waking_at: float = 0.0
     #: 「本轮睡眠时段已经睡够」的截止时刻（epoch 秒；0 = 没有这条抑制）。
-    #: v1.15.0：睡满最短睡眠目标醒来时置成本轮窗口的结束时刻；在此之前窗口驱动的
-    #: 入睡一律不许（否则会出现「窗口内睡出第二个整觉」，见 ``ActivityFacts.rested``）。
+    #: **已退役**（v1.24.0）：睡够与否改由困意与睡眠账本判断，本字段只为旧状态
+    #: 能继续加载而保留；看到它就当 0 处理。
     rested_until: float = 0.0
     #: 最近若干段**已结束**的睡眠：``[{"start": 入睡时刻, "end": 醒来时刻,
     #: "minutes": 分钟数}, ...]``（``start`` / ``end`` 为权威字段，按与窗口的
@@ -977,6 +1062,22 @@ class LifeState:
     #: 睡眠中间时，会把**没睡完的觉**当成一整夜来判（真机 2026-10-02：她 08:00
     #: 睡下，12:00 边界只记到 4 小时）。
     sleep_ledger: list[dict[str, Any]] = field(default_factory=list)
+    #: 当前这一觉里**已被结算**的分钟数（v1.24.0）。与 ``sleep_started_at`` 分开：
+    #: 停机间隙不计入这段，所以「睡了多久」不再按旧锚点硬推。
+    continuous_sleep_minutes: int = 0
+    #: 困意（0–1，v1.24.0）：醒着涨、睡着退；与体力是两套量。
+    sleep_need: float = 0.25
+    #: 睡前陪聊的截止时刻（epoch 秒；0 = 没开预算）。只在第一次「该睡了」时开，
+    #: 新消息/会话切换都不会重置它。
+    sleep_defer_until: float = 0.0
+    #: 新睡眠模型的记账起点（epoch 秒；0 = 尚未开始）。欠债只在这之后的、
+    #: 且没有未知间隙的窗口里才评估——不够就是「记录不足」，不猜。
+    sleep_tracking_since: float = 0.0
+    #: 停机 / 时钟回拨造成的未知区间：``[{"start","end"}, ...]``。
+    #: 它们不进睡眠账本（不猜她在不在睡），只用来判定「记录是否完整」。
+    sleep_unknown: list[dict[str, Any]] = field(default_factory=list)
+    #: 旧模型的熬夜晚数：保留为证据，**不参与**新模型的任何判定。
+    legacy_sleep_debt_nights: int = 0
 
     cold_until: float = 0.0
     cold_days: int = 0
@@ -1155,8 +1256,9 @@ class LifeState:
         state = cls()
         if not isinstance(raw, dict):
             return state
+        field_names = {item.name for item in fields(cls)}
         for key, value in raw.items():
-            if not hasattr(state, key):
+            if key not in field_names:
                 continue
             current = getattr(state, key)
             try:
@@ -1228,11 +1330,18 @@ class LifeState:
         state.recent_events = _sanitize_records(
             state.recent_events, fields=("at", "emotion", "energy")
         )
-        # 睡眠账本同样做条目级净化：一个坏条目会让 sleep_in_window / grade_sleep_debt
-        # 在每次醒来时抛错，而异常发生在判分内部 ⇒ 熬夜统计永久失真且无法自愈。
-        # ``start`` / ``end`` 是权威字段（按区间交集求和），所以只校验这两个。
-        state.sleep_ledger = _sanitize_records(
-            state.sleep_ledger, fields=("start", "end")
+        state.sleep_ledger = _normalize_sleep_ledger(state.sleep_ledger)
+        state.sleep_unknown = _normalize_sleep_ledger(state.sleep_unknown)
+        # v1.24.0：困意 / 预算 / 记账起点 / 已结算睡眠四件套的边界收口。
+        state.sleep_need = _clamp(float(state.sleep_need or 0.0), 0.0, 1.0)
+        state.continuous_sleep_minutes = max(
+            0, min(MAX_CONTINUOUS_AWAKE_MINUTES, int(state.continuous_sleep_minutes))
+        )
+        for stamp in ("sleep_defer_until", "sleep_tracking_since"):
+            value = float(getattr(state, stamp) or 0.0)
+            setattr(state, stamp, value if math.isfinite(value) and value > 0.0 else 0.0)
+        state.legacy_sleep_debt_nights = max(
+            0, int(state.legacy_sleep_debt_nights or 0)
         )
         state.social_seen = _sanitize_float_map(state.social_seen)
         state.social_daily = _sanitize_float_map(state.social_daily)
@@ -1319,6 +1428,30 @@ class LifeState:
                 if len(cleaned_side) >= MAX_SIDE_ACTIVITIES:
                     break
         state.side_activities = cleaned_side
+        # v1.24.0 迁移：旧「连熬夜数」原样保留为证据，但不再参与判定；
+        # 新模型从这次加载起重新积累记录（``sleep_tracking_since`` 由 settle 置位），
+        # 因此升级后的头 72 小时只会显示「记录不足」，不会凭空算出欠债。
+        raw_version = raw.get("state_version") if isinstance(raw, dict) else None
+        try:
+            version = int(raw_version) if raw_version is not None else STATE_VERSION
+        except (TypeError, ValueError, OverflowError):
+            version = 0
+        if version < STATE_VERSION:
+            # 幂等迁移：旧「连熬夜数」搬进 legacy 字段（只作证据），新版计数清零，
+            # 记账起点置空，由下一次 settle 从现在开始积累。重复加载同一份旧文件
+            # 结果一致，不会重复扣减或清掉关系/情绪/病程/经历。
+            state.legacy_sleep_debt_nights = max(
+                int(state.legacy_sleep_debt_nights or 0),
+                int(state.sleep_debt_nights or 0),
+            )
+            state.sleep_debt_nights = 0
+            state.sleep_tracking_since = 0.0
+            # 困意是新增维度：用「已连续清醒多久」做一个**有据可依的估算**，
+            # 没有连续清醒数据时退回中性值（不假装知道）。
+            if not (0.0 < state.sleep_need < 1.0):
+                awake_hours = max(0, int(state.continuous_awake_minutes)) / 60.0
+                state.sleep_need = _clamp(0.18 + awake_hours * 0.029, 0.18, 0.85)
+            state.state_version = STATE_VERSION
         return state
 
 
@@ -1352,33 +1485,82 @@ def new_state(
     """冷启动状态：用时段表取一次种子，之后不再用时段表。"""
 
     local_now = local_datetime(now, config.tz_offset_minutes)
+    now_minutes = local_now.hour * 60 + local_now.minute
+    # 冷启动没有睡眠记录，困意只能是**估算**：按昼夜节律给一条中性曲线
+    # （03:00 最高、15:00 最低），体力很低时再略高一点。这里**不读已退役的
+    # 睡眠时段**——作息由身体规则接管，时段表只负责挑初始活动。
+    phase = math.cos(2.0 * math.pi * ((now_minutes % 1440) - 180.0) / 1440.0)
+    initial_need = _clamp(
+        0.45 + 0.22 * phase + (0.10 if float(energy) <= 2.0 else 0.0), 0.15, 0.80
+    )
+    # v1.24.0：种子也只看困意——够困就睡，不够困就按班表/时段表醒着。
     seed = rule_based_activity(
-        now_minutes=local_now.hour * 60 + local_now.minute,
-        energy=energy,
+        now_minutes=now_minutes,
         sick=False,
-        sleep_energy_threshold=config.sleep_energy_threshold,
         schedule=schedule_facts(local_now, config.schedule),
         work_scene=config.schedule.work_scene,
+        sleep_need=initial_need,
+        sleep_need_onset=config.sleep_need_onset,
     )
     state = LifeState(
         state_version=STATE_VERSION,
         last_tick_at=float(now),
         day_key=day_key_of(local_now, config.day_boundary_hour),
-        activity=seed.activity,
+        activity=DAILY,
         activity_source=SOURCE_COLD_START,
-        activity_note=seed.note,
+        activity_note="冷启动",
         activity_since=float(now),
-        scene=seed.scene,
+        scene="",
         emotion=_clamp(emotion, 0.0, config.emotion_max),
         energy=_clamp(energy, 0.0, config.energy_max),
         energy_cap=config.energy_max,
+        sleep_need=initial_need,
+        sleep_tracking_since=float(now),
         # 冷启动就把「最近一次成功」置为当前时间：这样 reseed_after_hours 是从冷启动
         # 起算的，而不是被每 tick 前进的 last_tick_at 拖着走（那样子安全阀永远触发不了）。
         llm_last_success_at=float(now),
     )
-    if is_asleep(state.activity):
-        state.sleep_started_at = float(now)
-    return state
+    # v1.24.0：时段表种子也要过同一套身体约束——「凌晨就一定在睡」「白天就一定
+    # 不睡」不再由时刻表直接决定，而是由困意与节律决定。
+    seed_decision = ActivityDecision(
+        seed.activity, seed.scene, SOURCE_COLD_START, seed.note
+    )
+    return enforce_and_apply(state, now=now, config=config, decision=seed_decision)
+
+
+def cold_daily_risk(
+    config: SimConfig,
+    *,
+    sleep_debt_nights: float,
+    low_energy: bool,
+    month_factor: float = 1.0,
+) -> float:
+    """合成一次每日感冒判定风险（v1.25.0，纯函数）。
+
+    风险按成因分别相加，再乘季节倍率并受 ``cold_daily_risk_cap`` 封顶：
+
+        (base + debt × min(nights, 3) + low_energy) × season
+        → clamp [0, cold_daily_risk_cap]
+
+    旧版把 ``cold_sleep_debt_risk`` 同时用于缺觉与低体力，最坏可达 37%/日；
+    拆分后低体力有自己的参数，且最终上限防止长期缺觉把角色变成「每周感冒」。
+    非有限输入一律按 0 处理，坏配置不能把风险变成 NaN。
+    """
+
+    def finite(value: float) -> float:
+        number = float(value)
+        return number if math.isfinite(number) else 0.0
+
+    base = max(0.0, min(1.0, finite(config.cold_base_risk)))
+    debt_risk = max(0.0, min(1.0, finite(config.cold_sleep_debt_risk)))
+    low_risk = max(0.0, min(1.0, finite(config.cold_low_energy_risk)))
+    nights = max(0.0, min(3.0, finite(sleep_debt_nights)))
+    season_raw = float(month_factor)
+    season = season_raw if math.isfinite(season_raw) else 1.0
+    cap_raw = float(config.cold_daily_risk_cap)
+    cap = max(0.05, min(0.95, cap_raw if math.isfinite(cap_raw) else 0.95))
+    risk = (base + debt_risk * nights + (low_risk if low_energy else 0.0)) * max(0.0, season)
+    return min(cap, max(0.0, risk))
 
 
 def is_cold(state: LifeState, now: float) -> bool:
@@ -1424,12 +1606,27 @@ def cold_day_index(state: LifeState, now: float, config: SimConfig) -> int:
     return max(1, int((float(now) - started) // 86400.0) + 1)
 
 
-def _sleep_debt_label(state: LifeState, config: SimConfig) -> str:
-    if int(state.sleep_debt_nights) >= int(config.sleep_debt_cap_nights):
-        return f"连续熬夜 {state.sleep_debt_nights} 天，体力上限被压低"
-    if int(state.sleep_debt_nights) > 0:
-        return f"有点缺觉（连熬 {state.sleep_debt_nights} 天）"
-    return "健康"
+def sleep_deficit_label(state: LifeState, now: float, config: SimConfig) -> str:
+    """缺觉的人话口径（v1.24.0）：只按**时间**说，不再说「连熬 N 天」。
+
+    记录不足时返回「睡眠记录不足（原因）」——升级后的头 72 小时会一直是这条，
+    这是诚实的，不是故障。
+    """
+
+    deficit, reason = sleep_deficit_minutes(state, now=now, config=config)
+    if deficit is None:
+        text = "睡眠记录不足"
+        return f"{text}（{reason}）" if reason else text
+    if deficit <= 0:
+        return "健康"
+    nights, _ = sleep_deficit_nights(state, now=now, config=config)
+    text = (
+        f"最近 {config.sleep_deficit_window_hours:g} 小时累计缺觉约 "
+        f"{deficit / 60.0:.1f} 小时"
+    )
+    if nights is not None and nights >= float(config.sleep_debt_cap_nights):
+        text += f"（体力上限被压低到 {config.sleep_deprived_energy_cap:g}）"
+    return text
 
 
 def health_label_prompt(state: LifeState, now: float, config: SimConfig) -> str:
@@ -1450,7 +1647,7 @@ def health_label_prompt(state: LifeState, now: float, config: SimConfig) -> str:
         return f"{text}（第 {day} 天）"
     if in_convalescence(state, now):
         return "感冒刚好利索，体力还没完全回来"
-    return _sleep_debt_label(state, config)
+    return sleep_deficit_label(state, now, config)
 
 
 def _day_key_now(now: float, config: SimConfig) -> str:
@@ -1483,7 +1680,7 @@ def health_label_admin(state: LifeState, now: float, config: SimConfig) -> str:
     if in_convalescence(state, now):
         left = max(0.0, (float(state.convalescent_until) - float(now)) / 3600.0)
         return f"病后余韵（约剩 {left:.1f} 小时）"
-    base = _sleep_debt_label(state, config)
+    base = sleep_deficit_label(state, now, config)
     immunity = float(getattr(state, "cold_immunity_until", 0.0) or 0.0)
     if math.isfinite(immunity) and immunity > float(now):
         days = (immunity - float(now)) / 86400.0
@@ -1518,18 +1715,22 @@ def _minutes_since(now: float, anchor: object) -> int:
 def activity_facts(state: LifeState, now: float) -> ActivityFacts:
     """当前状态 → ``enforce`` 需要的事实（本地时间由 tz 偏移还原）。"""
 
-    single_sleep = 0
+    slept = 0
     if is_asleep(state.activity):
-        # 优先用「她几点睡下的」这个专用字段；缺失时退回活动起始时间
-        # v1.15.0（PR-R1）：小睡同样走这条（``is_asleep``），否则小睡时
-        # ``minutes_in_sleep`` 恒为 0（= 锚点不可信），时长上限判定会失效。
-        single_sleep = _minutes_since(now, state.sleep_started_at) or _minutes_since(
-            now, state.activity_since
-        )
+        # v1.24.0：优先用**已结算**的连续睡眠（不含停机间隙）。锚点只作旧状态/
+        # 旧测试的兜底——它可能把停机时间算进来，不能当权威。
+        slept = max(0, int(state.continuous_sleep_minutes))
+        if slept <= 0:
+            slept = _minutes_since(now, state.sleep_started_at) or _minutes_since(
+                now, state.activity_since
+            )
+    defer_until = float(state.sleep_defer_until or 0.0)
+    if not math.isfinite(defer_until) or defer_until < 0.0:
+        defer_until = 0.0
     return ActivityFacts(
         activity=state.activity,
         minutes_in_activity=_minutes_since(now, state.activity_since),
-        minutes_in_sleep=single_sleep,
+        minutes_in_sleep=slept,
         now_minutes=0,  # 由 settle / plugin 用本地时间覆盖
         emotion=state.emotion,
         energy=state.energy,
@@ -1540,6 +1741,12 @@ def activity_facts(state: LifeState, now: float) -> ActivityFacts:
         cold_stage=cold_stage(state, now),
         sleep_minutes_today=state.sleep_minutes_today,
         awake_minutes_today=state.awake_minutes_today,
+        continuous_sleep_minutes=slept,
+        sleep_need=_clamp(float(state.sleep_need or 0.0), 0.0, 1.0),
+        sleep_defer_active=defer_until > float(now),
+        sleep_defer_expired=defer_until > 0.0 and defer_until <= float(now),
+        # 夜醒后的同一夜窗口：续睡不看入睡阈（她本来就是睡着的，困意只回升了一点点）。
+        night_break=night_break_active(state, now=now),
     )
 
 
@@ -1614,6 +1821,7 @@ def _sweep(state: LifeState, now: float, config: SimConfig) -> LifeState:
             for key, value in state.medicine_cooldown.items()
             if float(value or 0.0) > float(now)
         }
+    _trim_sleep_ledger(state, now=now)
     return state
 
 
@@ -1938,11 +2146,18 @@ def _note_sick_leave(state: LifeState, *, now: float, config: SimConfig) -> None
     )
 
 
-def _cold_rest_score(state: LifeState, config: SimConfig, day_key: str) -> int:
-    """今天的「休息分」（§2.3）：睡够了 +1、此刻在养病/睡觉 +1、被关心 +0~cap。"""
+def _cold_rest_score(
+    state: LifeState, config: SimConfig, day_key: str, *, now: float
+) -> int:
+    """今天的「休息分」（§2.3）：睡够了 +1、此刻在养病/睡觉 +1、被关心 +0~cap。
+
+    v1.24.0：「睡够了」改按**时间口径的缺觉**判定；记录不足时**不加分**
+    （不拿残缺数据替她说「睡够了」）。
+    """
 
     score = 0
-    if int(state.sleep_debt_nights) == 0:
+    nights, _ = sleep_deficit_nights(state, now=now, config=config)
+    if nights is not None and nights <= 0.0:
         score += 1
     if is_asleep(state.activity) or state.activity == SICK_REST:
         score += 1
@@ -1973,10 +2188,11 @@ def settle_cold_stage(
         return
     state.cold_stage_checked_day = day_key
 
-    score = _cold_rest_score(state, config, day_key)
-    worsening_pressure = int(state.sleep_debt_nights) > 0 or float(state.energy) < float(
-        config.sleep_energy_threshold
-    )
+    score = _cold_rest_score(state, config, day_key, now=now)
+    deficit_nights, _ = sleep_deficit_nights(state, now=now, config=config)
+    worsening_pressure = (deficit_nights is not None and deficit_nights > 0.0) or float(
+        state.energy
+    ) < float(config.sleep_energy_threshold)
 
     if score >= 2:
         if stage == COLD_RECOVERING:
@@ -2716,8 +2932,12 @@ def settle(
     rollback_seconds = last - now
     if rollback_seconds > 0.0:
         state.last_tick_at = now
-        if rollback_seconds >= 60.0 and on_clock_rollback is not None:
-            on_clock_rollback(int(rollback_seconds // 60.0))
+        if rollback_seconds >= 60.0:
+            # 倒流的时间无从结算：记成「未知区间」，它会让欠债评估诚实地显示
+            # 「记录不足」，而不是按旧锚点猜她睡了/醒着。
+            _mark_unknown_span(state, start=float(now), end=float(last))
+            if on_clock_rollback is not None:
+                on_clock_rollback(int(rollback_seconds // 60.0))
         return _sweep(state, now, config)
 
     elapsed = max(0.0, now - float(state.last_tick_at))
@@ -2751,7 +2971,14 @@ def settle(
     cursor = now - elapsed
     local_cursor = local_datetime(cursor, config.tz_offset_minutes)
 
-    # 若当前是睡眠/小睡且没记开始时间，补记（例如热重载或旧状态）
+    # v1.24.0：新模型的记录起点。迁移来的旧状态从这里开始积累，
+    # 在此之前没有可信记录 ⇒ 欠债评估显示「记录不足」。
+    if float(state.sleep_tracking_since or 0.0) <= 0.0:
+        state.sleep_tracking_since = float(now)
+
+    # 若当前是睡眠/小睡且没记开始时间，补记（例如热重载或旧状态）。
+    # ⚠ 这只用于「停留时长」展示；睡眠账本只认 settle 实际结算的区间，
+    # 不会按这个锚点把停机时间整段算成睡眠。
     if is_asleep(state.activity) and not state.sleep_started_at:
         state.sleep_started_at = cursor
 
@@ -2759,19 +2986,28 @@ def settle(
         cursor += step_seconds
         local_cursor = local_datetime(cursor, config.tz_offset_minutes)
 
+        # 「睡眠时被 @ 临时唤醒」（at_wake_until）期间按**醒着**记账：
+        # 不回体力、不计睡眠、困意继续累积。窗口结束且仍是 sleep 时自动回到睡眠。
+        wake_override = (
+            is_asleep(state.activity) and float(state.at_wake_until or 0.0) > cursor
+        )
+        asleep = is_asleep(state.activity) and not wake_override
+
         # --- 体力 ---
         # v1.12.1（side）：主活动 1.0 + 每个背景活动 0.3 加权——「顺便」的事
         # 只占小头；背景项不经 enforce，白名单已在入口滤掉睡觉等独占活动
-        asleep = is_asleep(state.activity)
         drain = float(delta_per_hour.get(state.activity, -0.5))
-        if state.side_activities:
+        if wake_override:
+            # 临时清醒不是休息：既不回血也不额外耗体力（只有几分钟）。
+            drain = 0.0
+        if state.side_activities and not wake_override:
             drain += 0.3 * sum(
                 float(delta_per_hour.get(item, -0.5)) for item in state.side_activities
             )
         # v1.16.0（M1）：清醒疲劳——连续清醒越久，**额外**基础消耗越大。用本步
         # 开始前的连续清醒时长（这一步还没被计入），且**睡着时不适用**：她是躺着
         # 回血，不是躺着受累（否则熬到 22 小时才睡下的人会被扣掉大半恢复量）。
-        if not asleep:
+        if not asleep and not wake_override:
             drain += fatigue_ramp_extra(state.continuous_awake_minutes, config)
         # v1.16.2（M2b）：低体力时**消耗**被放大（越累越容易更累的软恶性循环，把她
         # 推向休息）。只放大负值——恢复项（睡觉 +1.20、吃饭 +0.20）照旧，不然
@@ -2782,10 +3018,25 @@ def settle(
             state.energy + drain * (step_minutes / 60.0), 0.0, float(state.energy_cap)
         )
 
-        # --- 睡眠 / 清醒记账（v1.15.0：睡眠与小睡走同一个谓词）---
+        # --- 睡眠 / 清醒记账（v1.24.0：账本 = 唯一事实源）---
         minutes = int(round(step_minutes))
         if asleep:
+            # 睡眠账本按 settle **实际结算的区间**逐段累加：停机间隙不会被算进去，
+            # 因此「不跨停机记账」是结构性成立的，不靠事后从旧锚点里减。
+            _add_sleep_interval(state, start=cursor - step_seconds, end=cursor)
             state.sleep_minutes_today += minutes
+            state.continuous_sleep_minutes = min(
+                MAX_CONTINUOUS_AWAKE_MINUTES,
+                int(state.continuous_sleep_minutes) + minutes,
+            )
+            # 困意消退：小睡只按比例消退（它不是一整觉）。
+            recovery = float(config.sleep_need_sleep_recovery_per_hour)
+            if state.activity == NAP:
+                recovery *= float(config.sleep_need_nap_recovery_ratio)
+            state.sleep_need = _clamp(
+                float(state.sleep_need) - recovery * (step_minutes / 60.0), 0.0, 1.0
+            )
+            state.sleep_defer_until = 0.0
         else:
             state.awake_minutes_today += minutes
             # v1.16.0（M1）：连续清醒只加不清零（清零在一觉结束时）。生活日边界
@@ -2794,11 +3045,25 @@ def settle(
                 MAX_CONTINUOUS_AWAKE_MINUTES,
                 int(state.continuous_awake_minutes) + minutes,
             )
+            # 困意累积。临时唤醒也照常累积（她确实醒着）。
+            state.sleep_need = _clamp(
+                float(state.sleep_need)
+                + float(config.sleep_need_awake_gain_per_hour) * (step_minutes / 60.0),
+                0.0,
+                1.0,
+            )
+            # 困意已经落到「睡得够」的水平（例如刚小睡过）⇒ 上一次「该睡了」的
+            # 陪聊预算自然失效，不把过期预算拖进下一轮。
+            if (
+                state.sleep_defer_until
+                and float(state.sleep_need) <= float(config.sleep_need_wake)
+            ):
+                state.sleep_defer_until = 0.0
 
         # --- 生活日边界结算 ---
         current_day = day_key_of(local_cursor, config.day_boundary_hour)
         if state.day_key and current_day != state.day_key:
-            _settle_day(state, config)
+            _settle_day(state, config, cursor)
             state.day_key = current_day
         elif not state.day_key:
             state.day_key = current_day
@@ -2811,19 +3076,24 @@ def settle(
             state.cold_checked_day = current_day
             # v1.14.0：免疫期内不掷（修「病好第二天无缝再病」）。
             if not is_cold(state, cursor) and not _immunity_active(state, cursor):
-                risk = float(config.cold_base_risk) + float(config.cold_sleep_debt_risk) * max(
-                    0, int(state.sleep_debt_nights)
-                )
-                if float(state.energy) < float(config.sleep_energy_threshold):
-                    risk += float(config.cold_sleep_debt_risk)
+                # v1.24.0：风险增量读**时间口径**的缺觉；记录不足时按 0 计
+                # （不猜），基础风险与低体力项照旧。
+                nights, _ = sleep_deficit_nights(state, now=cursor, config=config)
                 # 季节系数（可选，默认空表 = 不启用）：生病不再是均匀白噪声。
                 season_table = dict(getattr(config, "cold_season_factors", {}) or {})
+                month_factor = 1.0
                 if season_table:
-                    month_factor = _as_float(
+                    parsed_factor = _as_float(
                         season_table.get(str(int(local_cursor.month))), 1.0
                     )
-                    risk *= float(month_factor if month_factor is not None else 1.0)
-                if rng.random() < _clamp(risk, 0.0, 0.95):
+                    month_factor = float(parsed_factor if parsed_factor is not None else 1.0)
+                risk = cold_daily_risk(
+                    config,
+                    sleep_debt_nights=float(nights or 0.0),
+                    low_energy=float(state.energy) < float(config.sleep_energy_threshold),
+                    month_factor=month_factor,
+                )
+                if rng.random() < risk:
                     days = rng.randint(int(config.cold_min_days), max(int(config.cold_min_days), int(config.cold_max_days)))
                     start_cold(state, now=cursor, config=config, days=days)
 
@@ -2886,29 +3156,6 @@ def night_break_active(state: LifeState, *, now: float) -> bool:
     return last > 0.0 and (float(now) - last) <= float(NIGHT_BREAK_RESUME_SECONDS)
 
 
-def _mark_rested_if_satisfied(
-    state: LifeState, *, now: float, minutes: int, config: SimConfig
-) -> None:
-    """睡满「最短睡眠目标」醒来 ⇒ 记「本轮睡眠时段到此为止」（v1.15.0 PR-S1 配套）。
-
-    只在**仍在睡眠窗口内**时记：窗口外醒来（白天累趴了补觉）没有「再睡一觉」的问题，
-    记了反而会把当晚的窗口驱动入睡一起压掉（``rested_until`` 会指向下一个窗口末端）。
-
-    目标为 0（旧行为）时**不记**：那种配置下没有「睡够」的概念，行为与 v1.14 一致。
-    """
-
-    target = max(0.0, float(getattr(config, "energy_full_wake_min_hours", 0.0) or 0.0)) * 60.0
-    if target <= 0.0 or int(minutes) < target:
-        return
-    local = local_datetime(now, config.tz_offset_minutes)
-    now_minutes = local.hour * 60 + local.minute
-    if not in_window(now_minutes, config.sleep_window):
-        return
-    exit_minutes = minutes_until_window_exit(now_minutes, config.sleep_window)
-    if exit_minutes > 0:
-        state.rested_until = float(now) + exit_minutes * 60.0
-
-
 def _skip_offline_gap(
     state: LifeState,
     *,
@@ -2945,11 +3192,16 @@ def _skip_offline_gap(
     if crossed:
         state.sleep_minutes_today = 0
         state.awake_minutes_today = 0
-        # 不判新的一夜，但按**已知的**熬夜天数把体力上限重新夹一次，
+        # 不判新的一夜，但按**已知的**时间口径缺觉把体力上限重新夹一次，
         # 免得停机期间一直挂着旧的（可能更严的）上限。
-        _refresh_energy_cap(state, config)
+        _refresh_energy_cap(state, now=now, config=config)
     state.day_key = current_day
     state.last_tick_at = now
+    # 停机期间她在不在睡无从知道：记成未知区间（欠债评估据此显示「记录不足」），
+    # 并且不把这段算进本次连续睡眠——锚点从「现在」重新起算。
+    _mark_unknown_span(state, start=float(now) - float(elapsed), end=float(now))
+    if is_asleep(state.activity):
+        state.sleep_started_at = now
     # 停机不是模型的错：把「多久没交作业」的计时器一起往前推，差分保持不变。
     # 否则长停机后重启的第一轮就会撞上 reseed_after_hours，把她的活动改写成
     # 「当前时刻的时段表种子」（见 should_reseed 的说明）。
@@ -2957,9 +3209,6 @@ def _skip_offline_gap(
         state.llm_last_success_at = min(
             now, float(state.llm_last_success_at) + max(0.0, float(elapsed))
         )
-    if is_asleep(state.activity) and not state.sleep_started_at:
-        # 睡眠锚点缺失时补「现在」，别让 minutes_in_sleep 变成一个假的大值
-        state.sleep_started_at = now
     # 停机间隙不掷骰子、不结算流转（那段时间的状态无从判断），但**到期该痊愈的
     # 必须痊愈**：否则她会顶着「生病中」的阶段字段一直躺着，而 cold_until 早过了。
     _finish_cold_if_expired(state, now=now, config=config)
@@ -2973,8 +3222,6 @@ def _skip_offline_gap(
 #: 「睡够没有」看最近这么久（滑动窗口）。取 24 小时：既不依赖生活日边界，
 #: 又能把「拆成两段睡」自然合起来算。
 SLEEP_DEBT_WINDOW_HOURS = 24.0
-#: 账本最多留几段睡眠（每段至少 min_sleep_minutes，24 小时内正常只有 1~2 段）。
-SLEEP_LEDGER_KEEP = 8
 
 
 #: 夜间易醒的去重键前缀（键 = ``night_waking:<生活日>``，每夜至多一次）
@@ -2990,7 +3237,7 @@ def _roll_night_waking(
     真人会在半夜醒一次（翻身、喝水、看一眼手机），这也是「睡醒不一定清爽」的来源。
 
     判据（全部满足）：开关开、正在**睡整觉**（小睡不掷）、本生活日还没醒过、
-    已睡满 ``min_sleep_minutes``、体力没回满、掷骰命中。
+    已睡满 ``min_sleep_minutes``、困意还没退到自然醒的阈值、掷骰命中。
 
     **落地方式（关键）**：切到 ``daze`` 并开一个 ``wake_grace_until`` 宽限窗。
     不能只切活动——tick 的顺序是 ``settle`` → ``enforce(None)``，而 enforce 见她在
@@ -3015,8 +3262,8 @@ def _roll_night_waking(
     slept = _minutes_since(now, state.sleep_started_at)
     if slept < max(1, int(config.min_sleep_minutes)):
         return  # 睡太短：还在「刚躺下」的保护里
-    if float(state.energy) >= float(state.energy_cap):
-        return  # 体力已满：她本来就该醒了，不需要「半夜醒」
+    if float(state.sleep_need) <= float(config.sleep_need_wake):
+        return  # 困意已退：她本来就该醒了，不需要「半夜醒」
     day_key = _day_key_now(now, config)
     dedup = f"{NIGHT_WAKING_DEDUP}:{day_key}"
     if dedup in state.motive_seen:
@@ -3054,27 +3301,15 @@ def _roll_night_waking(
 
 
 def record_sleep_episode(state: LifeState, *, now: float, minutes: int) -> None:
-    """把一段**刚结束**的睡眠记进滚动账本，并清掉与窗口再无交集的旧条目。
+    """一觉结束后的收尾：连续清醒从零起算（``sleep_ledger`` 已由 settle 记好）。
 
-    v1.16.0（M1）：一觉结束 = **连续清醒重新起算**（``continuous_awake_minutes``
-    归零）。放在这里是因为「睡了一觉」正是这个计数器的语义边界；调用方
-    （``apply_activity``）另有一处兜底，用于量不到这段睡眠时长的旧状态。
+    v1.24.0：这段睡眠**不在这里补记**。账本只认 ``settle`` 实际结算过的区间；
+    再按 ``sleep_started_at → now`` 补一遍，会同时犯两个错：跨停机间隙造假睡眠、
+    与逐步记账重复计。``minutes`` 只为兼容旧调用签名而保留。
     """
 
-    minutes = int(max(0, int(minutes)))
-    now = float(now)
+    del now, minutes
     state.continuous_awake_minutes = 0
-    if minutes > 0:
-        state.sleep_ledger.append(
-            {"start": now - minutes * 60.0, "end": now, "minutes": minutes}
-        )
-    cutoff = now - SLEEP_DEBT_WINDOW_HOURS * 3600.0
-    # 判据是「还有没有交集」，不是「结束时间在不在窗口内」：见 sleep_in_window
-    state.sleep_ledger = [
-        item
-        for item in state.sleep_ledger
-        if float(item.get("end", 0.0) or 0.0) > cutoff
-    ][-SLEEP_LEDGER_KEEP:]
 
 
 def sleep_in_window(
@@ -3091,19 +3326,85 @@ def sleep_in_window(
     now = float(now)
     lower = now - float(hours) * 3600.0
     total_seconds = 0.0
-    for item in state.sleep_ledger:
-        end = float(item.get("end", 0.0) or 0.0)
-        start = float(item.get("start", end) or end)
+    for item in _normalize_sleep_ledger(state.sleep_ledger):
+        end = item["end"]
+        start = item["start"]
         overlap = min(end, now) - max(start, lower)
         if overlap > 0:
             total_seconds += overlap
     return int(round(total_seconds / 60.0))
 
 
-def _refresh_energy_cap(state: LifeState, config: SimConfig) -> None:
-    """按**当前**熬夜天数刷新体力上限，并把体力夹进上限。"""
+def sleep_deficit_minutes(
+    state: LifeState, *, now: float, config: SimConfig
+) -> tuple[int | None, str]:
+    """最近 ``sleep_deficit_window_hours`` 小时的缺觉分钟数；``None`` = 记录不足。
 
-    if int(state.sleep_debt_nights) >= int(config.sleep_debt_cap_nights):
+    v1.24.0：睡债只按**时间**算，不再按「醒来几次」加减。它同时满足三条：
+
+    1. 账本是唯一事实源（``sleep_in_window`` 按区间交集求和）；
+    2. 记录覆盖不到整窗、或窗内有停机/时钟回拨 ⇒ 返回 ``None``，显示「记录不足」，
+       而不是拿残缺数据硬算一个「连熬 N 天」；
+    3. 旧模型的「连熬 6 天」原样留档，不参与这里的任何一步。
+
+    ``expected = 目标睡眠 × 窗口天数``，所以窗口长短会等比放大期望值——72 小时的
+    窗口里缺 9 小时和 24 小时里缺 3 小时等价。
+    """
+
+    window_hours = max(24.0, float(config.sleep_deficit_window_hours))
+    window_seconds = window_hours * 3600.0
+    now = float(now)
+    lower = now - window_seconds
+    since = float(state.sleep_tracking_since or 0.0)
+    if not (math.isfinite(since) and since > 0.0) or since > lower + 60.0:
+        covered = max(0.0, now - since) / 3600.0 if since > 0.0 else 0.0
+        return None, (
+            f"新睡眠模型刚开始记录（已积累 {covered:.1f} / {window_hours:g} 小时）"
+        )
+    tolerance = max(0.0, float(config.sleep_unknown_tolerance_minutes)) * 60.0
+    unknown_seconds = 0.0
+    for span in _normalize_sleep_ledger(state.sleep_unknown):
+        overlap = min(float(span["end"]), now) - max(float(span["start"]), lower)
+        if overlap > 0:
+            unknown_seconds += overlap
+    if unknown_seconds > tolerance:
+        return None, (
+            f"窗口内有 {unknown_seconds / 3600.0:.1f} 小时无法记账"
+            "（停机或时钟回拨），记录不足"
+        )
+    expected = max(0.0, float(config.sleep_target_hours)) * 60.0 * (window_hours / 24.0)
+    actual = float(sleep_in_window(state, now=now, hours=window_hours))
+    return max(0, int(round(expected - actual))), ""
+
+
+def _deficit_night_minutes(config: SimConfig) -> float:
+    """「一晚没睡够」折成多少分钟：目标睡眠减去旧阈值（默认 8h − 5h = 3h）。"""
+
+    target = max(0.0, float(config.sleep_target_hours)) * 60.0
+    threshold = max(0.0, float(config.sleep_debt_threshold_minutes))
+    return max(30.0, target - threshold)
+
+
+def sleep_deficit_nights(
+    state: LifeState, *, now: float, config: SimConfig
+) -> tuple[float | None, str]:
+    """缺觉折成「几晚」的连续量（仅供上限/风险/显示使用，不是整数天数）。"""
+
+    deficit, reason = sleep_deficit_minutes(state, now=now, config=config)
+    if deficit is None:
+        return None, reason
+    return float(deficit) / _deficit_night_minutes(config), ""
+
+
+def _refresh_energy_cap(state: LifeState, *, now: float, config: SimConfig) -> None:
+    """按**时间口径的缺觉**刷新体力上限；记录不足时保持满上限（不猜）。
+
+    升级时上限可能从 8.5 回到 10：这里只做 ``min``，**不会**把体力补上去——
+    「升级后突然满血」是凭空造出来的恢复。
+    """
+
+    nights, _ = sleep_deficit_nights(state, now=now, config=config)
+    if nights is not None and nights >= float(config.sleep_debt_cap_nights):
         state.energy_cap = float(config.sleep_deprived_energy_cap)
     else:
         state.energy_cap = float(config.energy_max)
@@ -3117,52 +3418,29 @@ def grade_sleep_debt(
     config: SimConfig,
     extra_minutes: int = 0,
 ) -> int:
-    """在**睡醒时**判这一觉够不够，返回变化后的熬夜天数。
+    """**已退役**（v1.24.0）：不再按醒来次数增减熬夜债。
 
-    判据：最近 24 小时累计睡眠 ≥ ``sleep_debt_threshold_minutes``。为什么不再用
-    「本生活日累计」（v1.3.2 修正）：
-
-    * **边界会劈开一段睡眠**。生活日边界（默认 12:00）落在一段睡眠中间时，两个
-      生活日各拿到一半，边界那次结算就会把「没睡完的觉」当成一整夜——真机
-      2026-10-02：她 08:00 睡下、睡到 16:00（8 小时，明明睡够了），但 12:00 那次
-      结算只看到 08:00→12:00 这 4 小时，于是判了「连熬 1 天」；
-    * **拆成两段睡要看边界脸色**。3 小时 + 3 小时是否合起来算，在「本日合计」下
-      取决于两段有没有跨过 12:00；滑动窗口下必然合起来算。
-
-    ``extra_minutes`` 供「睡眠锚点不可信」的兜底路径使用（见 ``apply_activity``）：
-    那时当日累计是唯一能用的证据，而它不能同时进账本，否则会重复计。
-
-    v1.15.0（PR-S1）**滞回**：睡够的这次只清 ``sleep_debt_recovery_step`` 晚债
-    （默认 1），不再一晚直接归零。旧行为（一晚清零）在默认参数下会与
-    「体力满即醒」的正反馈叠加——连熬三晚把上限压到 8.5 后，睡够一晚就洗白、
-    第二天又睡不到阈值。``sleep_debt_recovery_step = 0`` 可回到旧行为。
+    保留这个符号只为旧调用点/旧测试导入时不炸；它不再修改状态，返回旧字段
+    （该字段在迁移后恒为 0，原值已挪进 ``legacy_sleep_debt_nights`` 留档）。
     """
 
-    total = sleep_in_window(state, now=now) + max(0, int(extra_minutes))
-    if total >= int(config.sleep_debt_threshold_minutes):
-        step = max(0, int(getattr(config, "sleep_debt_recovery_step", 0) or 0))
-        if step <= 0:
-            state.sleep_debt_nights = 0  # 旧行为：一晚清零
-        else:
-            state.sleep_debt_nights = max(0, int(state.sleep_debt_nights) - step)
-    else:
-        state.sleep_debt_nights = min(99, int(state.sleep_debt_nights) + 1)
-    _refresh_energy_cap(state, config)
-    return state.sleep_debt_nights
+    del now, config, extra_minutes
+    return int(state.sleep_debt_nights)
 
 
-def _settle_day(state: LifeState, config: SimConfig) -> None:
-    """生活日边界：清零当日计数器，并按已知的熬夜天数刷新体力上限。
+def _settle_day(state: LifeState, config: SimConfig, now: float) -> None:
+    """生活日边界：清零当日计数器，并按时间口径的缺觉刷新体力上限。
 
-    ⚠ 熬夜判定**不在这里**了：它已改成「睡醒时按最近 24 小时滑动窗口判」
-    （``grade_sleep_debt``），所以边界既不需要、也不应该给一段没睡完的觉打分。
+    ⚠ 生活日边界**只改归属，不改事实**：它清当日的两个计数器，但不清
+    ``continuous_awake_minutes`` / ``continuous_sleep_minutes`` / 睡眠账本——
+    「从早上熬到次日凌晨」本来就是一整段连续清醒，一段睡眠也不该被 12:00 劈开。
     """
 
     state.sleep_minutes_today = 0
     state.awake_minutes_today = 0
     # v1.9.1（physio）：进餐次数按生活日清零
     state.meal_count_today = 0
-    _refresh_energy_cap(state, config)
+    _refresh_energy_cap(state, now=now, config=config)
 
 
 def _fire_date_rules(
@@ -3210,7 +3488,6 @@ def enforce_facts(
     *,
     now: float,
     config: SimConfig,
-    rest_day: bool | None = None,
     workday_override: bool | None = None,
     day_name: str = "",
     day_key: str = "",
@@ -3220,16 +3497,20 @@ def enforce_facts(
     单独抽出来是给「这一轮问模型有没有意义」（``pointless_ask_reason``）复用：
     两处口径必须一致，否则跳过判断会与实际裁定对不上。
 
-    ``rest_day``（v1.15.0 PR-R4）：带日历的判定归 plugin 层（``life_calendar``
-    不属于本模块），那里可以显式覆盖；不给时按班表推（班表休息日 ⇒ 休息日）。
-
     ``workday_override`` / ``day_name``（v1.17.0，PR-CAL-1）：日历对「今天算不算
-    工作日」的覆盖，同样由 plugin 层算好透传（本模块不认识日历）。**必须与
+    工作日」的覆盖，由 plugin 层算好透传（本模块不认识日历）。**必须与
     提示词侧用同一份**——否则会出现「提示词说放假、强制层还在岗」的 P0 缺陷
     （见改进方案 §2 P0-1）。
 
     ``day_key``（v1.17.0，PR-SCH-2）：生活日标识——给了它才会应用班表的按日微扰
     与加班日；同样必须与提示词侧同源。
+
+    v1.24.0：``rest_day`` / ``rested`` 两条事实**已退役**——它们都是「体力/时段
+    决定睡醒」的旧口径（休息日多睡、今晚已睡够不再睡）。睡不睡只看困意。
+
+    ``night_break`` 保留但语义换了：旧口径是「夜醒后豁免清醒下限」，新口径是
+    「这次不是新的一觉，是**续上一觉**」——夜醒的十几分钟里困意只小幅回升，
+    达不到入睡阈，若照常守阈值她会整夜干坐在 ``daze`` 里（探针实测）。
     """
 
     local_now = local_datetime(now, config.tz_offset_minutes)
@@ -3249,10 +3530,6 @@ def enforce_facts(
         day_name=day_name,
         day_key=day_key,
     )
-    if rest_day is None:
-        computed_rest = bool(config.schedule.enabled and not schedule.is_workday)
-    else:
-        computed_rest = bool(rest_day)
     return replace(
         activity_facts(state, now),
         now_minutes=local_now.hour * 60 + local_now.minute,
@@ -3260,11 +3537,6 @@ def enforce_facts(
         in_interrupt=in_interrupt,
         # v1.15.0（PR-R3/PR-R2）：赖床/夜醒宽限窗从状态直接算（纯模块能拿到）
         wake_grace=float(state.wake_grace_until or 0.0) > float(now),
-        rest_day=computed_rest,
-        # v1.15.0（PR-S1 配套）：本轮窗口已睡够 ⇒ 不许在同一个窗口里再睡一觉
-        rested=float(state.rested_until or 0.0) > float(now),
-        # v1.15.0（PR-R2）：夜醒后的同一夜里可以无阻睡回去（不受清醒下限拦阻）
-        night_break=night_break_active(state, now=now),
     )
 
 
@@ -3273,7 +3545,6 @@ def pointless_ask_reason(
     *,
     now: float,
     config: SimConfig,
-    rest_day: bool | None = None,
     workday_override: bool | None = None,
     day_name: str = "",
     day_key: str = "",
@@ -3291,7 +3562,6 @@ def pointless_ask_reason(
             state,
             now=now,
             config=config,
-            rest_day=rest_day,
             workday_override=workday_override,
             day_name=day_name,
             day_key=day_key,
@@ -3334,14 +3604,10 @@ def apply_activity(
 ) -> LifeState:
     """把裁定结果写进状态；活动真的变了才重置停留计时与睡眠起点。
 
-    ⚠ 这里有**两本不能混的账**：
-
-    * ``sleep_minutes_today`` **只由 ``settle`` 逐步累加**，这里绝不重复计入——
-      否则每次醒来都会把同一段睡眠记两遍，当日统计失真；
-    * 而醒来时要把这一觉记进 ``sleep_ledger`` 并结算熬夜（``grade_sleep_debt``），
-      用的是 ``sleep_started_at → now`` 的**整段时长**。必须用整段而不是当日计数器：
-      计数器会在 12:00 边界被清零、把跨边界的一觉劈成两半（真机 2026-10-02 的事故）；
-      整段时长也包含插件停机的那段时间——那段时间她确实在睡，算进去是对的。
+    v1.24.0：睡眠账本**只由 ``settle`` 逐步写入**，这里不补记、不结算熬夜债。
+    醒来时只做三件收尾：清睡眠锚点、连续清醒从零起算、清掉「本次连续睡眠」
+    与睡前预算。这样「跨生活日不截断一觉」「停机间隙不算睡眠」两条都由账本的
+    写入方式保证，而不是靠这里的推算。
     """
 
     now = float(now)
@@ -3351,37 +3617,27 @@ def apply_activity(
     if changed:
         if is_asleep(decision.activity):
             # 夜醒中断后接着睡（v1.15.0，PR-R2）：**夜醒后一小时内**再睡下 ⇒ 这是在续
-            # 上一觉，保留原来的入睡锚点，这一夜算一整体（否则目标从零重算，
-            # 一夜被拆成两段各自睡满目标 = 白多睡一个多小时）。
-            # 判据用「距上次夜醒不超过 1 小时」而不是宽限窗：宽限窗可能只有几分钟，
-            # 而硬约束把她送回床是在宽限窗过期后的下一个 tick，可能落在窗外。
+            # 上一觉，保留原来的入睡锚点与已结算时长。
             resuming = night_break_active(state, now=now) and _minutes_since(
                 now, state.sleep_started_at
             ) > 0
             if not resuming:
                 state.sleep_started_at = now
-        elif is_asleep(previous):
-            # 先量这一觉再清锚点。量不到（旧状态没有 sleep_started_at）时退回当日累计：
-            # 那是唯一能用的证据，而且它不能同时进账本，否则会重复计。
-            minutes = _minutes_since(now, state.sleep_started_at)
-            state.sleep_started_at = 0.0
-            # v1.16.0（M1）：醒了 ⇒ 连续清醒从零起算。这里必须也做一次——
-            # 下面 ``minutes <= 0`` 的那条路不会调用 ``record_sleep_episode``。
+                state.continuous_sleep_minutes = 0
+            # 一进睡眠（含小睡），连续清醒就到此为止——否则「深夜没睡」的疲劳
+            # 会跨过整觉继续累积。醒来时在下面的分支里也会清零，两处都写是为了
+            # 让「睡着期间」的疲劳读数也是 0。
             state.continuous_awake_minutes = 0
-            if minutes > 0:
-                record_sleep_episode(state, now=now, minutes=minutes)
-                grade_sleep_debt(state, now=now, config=config)
-            elif int(state.sleep_minutes_today) > 0:
-                grade_sleep_debt(
-                    state,
-                    now=now,
-                    config=config,
-                    extra_minutes=int(state.sleep_minutes_today),
-                )
-            # v1.15.0（PR-S1 配套）：这一觉睡够了「最短睡眠目标」⇒ 本轮睡眠时段到此
-            # 为止（``rested_until`` = 本轮窗口结束）。没有这一步，醒来十分钟后
-            # 「窗口内 + 体力差一点点满」就会把她送回床，再睡出第二个整觉。
-            _mark_rested_if_satisfied(state, now=now, minutes=minutes, config=config)
+            # 一进睡眠，睡前陪聊的预算就作废（本次「该睡了」已经兑现）
+            state.sleep_defer_until = 0.0
+            state.rested_until = 0.0
+        elif is_asleep(previous):
+            state.sleep_started_at = 0.0
+            state.continuous_awake_minutes = 0
+            state.continuous_sleep_minutes = 0
+            state.sleep_defer_until = 0.0
+            state.rested_until = 0.0
+            _trim_sleep_ledger(state, now=now)
         state.activity_since = now
 
     state.activity = decision.activity

@@ -157,6 +157,7 @@ def test_short_wake_does_not_mark_pending():
         state.activity = A.SLEEP
         state.sleep_started_at = NOW - 100 * 60  # 100 分钟小憩
         state.activity_since = state.sleep_started_at  # 锚点有效（0 会被当成损坏）
+        state.sleep_need = 0.10  # 困意已退：身体同意醒，模型提议才生效
         plugin._enforce_and_apply(
             NOW, A.ActivityDecision("daily", "", A.SOURCE_LLM, "测试唤醒")
         )
@@ -173,6 +174,7 @@ def test_long_wake_marks_pending_and_dream_lands():
         state.activity = A.SLEEP
         state.sleep_started_at = NOW - 400 * 60  # 6.7 小时
         state.activity_since = state.sleep_started_at
+        state.sleep_need = 0.10
         # 模型提议醒来（活动任意非 sleep）
         plugin._enforce_and_apply(
             NOW, A.ActivityDecision("daily", "", A.SOURCE_LLM, "测试唤醒")

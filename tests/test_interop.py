@@ -583,6 +583,81 @@ def test_state_memory_survives_schema_version_mismatch():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("failed_name", ["life_state.json", "adjust_memory.json"])
+def test_failed_state_save_preserves_dirty_flag_and_previous_file(monkeypatch, failed_name):
+    _, plugin, host = _make_plugin()
+    plugin._state.energy = 6.0
+    plugin._state.foreign = {"group-1": 0.5}
+    plugin._save_state()
+    paths = [plugin._state_path(), plugin._memory_path()]
+    before = {path.name: path.read_bytes() for path in paths}
+    original_replace = pathlib.Path.replace
+
+    def fail_one(path, target):
+        if target.name == failed_name:
+            raise PermissionError("injected write failure")
+        return original_replace(path, target)
+
+    plugin._state.energy = 7.0
+    plugin._state.foreign = {"group-1": 0.6}
+    plugin._state_dirty = True
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "replace", fail_one)
+        plugin._save_state()
+    assert plugin._state_dirty is True
+    assert next(path for path in paths if path.name == failed_name).read_bytes() == before[failed_name]
+    plugin._save_state()
+    assert plugin._state_dirty is False
+    assert json.loads(paths[0].read_text(encoding="utf-8"))["energy"] == 7.0
+    assert json.loads(paths[1].read_text(encoding="utf-8"))["foreign"] == {"group-1": 0.6}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), object()])
+def test_json_write_rejects_invalid_payload_without_replacing_file(bad):
+    _, plugin, host = _make_plugin()
+    path = plugin._state_path()
+    plugin._write_json_file(path, {"energy": 6.0})
+    before = path.read_bytes()
+    assert plugin._write_json_file(path, {"energy": bad}) is False
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["unload", "config"])
+def test_catchup_task_cancelled_before_unload_or_config_update(operation):
+    async def run():
+        from life_catchup import Candidate
+
+        module, plugin, host = _make_plugin(catchup={"active_enabled": True})
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def trigger(candidate, **kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        plugin._catchup_trigger = trigger
+        candidate = Candidate("s1", "p1", "u1", False, 0.0, 1)
+        plugin._spawn_catchup_flush([(0, candidate)], now=time.time(), sleep_minutes=120)
+        task = plugin._catchup_task
+        await asyncio.wait_for(entered.wait(), 1)
+        try:
+            if operation == "unload":
+                await plugin.on_unload()
+            else:
+                await plugin.on_config_update(module.CONFIG_RELOAD_SCOPE_SELF, {}, "test")
+            assert task.done() and task.cancelled()
+            assert cancelled.is_set()
+            assert plugin._catchup_task is None
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_dry_run_flip_at_unload_keeps_memory():
     """回归：dry_run 打开后卸载，不能把倍率记忆抹掉。
 
@@ -1943,7 +2018,7 @@ def test_activity_prompt_discloses_choice_effects_from_live_config():
             "体力每小时（消耗）",
             "情绪：默认会往基线",
             "今日已睡/清醒",
-            "熬夜与上限",
+            "缺觉与上限",
             "感冒：每天",
             "说话多少",
         ):
@@ -1952,7 +2027,7 @@ def test_activity_prompt_discloses_choice_effects_from_live_config():
         # 断言「旧上限值没残留」要看**那句话本身**：v1.16.0 的清醒疲劳曲线行里合法地
         # 会出现「清醒 12 小时」，用裸的 "12 小时" 判会把它误当成旧配置值。
         assert "睡满 12 小时" not in prompt, "旧配置值不该残留"
-        assert "睡满 9 小时" in prompt
+        assert "单次连续睡眠到 9 小时" in prompt
         # 睡眠唤醒的事实要如实跟随开关：默认开 ⇒ 说「被 @ 会临时醒来一次」
         assert "被 @ 会临时醒来一次" in prompt
         # 经济没接上（hint 为空）时不许凭空提钱，否则会诱导「为了省钱挑活动」

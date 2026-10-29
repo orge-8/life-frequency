@@ -61,6 +61,37 @@ def test_parse_curve_points_empty_input():
     assert F.parse_curve_points([]) == ((), [])
 
 
+# ---------------------------------------------------------------- 病后余韵
+
+
+def test_convalescent_factor_is_a_single_transition_not_double_cold():
+    """v1.25.0：余韵期只乘一次温和因子，不再乘 cold，也不重复“健康”。"""
+
+    out = _adjust(convalescent=True)
+    assert out.adjust == pytest.approx(0.95 * 0.85 * 0.75, rel=1e-6)
+    factors = dict(out.factors)
+    assert factors["病后余韵"] == pytest.approx(0.75)
+    assert "健康" not in factors
+    assert "感冒" not in factors
+
+
+def test_convalescent_factor_is_clamped_and_can_be_disabled():
+    low = _adjust(config=_config(convalescent_factor=0.01), convalescent=True)
+    assert dict(low.factors)["病后余韵"] == pytest.approx(0.2)
+
+    off = _adjust(config=_config(convalescent_factor=1.0), convalescent=True)
+    assert off.adjust == pytest.approx(0.95 * 0.85, rel=1e-6)
+    assert "病后余韵" not in dict(off.factors)  # 1.0 因子会被明细过滤掉
+
+
+def test_convalescent_flag_does_not_change_sick_day_factor():
+    """余韵只作用于“不生病”的恢复窗；真生病时仍按病程阶段因子走。"""
+
+    out = _adjust(sick=True, cold_stage="worsening", convalescent=True)
+    assert "病后余韵" not in dict(out.factors)
+    assert dict(out.factors)["感冒(worsening)"] == pytest.approx(0.15)
+
+
 @pytest.mark.parametrize(
     "x,expected",
     [(0.0, 0.55), (2.5, 0.75), (5.0, 0.95), (7.5, 1.15), (10.0, 1.35), (-5.0, 0.55), (99.0, 1.35)],

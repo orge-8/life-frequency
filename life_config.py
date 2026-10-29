@@ -39,7 +39,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_sim import DEFAULT_CARE_PATTERNS
 
 
-SUPPORTED_CONFIG_VERSION = "1.8.0"
+SUPPORTED_CONFIG_VERSION = "1.9.0"
 """``[plugin].config_version`` 的默认值（宿主硬性要求，缺失即加载失败）。
 
 ⚠ 这是**配置 schema 的版本**，不是插件版本。v1.14.0 递增到 1.1.0（病程字段）、
@@ -48,7 +48,9 @@ v1.16.2 到 1.4.0（体力耦合 + 内心维度通道）、v1.16.3 到 1.5.0（�
 关系系数）、v1.17.0 到 1.6.0（`[schedule] honor_calendar` / `daily_jitter_minutes` /
 `overtime_probability`）、v1.18.0 到 1.7.0（`[proactive]` 的
 `failure_cooldown_minutes` / `confirm_send` / `confirm_delay_minutes` /
-`interval_jitter_ratio` / `max_unanswered_times`）的原因有实测依据（见 runtime-gotchas §7.0.1）：
+`interval_jitter_ratio` / `max_unanswered_times`）的原因有实测依据（见 runtime-gotchas §7.0.1）；
+v1.25.0 到 1.9.0（`[health]` 的 `cold_low_energy_risk` / `cold_daily_risk_cap` /
+`cold_convalescent_factor`，见下方健康节）：
 宿主只在**文件不存在**时
 才初始化 ``config.toml``；版本号相同时配置**完全不写回**。⇒ 新增字段若不 bump，
 已部署实例的 ``config.toml`` 里永远不会出现这些键（行为按 pydantic 默认值跑，但用户
@@ -296,50 +298,133 @@ class SimulationConfig(PluginConfigBase):
         description="「生活日」的分界小时；凌晨的睡眠会算进前一天并在这里结算",
         json_schema_extra={"label": "生活日分界（小时）", "order": 6, "step": 1},
     )
+    # ---- 身体驱动睡眠（v1.24.0）----
+    sleep_need_onset: float = Field(
+        default=0.62,
+        description=(
+            "困意到它就会入睡（0–1）。困意是独立于体力的维度：醒着慢慢累积、"
+            "睡着慢慢消退，体力回满不代表困意消退。昼夜节律只在它上面加一层"
+            "很小的软偏置，不决定能不能睡"
+        ),
+        json_schema_extra={"label": "困意入睡阈值", "order": 7, "step": 0.01},
+    )
+    sleep_need_wake: float = Field(
+        default=0.16,
+        description=(
+            "困意退到它以下、且本次睡眠已达「最短睡眠」，才会自然醒。"
+            "模型/习惯/生理窗都不能在困意还高时把她叫起来（生病与异常长睡除外）"
+        ),
+        json_schema_extra={"label": "困意醒来阈值", "order": 8, "step": 0.01},
+    )
+    sleep_need_awake_gain_per_hour: float = Field(
+        default=0.029,
+        description="清醒时每小时累积的困意；与「睡眠恢复速度」共同决定大约 16 小时清醒 / 8 小时睡眠",
+        json_schema_extra={"label": "清醒困意累积（/小时）", "order": 9, "step": 0.001},
+    )
+    sleep_need_sleep_recovery_per_hour: float = Field(
+        default=0.058,
+        description="睡着时每小时消退的困意；决定一觉要睡多久才自然醒",
+        json_schema_extra={"label": "睡眠困意消退（/小时）", "order": 10, "step": 0.001},
+    )
+    sleep_need_nap_recovery_ratio: float = Field(
+        default=0.40,
+        description=(
+            "小睡对困意的消退比例（相对整觉）。0.4 = 眯一小时只抵 24 分钟的整觉，"
+            "补不了夜里的缺；0 = 小睡完全不缓解困意"
+        ),
+        json_schema_extra={"label": "小睡困意消退比例", "order": 11, "step": 0.05},
+    )
+    sleep_need_nap_threshold: float = Field(
+        default=0.42,
+        description="困意到它（或生病）才允许小睡；精神好时提议小睡会被拒绝",
+        json_schema_extra={"label": "小睡困意阈值", "order": 12, "step": 0.01},
+    )
+    sleep_circadian_strength: float = Field(
+        default=0.05,
+        description=(
+            "昼夜节律对入睡倾向的软偏置（0–0.2）：凌晨 03:00 最容易困、15:00 最清醒。"
+            "它只加减困意压力，不禁止白天睡、也不单独叫醒她；0 = 完全关闭节律"
+        ),
+        json_schema_extra={"label": "昼夜节律强度", "order": 13, "step": 0.01},
+    )
+    sleep_deferral_minutes: int = Field(
+        default=15,
+        description=(
+            "睡前陪聊预算（分钟）：第一次「该睡了」但她正在回消息时，最多再聊这么久；"
+            "新消息、切换会话都不会重置。用完后下一轮直接去睡。0 = 不留预算"
+        ),
+        json_schema_extra={"label": "睡前陪聊预算（分钟）", "order": 14, "step": 5},
+    )
+    sleep_target_hours: float = Field(
+        default=8.0,
+        description=(
+            "每日目标睡眠（小时），只用于算缺觉差额；不是「睡满就醒」的闹钟。"
+            "自然醒仍由困意恢复决定"
+        ),
+        json_schema_extra={"label": "目标睡眠（小时/天）", "order": 15, "step": 0.5},
+    )
+    sleep_deficit_window_hours: float = Field(
+        default=72.0,
+        description="缺觉的统计窗口（小时）：看最近这段时间实际睡了多少，与目标按天折算后求差额",
+        json_schema_extra={"label": "缺觉统计窗口（小时）", "order": 16, "step": 6},
+    )
+    sleep_unknown_tolerance_minutes: float = Field(
+        default=60,
+        description=(
+            "统计窗口内「无法记账」的时间超过它，就显示「记录不足」而不是编一个缺觉结论"
+            "（停机、时钟回拨、旧模型升级前的时间都算未知）"
+        ),
+        json_schema_extra={"label": "未知时间容忍（分钟）", "order": 17, "step": 10},
+    )
+
+    # ---- 已退役的旧闸门（保留字段只为旧 config.toml 能加载，不参与判定）----
     sleep_window: str = Field(
         default="03:00-11:00",
-        description="睡眠时段；此时段内才允许自行入睡（体力很低或生病时不限）",
-        json_schema_extra={"label": "睡眠时段", "order": 7, "placeholder": "03:00-11:00"},
+        description=(
+            "**已退役**（v1.24.0）：不再限制入睡时段。睡眠改由困意驱动，昼夜节律"
+            "只做软偏置；保留本字段只为旧配置能加载"
+        ),
+        json_schema_extra={"label": "睡眠时段（已退役）", "order": 30, "hidden": True},
     )
     sleep_energy_threshold: float = Field(
         default=3.0,
         description=(
-            "体力低于它就可以随时入睡，不必等睡眠时段，"
-            "也不受「每日清醒下限」限制（健康优先）"
+            "低体力参考线：**不是**入睡门槛，体力也不参与「睡不睡」的判定；只用于"
+            "感冒风险里的「体力偏低」判定与提示词里的事实描述"
         ),
-        json_schema_extra={"label": "体力入睡阈值", "order": 8, "step": 0.1},
+        json_schema_extra={"label": "低体力参考线", "order": 18, "step": 0.1},
     )
     max_sleep_hours: float = Field(
         default=12.0,
-        description="单日累计睡眠上限；超过就强制唤醒（防止模型让她睡一整天）",
-        json_schema_extra={"label": "每日睡眠上限（小时）", "order": 9, "step": 0.5},
+        description=(
+            "**单次连续睡眠**的异常上限（小时）：只防「睡死」兜底，不是日常醒来依据。"
+            "正常醒来看困意是否退到醒来阈值。0 = 不设上限"
+        ),
+        json_schema_extra={"label": "异常长睡上限（小时）", "order": 19, "step": 0.5},
     )
     energy_full_wake: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "睡眠中体力恢复到上限（动态值：连熬 3 晚后是 8.5）就强制唤醒（感冒醒到养病）。"
-            "睡觉的目的是恢复体力，满了继续躺只是空转；"
-            "关掉则回到「模型提议醒 / 睡满每日上限」两条路"
+            "**已退役**（v1.24.0）：体力回满不再等于睡够了，醒来只看困意。"
+            "保留字段只为旧配置能加载，改它没有任何效果"
         ),
-        json_schema_extra={"label": "体力满唤醒", "order": 10},
+        json_schema_extra={"label": "体力满唤醒（已退役）", "order": 31, "hidden": True},
     )
     energy_full_wake_min_hours: float = Field(
         default=6.5,
         description=(
-            "体力满唤醒的**最短睡眠目标**（小时，v1.15.0）：睡不满它就算体力已满也继续睡。"
-            "0 = 旧行为（体力一回满立刻醒）。默认 6.5 比熬夜阈值（默认 5 小时）高，"
-            "这样才能断开「熬夜压低体力上限 → 睡得更短 → 债更还不清」的正反馈；"
-            "睡觉不是充电，真人按钟点睡而不是按电量睡"
+            "**已退役**（v1.24.0）：最短睡眠目标由困意恢复速度与醒来阈值决定，"
+            "不再用固定小时数。保留字段只为旧配置能加载"
         ),
-        json_schema_extra={"label": "最短睡眠目标（小时）", "order": 11, "step": 0.5},
+        json_schema_extra={"label": "最短睡眠目标（已退役）", "order": 32, "hidden": True},
     )
     rest_day_sleep_extension_minutes: int = Field(
         default=60,
         description=(
-            "休息日（法定节假日 / 班表休息日）在最短睡眠目标上额外顺延的分钟数；"
-            "0 = 不区分休息日。需要同时有「最短睡眠目标 > 0」才有效"
+            "**已退役**（v1.24.0）：休息日不再固定多睡；睡多久由昨晚累积的困意与"
+            "当天消耗决定。保留字段只为旧配置能加载"
         ),
-        json_schema_extra={"label": "休息日多睡（分钟）", "order": 12, "step": 15},
+        json_schema_extra={"label": "休息日多睡（已退役）", "order": 33, "hidden": True},
     )
     routine_can_wake: bool = Field(
         default=False,
@@ -371,26 +456,29 @@ class SimulationConfig(PluginConfigBase):
     nap_enabled: bool = Field(
         default=True,
         description=(
-            "启用「小睡」（v1.15.0）：白天（睡眠时段之外）精力低时眯一会儿，"
-            "最多 `小睡上限` 分钟、体力恢复比睡觉弱、不做梦；睡着时同样完全静默。"
-            "关掉后模型看不到这个选项，行为与升级前一致"
+            "启用「小睡」：白天困意到阈值时眯一会儿，最多 `小睡上限` 分钟、"
+            "体力恢复比睡觉弱、困意只按比例消退（补不了整觉）、不做梦；"
+            "睡着时同样完全静默。关掉后模型看不到这个选项"
         ),
-        json_schema_extra={"label": "启用小睡", "order": 16},
+        json_schema_extra={"label": "启用小睡", "order": 20},
     )
     nap_max_minutes: int = Field(
         default=90,
         description="单次小睡的时长上限（分钟）；到了就叫醒她",
-        json_schema_extra={"label": "小睡上限（分钟）", "order": 17, "step": 10},
+        json_schema_extra={"label": "小睡上限（分钟）", "order": 21, "step": 10},
     )
     nap_min_minutes: int = Field(
         default=20,
         description="单次小睡的最短时长（分钟）；刚眯下不会被马上叫起来",
-        json_schema_extra={"label": "小睡最短（分钟）", "order": 18, "step": 5},
+        json_schema_extra={"label": "小睡最短（分钟）", "order": 22, "step": 5},
     )
     nap_energy_threshold: float = Field(
         default=4.0,
-        description="体力低于它（或生病）才会小睡；精神好时提议小睡会被拒绝",
-        json_schema_extra={"label": "小睡体力阈值", "order": 19, "step": 0.5},
+        description=(
+            "**已退役**（v1.24.0）：小睡改由困意判定（见 `[simulation] 小睡困意阈值`）。"
+            "保留字段只为旧配置能加载，改它没有任何效果"
+        ),
+        json_schema_extra={"label": "小睡体力阈值（已退役）", "order": 34, "hidden": True},
     )
     wake_on_at: bool = Field(
         default=True,
@@ -498,7 +586,7 @@ class ActivityLLMConfig(PluginConfigBase):
             "**睡眠中**的决策间隔（秒，v1.15.0）。睡满最短睡眠时长后到醒来之间，"
             "模型能做的有效决定只有「要不要提前醒」，而按 10 分钟一轮问一夜等于白烧"
             "token（每晚 18–30 次）。默认 30 分钟一轮；0 = 睡眠中完全不问模型"
-            "（醒来交给体力满 / 睡眠上限 / 最短睡眠目标这些确定性条件）"
+            "（醒来交给困意退到醒来阈值 / 异常长睡上限这些确定性条件）"
         ),
         json_schema_extra={"label": "睡眠中决策间隔（秒）", "order": 20, "step": 60},
     )
@@ -691,33 +779,35 @@ class ActivityConfig(PluginConfigBase):
     )
     min_sleep_minutes: int = Field(
         default=180,
-        description="单次睡眠的最短时长（分钟）；睡不够不会被叫醒",
-        json_schema_extra={"label": "最短睡眠（分钟）", "order": 2, "step": 10},
+        description=(
+            "自然醒的最短睡眠保护（分钟）：睡不满它，就算困意已退也不会醒，"
+            "防止刚躺下就翻身起来。超过它之后，醒来只看困意阈值"
+        ),
+        json_schema_extra={"label": "最短睡眠保护（分钟）", "order": 2, "step": 10},
     )
     min_awake_hours_per_day: float = Field(
         default=8.0,
-        description="每日清醒下限（小时）；不够就拒绝入睡，防止模型一累就让她睡",
-        json_schema_extra={"label": "每日清醒下限（小时）", "order": 3, "step": 0.5},
+        description=(
+            "**已退役**（v1.24.0）：不再有「今天必须清醒满 N 小时才许入睡」的闸门。"
+            "保留字段只为旧配置能加载，改它没有任何效果"
+        ),
+        json_schema_extra={"label": "每日清醒下限（已退役）", "order": 30, "hidden": True},
     )
     cold_onset_awake_floor: bool = Field(
         default=True,
         description=(
-            "感冒**初起**也走每日清醒下限（v1.19.0 PR-AF-1），不再「病中随时可睡」。"
-            "真机实测：初起也短路时，她睡到体力满醒来、下一轮又因病中立刻躺回去，"
-            "清醒被压成 1 个 tick（10 分钟），睡觉占比 79.6%。"
-            "关掉（False）= 回到「一生病就随时可睡」的旧行为。"
-            "加重/好转期**不受**此开关影响，永远可以多躺"
+            "**已退役**（v1.24.0）：随「每日清醒下限」一并撤掉。保留字段只为旧配置能加载"
         ),
-        json_schema_extra={"label": "感冒初起也走清醒下限", "order": 9},
+        json_schema_extra={"label": "感冒初起也走清醒下限（已退役）", "order": 31, "hidden": True},
     )
     sleep_hard_floor: float = Field(
         default=0.5,
         description=(
-            "体力低到这条线以下时**无视模型提议**强制入睡（v1.15.0）。"
-            "0 = 关闭。原来只兜住了「模型没输出」那条路，模型一直提议别的事时"
-            "她可以被按在 0 体力上熬夜"
+            "**已退役**（v1.24.0）：强制入睡改由困意压力判定（体力低只会通过"
+            " `低体力参考线` 给困意加压，不再单独触发）。保留字段只为旧配置能加载，"
+            "改它没有任何效果"
         ),
-        json_schema_extra={"label": "体力耗尽强制入睡", "order": 8, "step": 0.1},
+        json_schema_extra={"label": "体力耗尽强制入睡（已退役）", "order": 32, "hidden": True},
     )
     reseed_after_hours: float = Field(
         default=8.0,
@@ -1056,25 +1146,23 @@ class HealthConfig(PluginConfigBase):
     sleep_debt_threshold_minutes: int = Field(
         default=300,
         description=(
-            "最近 24 小时累计睡眠低于它就算「没睡够的一夜」（默认 300 = 5 小时）。"
-            "判据是滑动 24 小时窗口、在睡醒时结算，所以跨生活日边界的一段睡眠"
-            "不会被切成两半分别判，拆成两段睡也会合起来算"
+            "缺觉折算成「几晚」时的基准：每缺「目标睡眠 − 这个值」（默认 8−5=3 小时）"
+            "算一晚。只影响显示与体力上限的档位，不做「睡醒时判一晚」的逐晚记账"
         ),
-        json_schema_extra={"label": "熬夜阈值（分钟）", "order": 0, "step": 30},
+        json_schema_extra={"label": "一晚缺觉折算（分钟）", "order": 0, "step": 30},
     )
     sleep_debt_cap_nights: int = Field(
         default=3,
-        description="连熬几夜后压低体力上限",
-        json_schema_extra={"label": "连熬夜数", "order": 1, "step": 1},
+        description="按时间口径累计缺觉达到约几晚时压低体力上限",
+        json_schema_extra={"label": "缺觉压低上限的档位（晚）", "order": 1, "step": 1},
     )
     sleep_debt_recovery_step: int = Field(
         default=1,
         description=(
-            "一晚「睡够了」清掉几晚熬夜债（v1.15.0，默认 1 = 滞回：连熬三晚要三个好觉"
-            "才还清）。0 = 旧行为（一晚直接归零）。旧行为与「体力满即醒」叠加时，"
-            "她会在「熬夜 → 上限被压低 → 睡得更短」之间反复"
+            "**已退役**（v1.24.0）：睡债只按时间口径计算，不再「每醒来一次加减一晚」。"
+            "保留字段只为旧配置能加载，改它没有任何效果"
         ),
-        json_schema_extra={"label": "每晚还几晚债", "order": 2, "step": 1},
+        json_schema_extra={"label": "每晚还几晚债（已退役）", "order": 3, "hidden": True},
     )
     sleep_deprived_energy_cap: float = Field(
         default=8.5,
@@ -1102,14 +1190,38 @@ class HealthConfig(PluginConfigBase):
         json_schema_extra={"label": "感冒最长天数", "order": 6, "step": 1},
     )
     cold_base_risk: float = Field(
-        default=0.05,
-        description="感冒基础风险（0–1）",
-        json_schema_extra={"label": "感冒基础风险", "order": 7, "step": 0.01},
+        default=0.012,
+        description="感冒基础风险（0–1）；默认约 4 次/年，旧的 5% 会让角色接近每月感冒一次",
+        json_schema_extra={"label": "感冒基础风险", "order": 7, "step": 0.001},
     )
     cold_sleep_debt_risk: float = Field(
-        default=0.08,
-        description="每多一晚熬夜、以及体力很低时，各自增加的风险",
-        json_schema_extra={"label": "熬夜/低体力风险增量", "order": 8, "step": 0.01},
+        default=0.03,
+        description="每多一晚缺觉增加的感冒风险；最多按 3 晚叠加",
+        json_schema_extra={"label": "每晚缺觉风险增量", "order": 8, "step": 0.01},
+    )
+    cold_low_energy_risk: float = Field(
+        default=0.03,
+        description=(
+            "体力低于『低体力参考线』时额外增加的感冒风险。与缺觉风险分开，"
+            "避免旧版同一个参数被夜间缺觉和低体力重复叠加"
+        ),
+        json_schema_extra={"label": "低体力风险增量", "order": 9, "step": 0.01},
+    )
+    cold_daily_risk_cap: float = Field(
+        default=0.20,
+        description=(
+            "单日感冒风险上限（0.05–0.95）。基础、缺觉、低体力与季节因子合成后封顶；"
+            "防止长期缺觉把日风险推到 37% 以上"
+        ),
+        json_schema_extra={"label": "单日风险上限", "order": 10, "step": 0.05},
+    )
+    cold_convalescent_factor: float = Field(
+        default=0.75,
+        description=(
+            "病后余韵期的发言频率因子（0.2–1.0）。余韵不算生病，但刚从重病恢复时"
+            "不应立刻回到 1.0；默认 0.75，设为 1.0 可关闭该过渡"
+        ),
+        json_schema_extra={"label": "病后余韵频率因子", "order": 11, "step": 0.05},
     )
     cold_stage_factors: list[str] = Field(
         default_factory=lambda: list(DEFAULT_COLD_STAGE_FACTOR_LINES),
@@ -1117,20 +1229,20 @@ class HealthConfig(PluginConfigBase):
             "病程阶段因子，每行一组 \"阶段=因子\"（onset 初起 / worsening 加重 / "
             "recovering 好转）。轻症与病重不再同一个压制值；留空则回退「健康因子」里的 cold"
         ),
-        json_schema_extra={"label": "病程阶段因子（每行一组）", "order": 9, "rows": 3},
+        json_schema_extra={"label": "病程阶段因子（每行一组）", "order": 13, "rows": 3},
     )
     cold_immunity_days: int = Field(
-        default=5,
+        default=7,
         description="痊愈后几天内不再掷中招骰子（0 = 关掉免疫期）",
-        json_schema_extra={"label": "病后免疫期（天）", "order": 10, "step": 1},
+        json_schema_extra={"label": "病后免疫期（天）", "order": 14, "step": 1},
     )
     cold_convalescent_hours: int = Field(
         default=24,
         description=(
-            "病后余韵时长（小时）：这段时间不算生病，只是提示词与状态卡里带一句"
-            "「刚好利索，体力还没回来」（0 = 关掉）"
+            "病后余韵时长（小时）：这段时间不算生病，但发言频率会乘以"
+            "『病后余韵频率因子』，避免健康因子从 0.15 一步跳回 1.0（0 = 关掉）"
         ),
-        json_schema_extra={"label": "病后余韵（小时）", "order": 11, "step": 1},
+        json_schema_extra={"label": "病后余韵（小时）", "order": 15, "step": 1},
     )
     cold_care_daily_cap: int = Field(
         default=2,
@@ -1138,7 +1250,7 @@ class HealthConfig(PluginConfigBase):
             "每日计入病程流转的关心次数上限（别人说「你吃药了吗」这类句式）。"
             "多出来的关心仍有情绪收益，但不再加速康复——0 = 关心不影响病程"
         ),
-        json_schema_extra={"label": "每日关心计入上限", "order": 12, "step": 1},
+        json_schema_extra={"label": "每日关心计入上限", "order": 16, "step": 1},
     )
     cold_sick_leave: bool = Field(
         default=True,
@@ -1146,7 +1258,7 @@ class HealthConfig(PluginConfigBase):
             "病假：加重/好转期她请病假，班表的在岗约束对她挂起（提示词与强制层都不再"
             "让她上班）。关掉 = 只有强制养病、没有病假说法"
         ),
-        json_schema_extra={"label": "生病自动请病假", "order": 13},
+        json_schema_extra={"label": "生病自动请病假", "order": 17},
     )
     cold_care_patterns: list[str] = Field(
         default_factory=lambda: list(DEFAULT_CARE_PATTERNS),
@@ -1155,7 +1267,7 @@ class HealthConfig(PluginConfigBase):
             "「叮嘱/询问句式」（多喝热水、好点了吗），防「我昨天也感冒了」「他感冒一礼拜了」"
             "被当成关心；坏正则只告警并忽略。想更宽松可自己加行，例如 ^早点睡"
         ),
-        json_schema_extra={"label": "关心句式（每行一条正则）", "order": 14, "rows": 3},
+        json_schema_extra={"label": "关心句式（每行一条正则）", "order": 18, "rows": 3},
     )
     cold_season_factors: list[str] = Field(
         default_factory=list,
@@ -1163,7 +1275,7 @@ class HealthConfig(PluginConfigBase):
             "季节风险系数，每行一组 \"月份=倍率\"（如 1=1.5、7=0.7），留空 = 不启用。"
             "启用后冬天更容易感冒，生病不再是均匀白噪声"
         ),
-        json_schema_extra={"label": "季节风险系数（每行一组）", "order": 15, "rows": 3},
+        json_schema_extra={"label": "季节风险系数（每行一组）", "order": 19, "rows": 3},
     )
 
     _norm_health_factors = _str_list_validator("health_factors")

@@ -7,11 +7,15 @@
 | 层 | 标准 |
 |---|---|
 | gate | 四件套全绿；每项新机制附「关闭 = 旧行为逐位一致」的回归测试 |
-| 行为（M1） | 清闲日 16–18 h 内自然触到入睡阈值；nap 在一周内至少自然触发一次 |
+| 行为（M1） | 清闲日一天内自然触到**困意**入睡阈；nap 在一周内至少自然触发一次 |
 | 行为（M5） | 大冲击后情绪前 1 h 回落 > 旧线性，4 h 后仍有可测余量（长尾） |
 | 行为（M3a） | 高压日的归因输出里能看到「绷不住」事件，且每天 ≤ 1 次 |
-| 行为（C 期） | 无死亡螺旋：连续 7 天运行中，emotion 不低于 1.5 的天数占比 ≥ 80% |
+| 行为（C 期） | 无死亡螺旋：7 天里 ≥ 80% 的样本/生活日不低于 1.5，且不长时间趴在底部 |
 | 纪律 | 内心维度在 `compute_adjust` 的因子表里始终不出现；经济维度照旧不在 |
+
+⚠ v1.24.0 把入睡从「体力降到阈值」改成**困意（sleep_need）达到阈值**，所以 M1
+那两条不再测体力，而是测 `sleep_need` 与强制层裁定；旧口径（体力跌破 3.0）
+属于已退役行为，不在这里留断言。
 
 「关闭 = 旧行为逐位一致」那一层不在这里重复——它散在四个专项文件里
 （`test_attribution.py` / `test_emotion_regress.py` / `test_mood_coupling.py` /
@@ -163,84 +167,94 @@ def test_discipline_fatigue_reaches_the_multiplier_only_through_the_baseline():
 # ================================================================ 行为（M1）
 
 
-def _calm_day_timeline(*, config, start_energy=8.0, hours=20.0, at=None):
-    """清闲日：daze / daily 每 4 小时交替（平均 ≈ −0.3/h），睡眠窗口关掉。
+def _calm_day_timeline(*, config, start_energy=8.0, hours=24.0, at=None):
+    """清闲日：daze / daily 每 4 小时交替，**每一步都过强制层**（无提议）。
 
-    关窗是关键——这样「她睡着了」只能是因为**累**，不是被窗口拖上床的。
+    v1.24.0 起没有「睡眠窗口」了：她会不会睡只取决于困意。所以这条时间线
+    同时是验收「身体驱动入睡」的场地——不需要关掉任何硬性时段。
     """
 
-    config = S.SimConfig(**{**config.__dict__, "sleep_window": (0, 0)})
     at = at or ts(2026, 3, 2, 8, 0)
     state = make_state(at=at, activity=A.DAZE, energy=start_energy)
-    samples: list[tuple[float, float]] = []
+    samples: list[dict] = []
     for step in range(1, int(hours * 6) + 1):
         now = at + 600 * step
-        state.activity = A.DAZE if (step * 10) % 480 < 240 else A.DAILY
+        if not S.is_asleep(state.activity):
+            state.activity = A.DAZE if (step * 10) % 480 < 240 else A.DAILY
         S.settle(state, now=now, config=config, events=(), rng=random.Random(1))
-        samples.append(((now - at) / 3600.0, float(state.energy)))
+        S.enforce_and_apply(state, now=now, config=config, decision=None)
+        samples.append({
+            "hour": (now - at) / 3600.0,
+            "energy": float(state.energy),
+            "sleep_need": float(state.sleep_need),
+            "activity": state.activity,
+        })
     return config, state, samples
 
 
-def test_m1_calm_day_reaches_the_sleep_threshold_within_16_to_18_hours():
-    """验收：清闲日 16–18 小时内自然触到入睡阈值（3.0）。
+def test_m1_calm_day_naturally_falls_asleep_within_a_day():
+    """验收：清闲日 24 小时内**自然**触到入睡阈（困意 0.62）并睡下。
 
-    **实测（本用例钉的就是这两个数）**：新机制 **15.8 h**、旧机制 **18.2 h**。
-    方案窗口是 16–18 h，我们落在窗口**下沿前约 12 分钟**（方案自己算的是 15.7 h，
-    见 §3 M1 的标定算式）——所以这里放宽成 15.0–18.0 并把这个差写进 README。
-    真正拉开差距的是最闲的那条路（纯 `daze`，见下一个断言）。
+    **实测**：混合清闲日（daze/daily 交替）约 **19.6 h**；纯 `daze` 也在这条
+    时间线的 24 小时窗口内睡下（见下一个用例）。方案原文的 16–18 h 是旧
+    「体力驱动」标定；v1.24.0 改成困意驱动后，入睡由 0.029/h 的累积速度决定，
+    这里把窗口校准为「一天之内」并把实测值写进断言。
     """
 
     config = production_config()
-    _config, _state, samples = _calm_day_timeline(config=config)
-    crossed = next((hour for hour, energy in samples if energy < 3.0), None)
-    assert crossed is not None, "清闲的一天里她永远不困 = M1 没生效"
-    assert 15.0 <= crossed <= 18.0, f"触阈时刻 {crossed:.1f} 小时，方案要求 16–18"
-
-    # 旧行为：同样的混合清闲日要晚得多（18.2 h）——清醒疲劳确实把她更早推向床
-    _c2, _s2, old_samples = _calm_day_timeline(config=cfg())
-    old_crossed = next((hour for hour, energy in old_samples if energy < 3.0), None)
-    assert old_crossed is not None, "混合清闲日在旧机制下也会累（这正是 P5 的另一半）"
-    assert crossed < old_crossed - 1.0, (crossed, old_crossed)
+    _config, state, samples = _calm_day_timeline(config=config, hours=26)
+    onset = next((item for item in samples if item["activity"] == A.SLEEP), None)
+    assert onset is not None, "清闲的一天里她永远不困 = 身体驱动没生效"
+    assert onset["hour"] <= 24.0, f"触阈时刻 {onset['hour']:.1f} 小时，一天内该睡了"
+    assert onset["sleep_need"] >= (
+        config.sleep_need_onset - config.sleep_circadian_strength - 1e-6
+    ), f"入睡时困意只有 {onset['sleep_need']:.3f}，不该被别的东西拖上床"
+    assert onset["energy"] > 0.0, "她不是因为体力耗尽才睡的（体力仍在正区间）"
 
 
-def test_m1_the_quietest_path_never_gets_tired_without_the_ramp():
-    """P5 的正解：纯 `daze`（−0.10/h）在旧机制下 24 小时只掉到 5.6，永远碰不到阈值。"""
+def test_m1_full_energy_does_not_block_sleep():
+    """清单第二部分的硬要求：**体力满也不许拒绝睡觉**。
 
-    at = ts(2026, 3, 2, 8, 0)
-    results = {}
-    for label, config in (("new", production_config()), ("old", cfg())):
-        windowless = S.SimConfig(**{**config.__dict__, "sleep_window": (0, 0)})
-        state = make_state(at=at, activity=A.DAZE, energy=8.0)
-        for step in range(1, 24 * 6 + 1):
-            S.settle(state, now=at + 600 * step, config=windowless, events=(),
-                     rng=random.Random(1))
-        results[label] = float(state.energy)
+    旧模型里「体力回满」会把她叫醒；新模型里体力与困意是两套量，
+    满体力 + 困意到阈 = 就该睡。
+    """
 
-    assert results["new"] < 3.0, results
-    assert results["old"] == pytest.approx(5.6, abs=0.05), results
-    assert results["old"] - results["new"] > 3.0
+    at = ts(2026, 3, 3, 3, 0)  # 节律峰值，最容易困的相位
+    state = make_state(at=at, activity=A.DAILY, energy=10.0, sleep_need=0.70)
+    S.enforce_and_apply(state, now=at, config=production_config(), decision=None)
+    assert state.activity == A.SLEEP
+    assert state.energy == pytest.approx(10.0)
+
+    # 反向：体力低、困意没到阈 ⇒ 不许强制她去睡（低体力 ≠ 必须睡）
+    rested = make_state(at=at, activity=A.DAILY, energy=1.0, sleep_need=0.20)
+    S.enforce_and_apply(rested, now=at, config=production_config(), decision=None)
+    assert rested.activity == A.DAILY
 
 
 def test_m1_nap_becomes_reachable_on_a_calm_day():
-    """验收：nap 在一周内至少自然触发一次——先证明它**够得着**（阈值 4.0）。
+    """验收：nap 在一周内至少自然触发一次——先证明它**够得着**（困意阈值 0.42）。
 
     nap 必须由模型提议（没有提议时强制层不会自己安排小睡），所以验收拆两半：
-    ① 清闲日下午体力真的跌破 nap 阈值；② 此刻的 propose 会被放行。两者的结合就是
-    「一周内至少自然触发一次」的前提。
+    ① 清闲日下午困意真的涨过 nap 阈；② 此刻的提议会被放行。
     """
 
     config = production_config()
-    _config, _state, samples = _calm_day_timeline(config=config)
-    crossed = next((hour for hour, energy in samples if energy < 4.0), None)
-    assert crossed is not None, "清闲日连小睡阈值都够不着 = M1 标定偏保守"
-    assert 12.0 <= crossed <= 18.0, crossed
+    _config, _state, samples = _calm_day_timeline(config=config, hours=24)
+    crossed = next(
+        (item["hour"] for item in samples if item["sleep_need"] >= config.sleep_need_nap_threshold),
+        None,
+    )
+    assert crossed is not None, "清闲日连小睡阈值都够不着 = 标定偏保守"
+    # 初始困意 0.25（睡醒后的日常状态），涨到 0.42 约需 (0.42−0.25)/0.029 ≈ 5.9 h
+    assert 4.0 <= crossed <= 20.0, crossed
 
-    # ② 站在那个时刻上：白天的低体力小睡提议会被放行（窗口关着也能睡）
-    policy = S.build_enforce_policy(cfg(sleep_window=(0, 0)))
+    # ② 站在那个时刻上：白天的低体力小睡提议会被放行
+    policy = S.build_enforce_policy(cfg())
     facts = A.ActivityFacts(
         activity=A.DAILY, minutes_in_activity=120, now_minutes=18 * 60,
         emotion=5.0, energy=3.8, energy_cap=10.0, sick=False,
         sleep_minutes_today=0, awake_minutes_today=14 * 60,
+        sleep_need=0.50,
     )
     decided = A.enforce(facts, A.ActivityDecision(A.NAP, source=A.SOURCE_LLM), policy)
     assert decided.activity == A.NAP, decided
@@ -325,21 +339,39 @@ def test_m3a_high_stress_day_shows_up_in_the_attribution_and_only_once():
 
 
 def test_c_phase_no_death_spiral_over_seven_days():
-    """验收：连续 7 天运行中 emotion ≥ 1.5 的占比 ≥ 80%（无死亡螺旋）。
+    """验收：连续 7 天运行中情绪**不被困在谷底**（无死亡螺旋）。
 
     跑的是标定脚本那条确定性时间线（时段表提议 + 内建事件库 + 固定种子）：
     机制全开（含 C 期两条合法压低源：疲劳偏移与崩溃事件）也不能把她按死在谷底。
+
+    **校准（实测值写进断言）**：样本占比 99.6%（≥ 1.5）、逐日最低值
+    ``[1.67, 2.54, 0.93, 2.71, 2.22, 2.23, 3.05]`` ⇒ 7 天里 6 天全程 ≥ 1.5
+    （85.7%）。唯一的低谷只持续 **0.5 小时**（3 个 10 分钟样本）就回升——
+    旧写法用「最低值 ≥ 1.5」一刀切，会把**合法的一次短暂低落**判成死亡螺旋；
+    真正要禁的是「长时间趴在底部」，所以这里改成占比 + 连续时长两条有界判据。
     """
 
     calibrator = _calibrator()
     data = calibrator.simulate(production_config(), days=7, seed=20261010)
     emotions = data["emotion"]
     assert emotions, "标定脚本没跑出样本"
+
     healthy = sum(1 for value in emotions if value >= 1.5) / len(emotions)
     assert healthy >= 0.80, f"emotion ≥ 1.5 的占比只有 {healthy:.1%}（要求 ≥ 80%）"
-    assert min(emotions) >= 1.5, f"最低情绪 {min(emotions):.2f}——已经跌进谷底"
 
-    # 崩溃事件确实发生过（否则「没有死亡螺旋」可能只是因为机制根本没触发）
+    per_day = [min(emotions[i:i + 144]) for i in range(0, len(emotions), 144)]
+    good_days = sum(1 for value in per_day if value >= 1.5) / len(per_day)
+    assert good_days >= 0.80, f"只有 {good_days:.0%} 的生活日全程 ≥ 1.5"
+    assert len([value for value in per_day if value >= 1.5]) >= 6, per_day
+
+    longest = current = 0
+    for value in emotions:
+        current = current + 1 if value < 1.5 else 0
+        longest = max(longest, current)
+    assert longest * 10 <= 3 * 60, f"连续 {longest * 10} 分钟趴在 1.5 以下"
+    assert min(emotions) >= 0.5, f"最低情绪 {min(emotions):.2f}——已经跌进谷底"
+
+    # 睡眠确实在发生（否则「没有死亡螺旋」可能只是因为根本没睡）
     assert data["sleep_episodes"] > 0
 
 

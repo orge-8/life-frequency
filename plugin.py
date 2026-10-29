@@ -102,6 +102,7 @@ try:
         rule_based_activity,
         schedule_facts,
         schedule_phase_label,
+        sleep_pressure,
     )
     from .life_economy import (
         TIER_UNKNOWN,
@@ -257,6 +258,7 @@ try:
         health_label_admin,
         health_label_prompt,
         impact_scale,
+        in_convalescence,
         is_cold,
         local_datetime,
         mark_ask_skipped,
@@ -272,6 +274,8 @@ try:
         register_care,
         settle,
         should_reseed,
+        sleep_deficit_label,
+        sleep_deficit_nights,
         sleep_hours_today,
         take_medicine,
     )
@@ -344,6 +348,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         rule_based_activity,
         schedule_facts,
         schedule_phase_label,
+        sleep_pressure,
     )
     from life_economy import (
         TIER_UNKNOWN,
@@ -413,6 +418,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         health_label_admin,
         health_label_prompt,
         impact_scale,
+        in_convalescence,
         is_cold,
         local_datetime,
         mark_ask_skipped,
@@ -428,6 +434,8 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         register_care,
         settle,
         should_reseed,
+        sleep_deficit_label,
+        sleep_deficit_nights,
         sleep_hours_today,
         take_medicine,
     )
@@ -925,6 +933,11 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         self._tasks: list[asyncio.Task[Any]] = []
         self._state: LifeState = LifeState()
         self._rng: random.Random = random.Random(0)
+        #: ``_sim_config`` / ``_factor_config`` 的派生缓存（v1.25.0）。
+        #: 两者每 tick 会被调用多次，重复解析几百个字段纯属浪费；配置热更新时
+        #: 由 ``_rebuild_from_config`` 置空。缓存的是不可变 dataclass，可安全共享。
+        self._sim_config_cache: SimConfig | None = None
+        self._factor_config_cache: Any = None
         self._events: list[Any] = []
         self._festival_warnings: list[str] = []
         self._bot_name: str = "麦麦"
@@ -1151,6 +1164,7 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             except Exception:  # noqa: BLE001 — 卸载阶段不允许抛错打断主流程
                 self.ctx.logger.exception("后台任务退出异常")
         self._tasks.clear()
+        await self._cancel_catchup_flush()
 
         if self._routine_store is not None:
             try:
@@ -1170,6 +1184,8 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         """配置热重载。``self`` = 插件自己的 config.toml；``bot``/``model`` = 全局广播。"""
 
         if scope == CONFIG_RELOAD_SCOPE_SELF:
+            await self._cancel_catchup_flush()
+            self._catchup_scanned = False
             # v1.14.0：关心句式是**正则表**，缓存在实例上（消息钩子每条都要用）。
             # 热更新后必须丢掉旧缓存，否则改完配置要重启才生效。
             self._care_patterns_cache = None
@@ -1237,6 +1253,10 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
     def _rebuild_from_config(self) -> None:
         """配置变化后重建派生对象：事件库、节日表、随机源、LLM 冷却。"""
 
+        # 先失效派生缓存：即使下面的某一步抛出，也绝不继续使用旧配置算出的
+        # SimConfig / FactorConfig。
+        self._sim_config_cache = None
+        self._factor_config_cache = None
         self._events, warnings = merge_events(
             self.config.events.extra, self.config.events.disabled
         )
@@ -1518,46 +1538,96 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
                 )
             state = LifeState()
         else:
+            # v1.24.0：迁移前把**原始状态**原样留一份快照（只写一次，之后只读不写）。
+            # 旧状态里有些事实（例如连熬夜数、睡眠账本缺失的那段历史）无法从新
+            # 模型还原，留档是为了排查时还能看到「当时到底长什么样」。
+            try:
+                raw_version = int(payload.get("state_version", LifeState().state_version))
+            except (TypeError, ValueError, OverflowError):
+                raw_version = 0
+            if raw_version < int(LifeState().state_version):
+                self._snapshot_state_before_migration(payload, raw_version)
             state = LifeState.from_dict(payload)
-            if state.state_version != int(LifeState().state_version):
+            # v1.24.0：旧版本由 ``from_dict`` 做**幂等迁移**（关系/情绪/病程/经历原样
+            # 保留，旧「连熬夜数」搬进证据字段），不再整份重建。只有读不懂的**未来**
+            # 版本才回到空状态，且倍率记忆必须保留。
+            if int(state.state_version) > int(LifeState().state_version):
                 self.ctx.logger.warning(
-                    "状态文件版本不匹配（%s）：生活状态按空状态继续，但**保留倍率记忆**"
-                    "（它描述的是宿主上的值，与状态结构无关；丢掉它会导致生活倍率被乘两次）",
+                    "状态文件版本 %s 高于当前插件（%s）：生活状态按空状态继续，"
+                    "但**保留倍率记忆**（它描述的是宿主上的值，与状态结构无关；"
+                    "丢掉它会导致生活倍率被乘两次）",
                     state.state_version,
+                    LifeState().state_version,
                 )
                 memory = state
                 state = LifeState()
                 for field in _MEMORY_FIELDS:
                     setattr(state, field, getattr(memory, field))
+            elif int(state.state_version) < int(LifeState().state_version):
+                # from_dict 迁移后应已是当前版本；这里只防「迁移漏写版本号」回退
+                state.state_version = int(LifeState().state_version)
 
         return self._apply_memory(state, self._read_json_file(self._memory_path()))
+
+    def _snapshot_state_before_migration(self, payload: dict[str, Any], version: int) -> None:
+        """旧状态迁移前留一份原始快照（幂等：已存在就不覆盖）。"""
+
+        path = self._state_path().with_name("life_state.pre-v2.json")
+        if path.exists():
+            return
+        snapshot = dict(payload)
+        snapshot["_snapshot_note"] = (
+            f"v{version} 迁移到 v{LifeState().state_version} 之前的原始状态；"
+            "插件只读不写，仅作排查留档"
+        )
+        if self._write_json_file(path, snapshot):
+            self.ctx.logger.warning(
+                "生活状态从 v%s 迁移到 v%s，原始快照已留档：%s",
+                version,
+                LifeState().state_version,
+                path,
+            )
+        else:
+            self.ctx.logger.warning(
+                "生活状态迁移前快照写入失败（状态迁移本身不受影响）：%s", path
+            )
 
     def _save_state(self) -> None:
         """写状态与对账记忆：先写临时文件再原子替换，避免写一半崩掉留下半个文件。"""
 
-        self._write_json_file(self._state_path(), self._state.to_dict())
-        self._write_json_file(
+        state_saved = self._write_json_file(self._state_path(), self._state.to_dict())
+        memory_saved = self._write_json_file(
             self._memory_path(),
             {field: getattr(self._state, field) for field in _MEMORY_FIELDS},
         )
-        self._state_dirty = False
+        self._state_dirty = not (state_saved and memory_saved)
 
-    def _write_json_file(self, path: Path, payload: dict[str, Any]) -> None:
+    def _write_json_file(self, path: Path, payload: dict[str, Any]) -> bool:
         try:
+            content = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            tmp.write_text(content, encoding="utf-8")
             tmp.replace(path)
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             self.ctx.logger.warning("落盘失败 %s: %s", path.name, exc)
+            return False
+        return True
 
     # ------------------------------------------------------------ 纯配置映射
 
     def _sim_config(self) -> SimConfig:
-        """配置 → ``SimConfig``。"""
+        """配置 → ``SimConfig``（按配置版本缓存）。"""
+
+        cached = self._sim_config_cache
+        if cached is not None:
+            return cached
+        built = self._build_sim_config()
+        self._sim_config_cache = built
+        return built
+
+    def _build_sim_config(self) -> SimConfig:
+        """把配置映射成 ``SimConfig``；只在缓存失效时执行。"""
 
         simulation = self.config.simulation
         activity = self.config.activity
@@ -1607,44 +1677,43 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
                 "；".join((impact_positive_warnings + impact_negative_warnings)[:3]),
             )
 
-        sleep_window = parse_window(simulation.sleep_window, (3 * 60, 11 * 60))
-        raw_window = str(simulation.sleep_window or "").strip()
-        sleep_window_text = raw_window or "03:00-11:00"
-        if raw_window and parse_window(raw_window, (-1, -1)) == (-1, -1):
-            # 解析失败时**必须告警**：否则强制层用默认窗口、而提示词仍写用户原文，
-            # 模型看到的时段与实际生效的时段不一致，现场完全无从排查。
-            self._warn_once(
-                "sleep_window",
-                "睡眠时段 %r 无法解析，已回退默认 03:00-11:00（提示词也按默认显示）",
-                raw_window,
-            )
-            sleep_window_text = "03:00-11:00"
+        # v1.24.0：``sleep_window`` / ``sleep_hard_floor`` / ``energy_full_wake*`` /
+        # ``rest_day_sleep_extension_minutes`` / ``nap_energy_threshold`` /
+        # ``min_awake_hours_per_day`` / ``cold_onset_awake_floor`` 这些旧闸门
+        # **不再参与任何判定**。配置里仍保留字段（hidden）只为旧 config.toml
+        # 能加载；这里也不再解析它们，避免「字段还在、规则还活着」的双套规则。
 
+        # v1.24.0：上限只管「单次连续睡眠的异常兜底」，0 = 不设上限。
         max_sleep_hours = float(simulation.max_sleep_hours)
-        if max_sleep_hours < 0.5:
+        if 0.0 < max_sleep_hours < 0.5:
             self._warn_once(
                 "max_sleep_hours",
-                "每日睡眠上限 %g 小时过小（<-0.5 视作 0.5），已按 0.5 小时处理",
+                "异常长睡上限 %g 小时过小，已按 0.5 小时处理；0 = 不设上限",
                 max_sleep_hours,
             )
             max_sleep_hours = 0.5
+        elif max_sleep_hours < 0.0:
+            max_sleep_hours = 0.0
 
-        # v1.15.0（PR-S1）：最短睡眠目标是「体力满唤醒」的新门槛，它必须落在
-        # 睡眠上限以内——否则上限唤醒会先到，目标形同虚设（而且提示词里会印出
-        # 一个自相矛盾的数：睡够 13 小时才醒、但 12 小时就被强制叫醒）。
-        min_sleep_target = max(0.0, float(simulation.energy_full_wake_min_hours))
-        if min_sleep_target > max_sleep_hours:
-            self._warn_once(
-                "energy_full_wake_min_hours",
-                "最短睡眠目标 %g 小时大于每日睡眠上限 %g 小时（上限唤醒会先生效），"
-                "已按上限处理",
-                min_sleep_target,
-                max_sleep_hours,
-            )
-            min_sleep_target = max_sleep_hours
         # 小睡时限：下限不得超过上限，否则「小睡」永远在同一个 tick 里被打架收口
         nap_max_minutes = max(1, int(simulation.nap_max_minutes))
         nap_min_minutes = max(0, min(nap_max_minutes, int(simulation.nap_min_minutes)))
+
+        # ---- 身体驱动睡眠（v1.24.0）：阈值成对出现，醒来阈值必须低于入睡阈值 ----
+        sleep_need_onset = max(0.05, min(1.0, float(simulation.sleep_need_onset)))
+        sleep_need_wake = max(0.0, min(1.0, float(simulation.sleep_need_wake)))
+        if sleep_need_wake >= sleep_need_onset:
+            self._warn_once(
+                "sleep_need_thresholds",
+                "困意醒来阈值 %g 不低于入睡阈值 %g（会睡下即醒、来回抖动），"
+                "已按入睡阈值 −0.1 处理",
+                sleep_need_wake,
+                sleep_need_onset,
+            )
+            sleep_need_wake = max(0.0, sleep_need_onset - 0.1)
+        nap_need_threshold = max(
+            0.0, min(sleep_need_onset, float(simulation.sleep_need_nap_threshold))
+        )
 
         return SimConfig(
             tick_seconds=max(60, int(simulation.tick_seconds)),
@@ -1652,24 +1721,39 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             offline_gap_minutes=max(0, int(simulation.offline_gap_minutes)),
             tz_offset_minutes=max(-1440, min(1440, int(simulation.tz_offset_minutes))),
             day_boundary_hour=max(0, min(23, int(simulation.day_boundary_hour))),
-            sleep_window=sleep_window,
-            sleep_window_text=sleep_window_text,
             sleep_energy_threshold=max(0.0, min(10.0, float(simulation.sleep_energy_threshold))),
             max_sleep_hours=max_sleep_hours,
-            energy_full_wake=bool(simulation.energy_full_wake),
-            # ---- 睡眠改进方案（v1.15.0）----
-            energy_full_wake_min_hours=min_sleep_target,
-            rest_day_sleep_extension_minutes=max(
-                0, int(simulation.rest_day_sleep_extension_minutes)
+            # ---- 身体驱动睡眠（v1.24.0）----
+            sleep_need_onset=sleep_need_onset,
+            sleep_need_wake=sleep_need_wake,
+            sleep_need_awake_gain_per_hour=max(
+                0.0, min(1.0, float(simulation.sleep_need_awake_gain_per_hour))
             ),
-            sleep_hard_floor=max(0.0, min(10.0, float(activity.sleep_hard_floor))),
+            sleep_need_sleep_recovery_per_hour=max(
+                0.0, min(1.0, float(simulation.sleep_need_sleep_recovery_per_hour))
+            ),
+            sleep_need_nap_recovery_ratio=max(
+                0.0, min(1.0, float(simulation.sleep_need_nap_recovery_ratio))
+            ),
+            sleep_need_nap_threshold=nap_need_threshold,
+            sleep_circadian_strength=max(
+                0.0, min(0.5, float(simulation.sleep_circadian_strength))
+            ),
+            sleep_deferral_minutes=max(0, int(simulation.sleep_deferral_minutes)),
+            sleep_target_hours=max(0.5, min(24.0, float(simulation.sleep_target_hours))),
+            sleep_deficit_window_hours=max(
+                24.0, min(720.0, float(simulation.sleep_deficit_window_hours))
+            ),
+            sleep_unknown_tolerance_minutes=max(
+                0, int(simulation.sleep_unknown_tolerance_minutes)
+            ),
+            # ---- 睡眠改进方案（v1.15.0）----
             routine_can_wake=bool(simulation.routine_can_wake),
             physio_can_wake=bool(simulation.physio_can_wake),
             wake_daze_minutes=max(0, int(simulation.wake_daze_minutes)),
             nap_enabled=bool(simulation.nap_enabled),
             nap_min_minutes=nap_min_minutes,
             nap_max_minutes=nap_max_minutes,
-            nap_energy_threshold=max(0.0, min(10.0, float(simulation.nap_energy_threshold))),
             insomnia_enabled=bool(self.config.mood.insomnia_enabled),
             insomnia_stress_threshold=max(
                 0.0, min(10.0, float(self.config.mood.insomnia_stress_threshold))
@@ -1681,8 +1765,6 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             night_waking_probability=max(
                 0.0, min(1.0, float(self.config.mood.night_waking_probability))
             ),
-            min_awake_hours_per_day=max(0.0, min(24.0, float(activity.min_awake_hours_per_day))),
-            cold_onset_awake_floor=bool(getattr(activity, "cold_onset_awake_floor", True)),
             min_dwell_minutes=max(0, int(activity.min_dwell_minutes)),
             min_sleep_minutes=max(0, int(activity.min_sleep_minutes)),
             schedule=self._schedule_config(),
@@ -1733,6 +1815,11 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             cold_max_days=max(max(1, int(health.cold_min_days)), int(health.cold_max_days)),
             cold_base_risk=max(0.0, min(1.0, float(health.cold_base_risk))),
             cold_sleep_debt_risk=max(0.0, min(1.0, float(health.cold_sleep_debt_risk))),
+            cold_low_energy_risk=max(0.0, min(1.0, float(health.cold_low_energy_risk))),
+            cold_daily_risk_cap=max(0.05, min(0.95, float(health.cold_daily_risk_cap))),
+            cold_convalescent_factor=max(
+                0.2, min(1.0, float(health.cold_convalescent_factor))
+            ),
             # ---- 病程系统（v1.14.0）----
             cold_stage_factors=self._cold_stage_factors(),
             cold_immunity_days=max(0, int(health.cold_immunity_days)),
@@ -1875,8 +1962,11 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         return patterns
 
     def _factor_config(self) -> FactorConfig:
-        """配置 → ``FactorConfig``（含两套曲线与静默时段）。"""
+        """配置 → ``FactorConfig``（含曲线与静默时段，按配置版本缓存）。"""
 
+        cached = self._factor_config_cache
+        if cached is not None:
+            return cached
         raw_mode = str(self.config.activity.factors_mode or "merge").strip().lower()
         if raw_mode not in ("merge", "replace"):
             self._warn_once(
@@ -1908,7 +1998,7 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             factor_table = dict(activity_factors)
         else:
             factor_table = activity_factors or _default_activity_factors()
-        return FactorConfig(
+        built = FactorConfig(
             activity_factors=factor_table,
             health_factors=health_factors or _default_health_factors(),
             cold_stage_factors=self._cold_stage_factors(),
@@ -1921,8 +2011,13 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             material_bonus=max(0.0, float(self.config.frequency.material_bonus)),
             material_bonus_cap=max(0.0, float(self.config.frequency.material_bonus_cap)),
             sleep_debt_cap_nights=max(1, int(self.config.health.sleep_debt_cap_nights)),
+            convalescent_factor=max(
+                0.2, min(1.0, float(self.config.health.cold_convalescent_factor))
+            ),
             silence_floor=silence_floor,
         )
+        self._factor_config_cache = built
+        return built
 
     # ------------------------------------------------------------ 经济维度
 
@@ -2705,30 +2800,14 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             return ""
 
     def _schedule_lines_now(self, now: float, sim_config: Any = None) -> tuple[str, ...]:
-        """活动提示词里的作息事实行 = 班表事实 + 休息日多睡（v1.15.0 PR-R4）。
+        """活动提示词里的作息事实行 = 班表事实。
 
-        休息日只在「最短睡眠目标 > 0 且休息日顺延 > 0」时才说——否则那是一句
-        没有机制支撑的空话（模型会以为周末可以睡到自然醒，而强制层照样按
-        体力满唤醒）。
-
-        v1.17.0（PR-CAL-1）：班表已经说过「今天放假/休息日」时，这里只补**机制**
-        那一半（多睡多久），不重复第二句「不用上班」——同一段话里说两遍不仅啰嗦，
-        还会让模型以为这是两件不同的事。
+        v1.24.0：休息日「可以多睡 N 小时」那句**已随机制一起退役**——睡眠不再由
+        时段或休息日顺延决定，睡多久只看困意。留着这句话会让模型以为周末可以
+        睡到自然醒，而强制层根本不认这条。
         """
 
-        config = sim_config if sim_config is not None else self._sim_config()
-        facts = self._schedule_facts_now(now)
-        lines = list(facts.prompt_lines)
-        extension = max(0.0, float(getattr(config, "rest_day_sleep_extension_minutes", 0.0)))
-        min_hours = max(0.0, float(getattr(config, "energy_full_wake_min_hours", 0.0)))
-        if extension > 0 and min_hours > 0 and self._rest_day(now):
-            if facts.enabled and not facts.is_workday:
-                lines.append(f"今天不用上班，可以比平时多睡 {extension / 60.0:g} 小时。")
-            else:
-                lines.append(
-                    f"今天是休息日，不用上班/上学——可以比平时多睡 {extension / 60.0:g} 小时。"
-                )
-        return tuple(lines)
+        return tuple(self._schedule_facts_now(now).prompt_lines)
 
     def _schedule_lines(self, now: float) -> list[str]:
         """状态卡上的班表一行；未启用班表时返回空列表。"""
@@ -3527,6 +3606,8 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
 
         sim_config = self._sim_config()
         local_now = local_datetime(now, sim_config.tz_offset_minutes)
+        # v1.24.0：倍率也改用**时间口径**的缺觉；记录不足时按 0 处理（不猜）。
+        deficit_nights, _ = sleep_deficit_nights(self._state, now=now, config=sim_config)
         return compute_adjust(
             activity=self._effective_activity(now),
             emotion=self._state.emotion,
@@ -3535,7 +3616,9 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             # v1.14.0：阶段因子（初起 0.7 / 加重 0.15 / 好转 0.5）取代旧的单一
             # cold=0.3；旧状态没有阶段字段时那边回退 health_factors["cold"]。
             cold_stage=cold_stage(self._state, now),
-            sleep_debt_nights=self._state.sleep_debt_nights,
+            sleep_debt_nights=float(deficit_nights or 0.0),
+            # v1.25.0：病后 24 小时余韵不再只是提示词文案，而是温和的频率过渡。
+            convalescent=in_convalescence(self._state, now),
             date_factor=date_factor(self._state, now, sim_config),
             material_count=material_effective_count(
                 self._state, now, floor=sim_config.material_decay_floor
@@ -3913,9 +3996,29 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             # v1.14.0 §7 双口径：进模型的是**模糊病程**描述（不报「还剩几小时」），
             # 精确口径只给状态卡（见 _render_status / health_label_admin）。
             health_label=health_label_prompt(state, now, sim_config),
-            sleep_debt_nights=state.sleep_debt_nights,
+            # v1.24.0：提示词与状态卡读**同一份**身体事实（困意 / 连续清醒 /
+            # 本次已睡 / 睡前预算 / 记录完整性），不再印「连熬 N 天」。
             sleep_minutes_today=state.sleep_minutes_today,
             awake_minutes_today=state.awake_minutes_today,
+            continuous_awake_minutes=max(0, int(state.continuous_awake_minutes)),
+            continuous_sleep_minutes=max(
+                0,
+                int(state.continuous_sleep_minutes)
+                or (
+                    int(max(0.0, (float(now) - float(state.sleep_started_at)) / 60.0))
+                    if is_asleep(state.activity)
+                    and float(state.sleep_started_at or 0.0) > 0.0
+                    else 0
+                ),
+            ),
+            sleep_need=float(state.sleep_need),
+            sleep_deferral_minutes=max(
+                0,
+                int((float(state.sleep_defer_until or 0.0) - float(now)) // 60)
+                if float(state.sleep_defer_until or 0.0) > float(now)
+                else 0,
+            ),
+            sleep_deficit_label=sleep_deficit_label(state, now, sim_config),
             # v1.17.0（PR-PRM-2）：饱腹与进餐事实——没开生理锚点时不提（satiety=-1）
             satiety=float(state.satiety) if bool(self.config.physio.enabled) else -1.0,
             meal_count_today=int(state.meal_count_today or 0),
@@ -3924,7 +4027,6 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
                 if float(state.last_meal_at or 0.0) > 0.0
                 else None
             ),
-            sleep_window_text=sim_config.sleep_window_text,
             recent_event_tiers=recent_event_tiers(
                 state,
                 now=now,
@@ -4704,22 +4806,6 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             ),
         )
 
-    def _rest_day(self, now: float) -> bool:
-        """今天是不是「休息日」（v1.15.0 PR-R4）：法定节假日 / 班表休息日 / 周末。
-
-        走与习惯层 ``later`` 判据同源的 ``_routine_day_flags``（班表 + 中国日历），
-        日历表缺当年数据时它自己降级成「周末 = 休息」。**日历与班表都不归纯模块管**，
-        所以这个事实由 plugin 侧算好塞进 ``ActivityFacts.rest_day``。
-        """
-
-        try:
-            is_workday, _is_holiday = self._routine_day_flags(
-                local_datetime(now, self._sim_config().tz_offset_minutes)
-            )
-        except Exception:  # noqa: BLE001 —— 取不到就当工作日（宁可少睡懒觉）
-            return False
-        return not bool(is_workday)
-
     def _insomnia_roll(self, now: float) -> bool:
         """本轮「入睡困难」的掷骰（v1.15.0 PR-R2）——**注入 rng、每生活日至多一次**。
 
@@ -4747,7 +4833,9 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         self._state_dirty = True
         return True
 
-    def _enforce_and_apply(self, now: float, decision: Any) -> None:
+    def _enforce_and_apply(
+        self, now: float, decision: Any, *, return_to: str = ""
+    ) -> None:
         """全插件**唯一**的活动收口入口（强制层 + 打断态策略）。
 
         刻意包一层而不是让各处直接调 ``life_sim.enforce_and_apply``：
@@ -4755,6 +4843,8 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         漏掉任何一处都会让「窗口内保住聊天态」在不同调用点上表现不一致。
         v1.15.0 又多了三件只有 plugin 侧才知道的事实：休息日（要查日历）、
         失眠掷骰（要 rng 与每夜去重）、赖床宽限窗（要在醒来时开）。
+
+        ``return_to`` 是打断结束时的「续上原活动」豁免，只在这一次裁定里生效。
         """
 
         sim_config = self._sim_config()
@@ -4766,12 +4856,21 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             self._state,
             now=now,
             config=sim_config,
-            rest_day=self._rest_day(now),
             workday_override=override,
             day_name=day_name,
             # v1.17.0（PR-SCH-2）：与提示词侧同一个生活日 ⇒ 同一份微扰/加班事实
             day_key=self._schedule_day_key(local_dt),
         )
+        if return_to:
+            facts = _replace(facts, interrupt_return_to=return_to)
+            # 睡前陪聊预算已经开过（说明这一轮对话是从「该睡了」开始的）：
+            # 对话结束时如果还困着，就直接去睡，而不是续上原来的活动。
+            if float(self._state.sleep_defer_until or 0.0) > 0.0:
+                policy = self._interrupt_policy()
+                if sleep_pressure(facts, policy) >= float(policy.sleep_need_onset):
+                    decision = ActivityDecision(
+                        SLEEP, "", SOURCE_ENFORCED, "聊完了，也困了，去睡"
+                    )
         # 只有「她想睡」时才掷失眠（其余轮次不该消耗随机性，否则同一条时间线
         # 会因为她什么时候提议睡觉而整体漂移）
         if (
@@ -4786,16 +4885,38 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         sleep_started = float(self._state.sleep_started_at or 0.0)
         resolved = enforce(facts, decision, self._interrupt_policy())
         self._state = apply_activity(self._state, resolved, now=now, config=sim_config)
+        # 睡前陪聊预算（v1.24.0）：只有强制层显式给 ``open`` 时才开一个截止时刻；
+        # ``hold`` 只续用既有截止时刻——新消息、换会话都不会重置它。
+        defer = str(getattr(resolved, "defer", "") or "")
+        if defer == "open":
+            existing = float(self._state.sleep_defer_until or 0.0)
+            if existing <= float(now):
+                minutes = max(0, int(self._interrupt_policy().sleep_deferral_minutes))
+                if minutes > 0:
+                    self._state.sleep_defer_until = float(now) + minutes * 60.0
+                    self._state_dirty = True
+                    deadline = local_datetime(
+                        self._state.sleep_defer_until, sim_config.tz_offset_minutes
+                    )
+                    self.ctx.logger.info(
+                        "%s 睡前陪聊预算开启：最多再聊 %d 分钟（截止 %s）",
+                        __plugin_id__,
+                        minutes,
+                        deadline.strftime("%H:%M"),
+                    )
+        wake_kind = str(getattr(resolved, "wake_kind", "") or "")
         if was_sleeping and not is_asleep(self._state.activity) and sleep_started > 0.0:
             minutes = max(0.0, (float(now) - sleep_started) / 60.0)
-            if minutes >= DREAM_MIN_SLEEP_MINUTES:
+            # 只有**自然醒**才做梦：临时唤醒不改 activity；异常上限叫醒/小睡结束
+            # 都不是「睡饱了」，不该生成一段「我梦到…」的经历。
+            if wake_kind == "natural" and minutes >= DREAM_MIN_SLEEP_MINUTES:
                 # 只标记不生成：LLM 调用回到 tick 的 async 流程（_maybe_dream），
                 # 绝不在收口路径上发 RPC。小憩（<3h）不标记——小憩不做梦。
                 self._dream_wake_pending = (float(now), minutes)
-        # 睡醒补答（v1.23.0）：任何一次「睡 → 非睡」都武装一次（**含短于 3h 的小睡**
-        # ——小睡期间也有人私聊；梦有 3h 门槛是叙事需要，补答没有这个理由）。
+        # 睡醒补答（v1.23.0）：任何一次**真实的**「睡 → 非睡」都武装一次（含小睡）
+        # ——小睡期间也有人私聊；梦有 3h 门槛是叙事需要，补答没有这个理由。
         # 主人在半夜叫醒她**不**触发：唤醒窗口不改 `activity`，这里根本不会命中。
-        if was_sleeping and not is_asleep(self._state.activity):
+        if was_sleeping and not is_asleep(self._state.activity) and wake_kind:
             self._catchup_pending_wake = True
         # 赖床宽限（v1.15.0 PR-R3）：强制层把她唤醒到 daze 时开一个窗口，
         # 否则下一个 tick 的 enforce 见她在睡眠时段内、又够格入睡，会立刻把她
@@ -4812,6 +4933,23 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             # 窗口过期顺手清零：状态卡与判据都读它，留一个旧时间戳只会让
             # 「她为什么还醒着」变成疑案
             self._state.wake_grace_until = 0.0
+
+    def _check_bedtime_budget(self, now: float) -> None:
+        """消息入口的睡前预算检查（v1.24.0）。
+
+        tick 每 10 分钟才跑一次；如果截止时刻刚好落在两次 tick 之间，消息入口
+        必须立刻兑现「预算用完就去睡」，否则最后一条消息能额外换来最多 10 分钟。
+        首次开启仍由 ``_enforce_and_apply`` 的协商标记负责（那里才有完整事实）。
+        """
+
+        if self._state.activity != INTERRUPT_CHATTING:
+            return
+        deadline = float(self._state.sleep_defer_until or 0.0)
+        if deadline <= 0.0 or deadline > float(now):
+            return
+        if not self._interrupt_policy().interrupt_hold:
+            return
+        self._enforce_and_apply(now, None)
 
     def _maybe_care(
         self, message: Any, *, session_id: str, group_id: str, now: float
@@ -5015,11 +5153,9 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         decision = interrupt_expire(self._state, now=now)
         if decision is None:
             return False
-        sim_config = self._sim_config()
-        facts = enforce_facts(self._state, now=now, config=sim_config)
-        facts = _replace(facts, interrupt_return_to=decision.activity)
-        resolved = enforce(facts, decision, self._interrupt_policy())
-        self._state = apply_activity(self._state, resolved, now=now, config=sim_config)
+        # 走统一收口（v1.24.0）：休息日/日历、睡前预算、醒来性质与 dream/catchup
+        # 都由同一入口判定；只有「续上原活动」这一个豁免单独传入。
+        self._enforce_and_apply(now, decision, return_to=decision.activity)
         if previous:
             note = interrupt_expire_note(previous, self._activity_label)
             self._state.recent_events.append(
@@ -6113,7 +6249,6 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
                     self._state,
                     now=now,
                     config=sim_config,
-                    rest_day=self._rest_day(now),
                     workday_override=skip_override,
                     day_name=skip_day_name,
                     day_key=self._schedule_day_key(skip_dt),
@@ -6225,9 +6360,10 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         override, day_name = self._schedule_calendar_override(local_now)
         seed = rule_based_activity(
             now_minutes=local_now.hour * 60 + local_now.minute,
-            energy=self._state.energy,
             sick=is_cold(self._state, now),
-            sleep_energy_threshold=sim_config.sleep_energy_threshold,
+            # v1.24.0：种子也只看困意——模型挂了不等于可以绕过身体规则
+            sleep_need=float(self._state.sleep_need),
+            sleep_need_onset=sim_config.sleep_need_onset,
             schedule=schedule_facts(
                 local_now,
                 sim_config.schedule,
@@ -6243,11 +6379,13 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
                 enabled=bool(self.config.health.cold_sick_leave),
             ),
         )
-        self._state = apply_activity(self._state, seed, now=now, config=sim_config)
+        # 种子只是**提议**：同样要过困意/睡眠保护/病后收口（v1.24.0）。
+        # 直接 apply 会让「模型挂了」成为绕过身体约束的后门。
+        self._enforce_and_apply(now, seed)
         self._state.llm_last_success_at = now  # 重新计时，避免每个 tick 都取种子
         self.ctx.logger.warning(
-            "%s 模型已 %g 小时无成功决策，按时段表重新取种子：%s",
-            __plugin_id__, hours, seed.activity,
+            "%s 模型已 %g 小时无成功决策，按时段表重新取种子：%s（收口后：%s）",
+            __plugin_id__, hours, seed.activity, self._state.activity,
         )
 
     # ------------------------------------------------------------ 展示
@@ -6257,6 +6395,33 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
 
     def _source_label(self, source: str) -> str:
         return SOURCE_LABELS.get(source, source)
+
+    def _body_rhythm_line(self, now: float, sim_config: SimConfig) -> str:
+        """状态卡的身体节律行（v1.24.0）：困意 / 连续清醒或本次睡眠 / 缺觉 / 预算。
+
+        与提示词读同一份事实（``state`` + ``sleep_deficit_*``），只是口径更精确；
+        记录不足时明确写「记录不足」，不把旧模型的「连熬 N 天」当成新结论。
+        """
+
+        state = self._state
+        need = max(0.0, min(1.0, float(state.sleep_need or 0.0)))
+        if is_asleep(state.activity):
+            slept = max(0, int(state.continuous_sleep_minutes))
+            if slept <= 0 and float(state.sleep_started_at or 0.0) > 0.0:
+                slept = max(0, int((float(now) - float(state.sleep_started_at)) / 60.0))
+            phase = f"本次已睡 {slept / 60.0:.1f} 小时"
+        else:
+            awake = max(0, int(state.continuous_awake_minutes))
+            phase = f"连续清醒 {awake / 60.0:.1f} 小时"
+        parts = [
+            f"困意 {need:.2f}",
+            phase,
+            sleep_deficit_label(state, now, sim_config),
+        ]
+        deadline = float(state.sleep_defer_until or 0.0)
+        if deadline > float(now):
+            parts.append(f"睡前预算剩 {max(0, int((deadline - float(now)) // 60))} 分钟")
+        return "身体节律：" + "　".join(parts)
 
     def _life_digest(self, session_id: str = "") -> str:
         """注入回复请求的短摘要，让语气与状态一致。
@@ -6392,6 +6557,10 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             f"　来源：{self._source_label(state.activity_source)}"
             f" · 已持续 {activity_minutes(state, now)} 分钟",
         ]
+        # v1.24.0：说明她为什么是这个活动（“还不困”“困意已退，自然醒”“预算用完去睡”
+        # 都在这条里）。排查“她怎么又醒了/怎么还没睡”时，这一行比活动名有用得多。
+        if state.activity_note:
+            lines.append(f"　说明：{sanitize_text(state.activity_note, max_chars=60)}")
         # 日期行（v1.10.0）：带节日名（「2026-02-17 周二 春节」）
         try:
             local_now = local_datetime(now, sim_config.tz_offset_minutes)
@@ -6421,6 +6590,7 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             # 而活动已持续 850 分钟），所以把口径标出来。
             f"今日已睡 {sleep_hours_today(state):.1f} 小时 / 清醒 {awake_hours_today(state):.1f} 小时"
             f"（本生活日已记账）",
+            self._body_rhythm_line(now, sim_config),
             (
                 f"饱腹 {state.satiety:.1f}/10　今日已吃 {int(state.meal_count_today)} 顿"
                 + self._physio_window_note(sim_config)
@@ -7263,6 +7433,7 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
                 f"情绪：{state.emotion:.1f}/10　体力：{state.energy:.1f}/10",
                 # 工具返回给**模型**读 ⇒ 走模糊病程口径（同 _ask_activity 与 reply 注入）
                 f"身体：{health_label_prompt(state, now, sim_config)}",
+                self._body_rhythm_line(now, sim_config),
                 f"今日已睡 {sleep_hours_today(state):.1f} 小时",
                 (
                     "最近想说的：" + sanitize_text(materials[0].get("text", ""), max_chars=60)
@@ -7403,6 +7574,12 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.debug("%s 打断触发失败：%s", __plugin_id__, exc)
+        # 睡前陪聊预算（v1.24.0）：消息入口也查截止时刻，别让 10 分钟的 tick
+        # 变成「额外多聊 10 分钟」。纯内存判定，失败只降级。
+        try:
+            self._check_bedtime_budget(now)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("%s 睡前预算检查失败：%s", __plugin_id__, exc)
         # 病程关心（v1.14.0 §5.1）：生病期间的一句「你吃药了吗」能让她好得快一点。
         # 放在打断之后、纯内存无 RPC；异常只在 debug 留痕（消息主链不受影响）。
         try:
