@@ -104,6 +104,10 @@ class FakeHost:
         #: 默认 ``False`` = 宿主真的按人圈定：哨兵 ``person_id``（全 0 串）查不到东西。
         #: 置 ``True`` 可复现 v1.22.4 作用域守卫要防的那种宿主。
         self.knowledge_ignores_person_id: bool = False
+        #: ``person_id → 返回内容``（v1.25.3）：仿真「按人筛」的宿主——不同的人拿到不同
+        #: 记忆，``[]`` 表示这个人查不到东西（宿主会「筛空回退全量」，这里只模拟筛空结果）。
+        #: 没登记的 ``person_id`` 仍返回 ``returns["knowledge.search"]``（老语义不变）。
+        self.knowledge_by_person: dict[str, Any] = {}
 
     # 插件侧所有 ctx.* 最终都走这里。
     # 真实 SDK 链路: ctx.send.text(...) -> call_capability("send.text", ...)
@@ -146,13 +150,14 @@ class FakeHost:
                 0.0, float(args.get("value") or 0.0)
             )
             return {"success": True}
-        if capability == "knowledge.search" and not self.knowledge_ignores_person_id:
-            # 仿真**支持** person_id 的宿主：插件会拿一个全 0 的哨兵 person_id 做
-            # 作用域自证（v1.22.4），正常宿主在这种人身上查不到任何记忆。不补这条，
-            # 假宿主会无差别返回同一份结果，于是「哨兵 == 真人」被判成作用域失效，
-            # 基于裸 FakeHost 的所有记忆用例都会静默空转（本地绿、真机才动）。
-            if str(args.get("person_id") or "") == "0" * 32:
-                return []
+        if capability == "knowledge.search":
+            pid = str(args.get("person_id") or "")
+            if not self.knowledge_ignores_person_id:
+                if pid in self.knowledge_by_person:
+                    return self.knowledge_by_person[pid]
+                # 老语义：正常的「按人筛」宿主在这种人身上查不到任何记忆
+                if pid == "0" * 32:
+                    return []
         if capability in self.returns:
             return self.returns[capability]
         return {"success": True, "result": None}

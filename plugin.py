@@ -197,6 +197,7 @@ try:
         LEDGER_NOT_SENT,
         LEDGER_SENT,
         NO_QUOTE_DISCIPLINE,
+        OUTPUT_ONLY_HINT,
         REASON_INTERVAL,
         REASON_SILENCE,
         ProactiveConfig as ProactiveRules,
@@ -377,6 +378,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
         LEDGER_NOT_SENT,
         LEDGER_SENT,
         NO_QUOTE_DISCIPLINE,
+        OUTPUT_ONLY_HINT,
         REASON_INTERVAL,
         REASON_SILENCE,
         ProactiveConfig as ProactiveRules,
@@ -804,8 +806,12 @@ def _looks_like_cut_json(text: str) -> bool:
 # 纪律本身**写在代码层**（不是 `Field(default=...)`）：`config.toml` 首跑落盘后就不再跟随
 # 升级更新，纪律类规则若只写在配置默认值里，已部署实例永远不会生效。
 PROACTIVE_NO_QUOTE_MARKER = "[proactive-no-quote]"
+#: v1.25.4 起同一行还带 ``OUTPUT_ONLY_HINT``：真机 2026-11-01 那次主动开口，回复器把
+#: 「数汉字、挑草稿」的推理写在了正文位置（英文 CoT + `Count: …`），末句停在半句上。
+#: 形态纪律与「不引用」同源——两者都是**模型看得见的系统级规则**才能提高概率，
+#: 写在 intent 里只是任务描述。
 PROACTIVE_NO_QUOTE_HINT = (
-    f"{PROACTIVE_NO_QUOTE_MARKER} 本次发言规则：{NO_QUOTE_DISCIPLINE}"
+    f"{PROACTIVE_NO_QUOTE_MARKER} 本次发言规则：{NO_QUOTE_DISCIPLINE} {OUTPUT_ONLY_HINT}"
 )
 
 #: 主动开口后多久内给该会话的 Planner 请求注入上面这条规则（秒）。
@@ -945,8 +951,14 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         self._host_mode: str = normalize_host_mode("")
         self._host_mode_source: str = "default"
         self._host_talk_value: float = 1.0
-        #: 私聊的基础频率（宿主 ``chat.reply_timing.private_talk_value``）
+        #: 私聊的基础频率（宿主 ``chat.reply_timing.private_talk_value``）。
+        #: ⚠ 宿主 **1.3.15 起这个键已不存在**，见 ``_host_private_paused_rule``。
         self._host_private_talk_value: float = 1.0
+        #: 宿主是否已把私聊的「频率」换成「暂停」（v1.3.15 起，changelog 原文：
+        #: 「私聊：支持暂停回复……替代原有的回复频率设置」）。探测方式是**读配置键**
+        #: ``chat.reply_timing.private_reply_paused``：它在 1.3.15 才出现，1.3.14 及更早没有。
+        #: 为真时私聊的生效频率恒为 ``1.0``（或暂停时的 0），**插件倍率一律不参与**。
+        self._host_private_paused_rule: bool = False
         self._last_breakdown: Any = None
         self._last_llm_attempt_at: float = 0.0
         #: 省调用统计（只用于日志/自检，不落盘）：跳过「问了也白问」的轮次计数，
@@ -2937,9 +2949,23 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         private_talk_value = _as_number(
             await self._read_config("chat.reply_timing.private_talk_value", None)
         )
-        self._host_private_talk_value = (
-            self._host_talk_value if private_talk_value is None else max(0.0, private_talk_value)
-        )
+        # ⚠ **宿主 1.3.15 起私聊不再有「频率」**（changelog：「私聊：支持暂停回复……替代原有的
+        # 回复频率设置」）。源码证据（v1.3.19 ``runtime.py:1070-1074``）：
+        #     if not self.chat_stream.is_group_session:
+        #         # 私聊只使用暂停开关，忽略旧频率、动态频率规则与插件频率倍率。
+        #         return ChatConfigUtils.get_talk_value(self.session_id, is_group_chat=False)
+        # 而 ``utils_config.get_talk_value`` 在私聊分支只返回 ``0.0``（暂停）或 ``1.0``。
+        # 于是 ``private_talk_value`` 这个键随之消失（v1.3.14 有、v1.3.19 无），
+        # 探测它存不存在就等于探测宿主是否已切到新口径。
+        paused_rule = await self._read_config("chat.reply_timing.private_reply_paused", None)
+        self._host_private_paused_rule = paused_rule is not None
+        if self._host_private_paused_rule:
+            # 新口径下私聊（未暂停时）恒为 1.0；插件倍率不参与，卡面必须照实说。
+            self._host_private_talk_value = 1.0
+        else:
+            self._host_private_talk_value = (
+                self._host_talk_value if private_talk_value is None else max(0.0, private_talk_value)
+            )
 
     async def _read_config(self, key: str, default: Any) -> Any:
         """读宿主全局配置；失败（含能力被拒）时返回默认值，绝不上抛。"""
@@ -4619,17 +4645,49 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         tokens.extend(sorted(self._bot_qq_ids or ()))
         return tuple(tokens)
 
+    async def _memory_decoy_person_id(self, target_pid: str) -> str:
+        """「另一个**真实的**真人」的 ``person_id``：作用域对照的对照组（v1.25.3）。
+
+        为什么不是「不存在的人」：宿主 ``MemorySearchHitProcessingService._filter_hits``
+        以 ``return filtered or hits`` 收尾——按人筛空就回退全量，而不存在的人必然筛空，
+        所以它永远与真人结果一致，判据恒假。
+
+        顺序：先她自己（``bot.qq`` + 会话平台，她必然有记忆，筛不空的概率最低），
+        再关系档案里的另一个熟人。都拿不到就返回空串——那时判「存疑」并退严格模式
+        （按人点名），**不是**判「无效」把整层关掉。
+        """
+
+        target = str(target_pid or "").strip()
+        platform = "qq"
+        for info in self._seen_sessions.values():
+            candidate = str((info or {}).get("platform") or "").strip()
+            if candidate:
+                platform = candidate
+                break
+        try:
+            bot_ids = sorted(await self._bot_identity_ids())
+        except Exception:  # noqa: BLE001 —— 读不到宿主配置只是少一个对照人
+            bot_ids = []
+        for uid in bot_ids:
+            pid = str(relation_person_id(platform, uid) or "").strip()
+            if pid and pid != target:
+                return pid
+        for pid in sorted(self._relation_familiarity):
+            if pid and pid != target:
+                return str(pid)
+        return ""
+
     async def _memory_facts_for_person(
         self, person_id: str, *, query: str = "", user_id: str = ""
     ) -> tuple[str, ...]:
         """这个人的长期记忆事实；任何失败都返回空元组，绝不抛。
 
-        **作用域自证（v1.22.4）**：``person_id`` / ``respect_filter`` 不在 SDK 的
-        ``KnowledgeCapability.search(query, limit=5)`` 签名里，宿主可能接受、忽略或
-        直接报错，公开文档无从判断。所以这一层会拿哨兵 ``person_id`` 对照自证一次：
-        验不出作用域就**停用本层**，而不是退回无作用域的检索——那正是串人本身。
-        判定与检索都在 ``life_memory.fetch_person_facts``（入口模块的结构预算是
-        门禁化的，一层可选接线不该把它撑大）。
+        **作用域自证（v1.22.4 / v1.25.3 改四态）**：``person_id`` / ``respect_filter``
+        不在 SDK 的 ``KnowledgeCapability.search(query, limit=5)`` 签名里，宿主可能接受、
+        忽略或直接报错。所以这一层拿**另一个真实的真人**做对照：另一个人拿到的与你
+        不同 ⇒ 真的按人筛；完全一样 ⇒ 没有作用域（停用）；对照人一无所获或没有对照人
+        ⇒ 存疑（**不停用**，退「条目必须点名本人」的严格模式）。
+        判定与检索都在 ``life_memory.fetch_person_facts``。
 
         **失败不写缓存**：把一次网络抖动缓存成 6 小时的「她没有记忆」，比不查更糟。
         成功但为空**要**缓存，否则新用户每次巡检都被重查一遍。
@@ -4647,6 +4705,7 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
             self.ctx.call_capability,
             person_id=pid,
             query=str(query or "").strip() or pid,
+            decoy_person_id=await self._memory_decoy_person_id(pid),
             guard=self._memory_scope,
             cache=self._memory_cache,
             log=self._memory_log.bind(self.ctx.logger),
@@ -6677,10 +6736,25 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
                     f" = {composed:.3f}　→ 生效频率 {effective:.3f}"
                     f"（{talk_source} {talk_value:.3f}）"
                 )
-            verdict = preview(
-                mode=self._host_mode, talk_value=talk_value, adjust=composed
-            ).get("verdict", "")
-            lines.append(f"后果：{verdict}")
+            private_new_rule = (
+                self._session_is_group(stream_id) is False and self._host_private_paused_rule
+            )
+            if private_new_rule:
+                # 宿主 1.3.15 起私聊没有「频率」可言：那张门根本不存在，不能拿计数门去预览，
+                # 否则卡面会写「攒 12 条进 Planner」，而真机是**来一条就进**。
+                lines.append("后果：私聊不设频率门控（宿主任一新消息都进 Planner），只有「暂停回复」拦得住她")
+            else:
+                verdict = preview(
+                    mode=self._host_mode, talk_value=talk_value, adjust=composed
+                ).get("verdict", "")
+                lines.append(f"后果：{verdict}")
+            if private_new_rule:
+                # 卡面必须说实话，否则用户会以为「她睡了所以私聊不回」，而宿主照样送进 Planner。
+                lines.append(
+                    "私聊口径：宿主 1.3.15 起用「暂停回复」替代「回复频率」，插件倍率在私聊"
+                    "**不生效**（睡着、体力低、静默时段都压不住私聊），倍率只影响群聊；"
+                    "要静默某个私聊，只能去宿主里暂停它"
+                )
         proactive_scope = "全部会话"
         if str(self.config.proactive.filter_mode or "all").strip().lower() != "all":
             proactive_scope = (
@@ -6929,9 +7003,17 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         if self.config.simulation.dry_run:
             lines.append("（演算模式：以上都是计算结果，没有真的写到宿主）")
 
+        if self._session_is_group(stream_id) is False and self._host_private_paused_rule:
+            lines.append(
+                "私聊口径：宿主 1.3.15 起用「暂停回复」替代「回复频率」，插件倍率在私聊"
+                "**不生效**（睡着、体力低、静默时段都压不住私聊），倍率只影响群聊；"
+                "要静默某个私聊，只能去宿主里暂停它"
+            )
+
         lines.append(
-            "提示：宿主的基础频率是 [chat.reply_timing] 的 talk_value（群聊）/"
-            "private_talk_value（私聊），本插件只提供倍率；上面的基础频率优先按宿主实测反推"
+            "提示：宿主的基础频率是 [chat.reply_timing] 的 talk_value（群聊）/ "
+            "private_talk_value（私聊，**仅宿主 ≤1.3.14**；1.3.15 起私聊改为暂停开关、"
+            "倍率不参与），本插件只提供倍率；上面的基础频率优先按宿主实测反推"
         )
         return "\n".join(lines)
 
@@ -6974,10 +7056,13 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
         return None
 
     def _talk_value_for(self, stream_id: str) -> tuple[float, str]:
-        """取这个会话的基础频率（群聊 ``talk_value`` / 私聊 ``private_talk_value``）。"""
+        """取这个会话的基础频率（群聊 ``talk_value`` / 私聊见 ``_host_private_paused_rule``）。"""
 
         is_group = self._session_is_group(stream_id) if stream_id else None
         if is_group is False:
+            if self._host_private_paused_rule:
+                # 宿主 ≥1.3.15：私聊只有「暂停」开关，没有频率可言（未暂停即 1.0）
+                return self._host_private_talk_value, "私聊（宿主 1.3.15+ 只认暂停开关）"
             return self._host_private_talk_value, "私聊基础频率"
         if is_group is True:
             return self._host_talk_value, "群聊基础频率"
@@ -7231,13 +7316,26 @@ class LifeFrequencyPlugin(CatchupHostMixin, PersonaTopicMixin, MaiBotPlugin):
 
     @API("life.pause", description="暂停频率干预（与 /生活 暂停 同路径）", version="1")
     async def api_pause(self, **kwargs: Any) -> dict[str, Any]:
-        """页面「暂停干预」按钮；执行体与命令侧同一份（life_webui.set_paused）。"""
-        return await webui_set_paused(self, True)
+        """页面「暂停干预」按钮；执行体与命令侧同一份（life_webui.set_paused）。
+
+        ``admin_id`` 是可选的**自证**参数：``[security].webui_write_mode=strict`` 时
+        必填且要命中管理员名单；``login`` 档下即使传了也只用于日志（见
+        ``life_webui.set_paused`` 的鉴权说明）。
+        """
+        return await webui_set_paused(
+            self,
+            True,
+            admin_id=str(kwargs.get("admin_id") or kwargs.get("user_id") or ""),
+        )
 
     @API("life.resume", description="恢复频率干预（与 /生活 恢复 同路径）", version="1")
     async def api_resume(self, **kwargs: Any) -> dict[str, Any]:
         """页面「恢复干预」按钮；执行体与命令侧同一份（life_webui.set_paused）。"""
-        return await webui_set_paused(self, False)
+        return await webui_set_paused(
+            self,
+            False,
+            admin_id=str(kwargs.get("admin_id") or kwargs.get("user_id") or ""),
+        )
 
     @Command(
         "life_state",

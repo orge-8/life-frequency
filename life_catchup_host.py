@@ -120,6 +120,7 @@ class CatchupHostMixin:
             max_chars=max(0, int(catchup.max_chars)),
             retention_hours=max(0.0, float(catchup.retention_hours)),
             requote_limit=max(0, int(catchup.requote_limit)),
+            store_text=bool(getattr(catchup, "store_text", False)),
             stagger_max_seconds=max(0, int(catchup.stagger_max_seconds)),
             persona_chars=max(0, int(catchup.persona_chars)),
         )
@@ -227,12 +228,16 @@ class CatchupHostMixin:
         if not person_id:
             return "无法确定人物"
         store = self._routine_store
+        # v1.25.1：原文默认**不落盘**。补答/回填只用「谁、几点、私聊还是群里被 @」，
+        # 而 ``requote_limit<=0``（默认）时原文根本不参与输出——把它写进 SQLite 只是
+        # 让聊天记录在插件侧多存一份。要复述原文的用户显式打开 ``[catchup].store_text``。
+        body = str(text or "") if rules.store_text else ""
         row_id = await asyncio.to_thread(
             store.add_sleep_backlog,
             person_id,
             session_id,
             at=float(now),
-            text=str(text or ""),
+            text=body,
             user_id=str(user_id or ""),
             platform=platform,
             is_group=not private_chat,
@@ -244,7 +249,7 @@ class CatchupHostMixin:
                 {
                     "id": int(row_id),
                     "at": float(now),
-                    "text": str(text or "")[: max(1, int(rules.max_chars))],
+                    "text": body[: max(1, int(rules.max_chars))],
                     "session_id": session_id,
                 }
             )

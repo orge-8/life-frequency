@@ -696,6 +696,15 @@ def test_webui_schema_paths_all_write_back_to_the_real_config():
         return current
 
     def probe_value(field):
+        # 枚举字段（``Literal`` 注解 → SDK 输出 ``choices``）只能用**合法取值**探测：
+        # 这类字段本身就有「非法值归一到默认」的校验（如 ``[security].webui_write_mode``），
+        # 拿 ``__probe__`` 去写回必然被归一化掉——那是设计意图，不是路径失效。
+        choices = field.get("choices") or []
+        if choices:
+            for option in choices:
+                if option != field.get("default"):
+                    return option
+            return choices[0]
         kind = field.get("type")
         if kind == "boolean":
             return not bool(field.get("default"))

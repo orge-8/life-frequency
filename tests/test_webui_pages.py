@@ -23,10 +23,31 @@ invalidData」——本文件把三条都钉住：
 """
 
 import asyncio
+import contextlib
 import json
 import pathlib
 import sys
 import time
+
+
+@contextlib.contextmanager
+def _daytime_clock(hour: int = 14):
+    """把 ``time.time()`` 钉在当天 ``hour:00``，退出时还原。
+
+    为什么需要：「当前倍率」有两条措辞分支——醒着时是 ``当前倍率：0.842``，命中硬闸
+    （睡眠中）时是 ``当前倍率：写回 0.0（…）``。对账断言只覆盖前者，于是这个用例
+    **依赖跑门禁的时刻**：22:55 过、01:00 挂（真机 2026-10-31 实测）。门禁不该有作息。
+    """
+
+    real = time.time
+    fixed = time.mktime(
+        time.strptime(f"{time.strftime('%Y-%m-%d')} {int(hour)}:00", "%Y-%m-%d %H:%M")
+    )
+    time.time = lambda: fixed  # type: ignore[assignment]
+    try:
+        yield fixed
+    finally:
+        time.time = real
 
 import pytest
 
@@ -465,7 +486,9 @@ def test_dashboard_matches_command_cards():
         finally:
             await plugin.on_unload()
 
-    asyncio.run(flow())
+    # 钉在 14:00 跑：冷启动种子与「当前倍率」的措辞分支都取决于钟点
+    with _daytime_clock():
+        asyncio.run(flow())
 
 
 def test_pause_resume_roundtrip_and_persist():

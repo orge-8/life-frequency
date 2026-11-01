@@ -575,25 +575,73 @@ def _degraded(name: str) -> dict[str, Any]:
     }
 
 
-async def set_paused(plugin: Any, paused: bool) -> dict[str, Any]:
+async def set_paused(
+    plugin: Any,
+    paused: bool,
+    *,
+    admin_id: str = "",
+    mode: str = "",
+) -> dict[str, Any]:
     """暂停 / 恢复：与 ``/生活 暂停``、``/生活 恢复`` **同一份执行体**。
 
     命令侧的两个分支逐字照搬（``paused_override`` + ``_restore_baseline`` +
     ``_save_state``），页面只是另一个入口——不新造第二套状态机。
 
-    鉴权说明：WebUI 调用不带 QQ 侧身份（``plugin.invoke_api`` 只传声明过的
-    参数），命令侧的 ``_is_admin`` 在这里必然 fail-closed；dashboard 本身在
-    MaiBot 登录态之后，与 identity-guard 的写操作同款口径（登录即可用）。
+    鉴权（v1.25.1 起有两档，见 ``[security].webui_write_mode``）：
+
+    * ``login``（默认）：WebUI 调用不带 QQ 侧身份（``plugin.invoke_api`` 只传
+      声明过的参数），命令侧的 ``_is_admin`` 在这里必然 fail-closed；dashboard
+      本身在 MaiBot 登录态之后，与 identity-guard 的写操作同款口径（登录即可用）。
+    * ``strict``：要求调用方额外传 ``admin_id`` 且命中 ``[security].admin_ids``。
+      宿主 API 层不携带调用方身份，所以这是**调用方自证**而非服务端证明——
+      它的作用是让「登录态之外的调用方」（脚本 / 其它插件 ``api.call``）默认被拒，
+      代价是页面按钮失效、需改用命令。
+
+    ``auth`` / ``actor`` 随返回值回传，便于在日志与页面上看清这一次是谁按的。
     """
 
     state = plugin._state
     target = bool(paused)
     current = bool(getattr(state, "paused_override", False))
+    effective_mode = str(mode or "").strip().lower()
+    if effective_mode not in {"login", "strict"}:
+        effective_mode = str(
+            getattr(plugin.config.security, "webui_write_mode", "login") or "login"
+        ).strip().lower()
+    if effective_mode not in {"login", "strict"}:
+        effective_mode = "login"
+
+    actor = str(admin_id or "").strip()
+    actor_label = ""
+    if actor:
+        try:
+            actor_label = _text(mask_user_id(actor))
+        except Exception:  # noqa: BLE001 —— 脱敏失败不该把号码原样回给页面
+            actor_label = "（已脱敏）"
+
+    if effective_mode == "strict" and not _admin_hit(plugin, actor):
+        _warn(
+            plugin,
+            "WebUI 写接口被拒（strict）：paused=%s actor=%s",
+            target,
+            actor_label or "（未提供）",
+        )
+        return {
+            "ok": False, "paused": current, "changed": False,
+            "auth": effective_mode, "actor": actor_label,
+            "reason": (
+                "当前 [security].webui_write_mode = strict：这个接口需要管理员身份，"
+                "请在群里用 /生活 暂停 或 /生活 恢复"
+            ),
+        }
+
     if not plugin.config.plugin.enabled:
         return {"ok": False, "paused": current, "changed": False,
+                "auth": effective_mode, "actor": actor_label,
                 "reason": "生活频率插件已停用（可在插件配置里重新启用）"}
     if current == target:
         return {"ok": True, "paused": current, "changed": False,
+                "auth": effective_mode, "actor": actor_label,
                 "reason": "状态未变（已是目标状态）"}
 
     if target:
@@ -603,16 +651,41 @@ async def set_paused(plugin: Any, paused: bool) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 —— 归还失败不挡暂停本身（下轮扫会重试）
             _warn(plugin, "暂停时归还基数失败（稍后重试）：%s", exc)
         plugin._save_state()
-        _info(plugin, "WebUI 暂停频率干预（与 /生活 暂停 同路径）")
+        _info(plugin, "WebUI 暂停频率干预（与 /生活 暂停 同路径，auth=%s）", effective_mode)
         reason = "已暂停频率干预（生活状态继续推进，倍率归还给外部基数；重启后仍然有效）"
     else:
         state.paused_override = False
         plugin._state_dirty = True
         plugin._save_state()
-        _info(plugin, "WebUI 恢复频率干预（与 /生活 恢复 同路径）")
+        _info(plugin, "WebUI 恢复频率干预（与 /生活 恢复 同路径，auth=%s）", effective_mode)
         reason = "已恢复频率干预"
 
-    return {"ok": True, "paused": target, "changed": True, "reason": reason}
+    return {"ok": True, "paused": target, "changed": True,
+            "auth": effective_mode, "actor": actor_label, "reason": reason}
+
+
+def _admin_hit(plugin: Any, user_id: str) -> bool:
+    """``user_id`` 是否在 ``[security].admin_ids`` 里（``'123'`` / ``'qq:123'`` 都认）。
+
+    ⚠ 与 ``plugin._is_admin`` 同一份名单，但这里**不放行**
+    ``is_local_operator``——WebUI 调用拿不到那个标记，若在这里也放行它就等于没鉴权。
+    名单为空时一律拒绝（fail-closed）。
+    """
+
+    uid = str(user_id or "").strip()
+    if uid[:3].lower() == "qq:":
+        uid = uid[3:].strip()
+    if not uid:
+        return False
+    try:
+        raw = getattr(plugin.config.security, "admin_ids", []) or []
+        admins = {str(item).strip() for item in raw}
+    except Exception:  # noqa: BLE001 —— 读不到名单就是没人有权
+        return False
+    admins.discard("")
+    if not admins:
+        return False
+    return uid in admins or f"qq:{uid}" in admins
 
 
 # ------------------------------------------------------------------ 日志小灶

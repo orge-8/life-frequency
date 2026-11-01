@@ -13,7 +13,8 @@
 1. 群聊与私聊用**两套引导语**——私聊里「想聊聊刚发生的一件事」成立（对面就是那个人），
    群聊里没有对象，说成「讲故事」必然变独白；
 2. 群聊**一句话、限字数**——治三句叙事的独白体；
-3. 群聊**结尾必须留落子**、且**说态度不汇报事实**——治「内容无信息量」+「句号式封闭」；
+3. 群聊**结尾必须留落子**、且**先说由头、重心在态度**——治「内容无信息量」+「句号式封闭」。
+   ⚠ v1.25.4 撤掉了「不要汇报事实」：它把事件本身也砍了，句子悬空反而更难接；
 4. 两档都禁止**编造具体次数/时长与他人原话**——「八百年」「看了半天」都是模型加的戏，
    她的世界观里没有可依的历史。
 
@@ -68,13 +69,19 @@ def _decide(*, private_chat: bool, material=None):
 
 
 def test_group_intent_is_not_a_story_and_asks_for_a_hook():
-    """群聊档：不许「想聊聊…的一件事」（那是讲故事），必须要求落子与态度。"""
+    """群聊档：不许「想聊聊…的一件事」（那是讲故事），必须要求落子与态度。
+
+    v1.25.4 改口径：**由头必须留**，被禁的是「只叙述事实」。旧措辞「不要汇报事实」在真机
+    2026-11-01 把事件本身一起砍掉了（素材「今天居然有人跟我问路」→ 只发出「这业务能力，
+    导航都得喊你师父了！」），所以这条断言从「要求禁止事实」翻转成「要求点明由头」。
+    """
 
     intent = P.build_intent(_material(), private_chat=False)
     assert P.GROUP_SCENE in intent
     assert P.PRIVATE_SCENE not in intent, "群聊不该沿用私聊的叙事引导语"
     assert "留一个别人能接的落子" in intent
-    assert "不要汇报事实" in intent
+    assert "点明由头" in intent, "锚点丢了句子就悬空，比「只汇报事实」更难接"
+    assert "不要汇报事实" not in intent, "这条会把事件一起砍掉（v1.25.4 已撤）"
     # 发言纪律照旧（不挂引用）——这一次改动不动那条
     assert P.NO_QUOTE_DISCIPLINE in intent
 
@@ -101,6 +108,32 @@ def test_group_length_budget_is_a_real_number_in_the_prompt():
 
     assert 15 <= P.GROUP_INTENT_MAX_CHARS <= 40
     assert str(P.GROUP_INTENT_MAX_CHARS) in P.build_intent(_material(), private_chat=False)
+
+
+def test_length_budget_can_hold_anchor_attitude_and_hook():
+    """v1.25.4：上限必须装得下**三个**要件，否则模型只能三选二。
+
+    证据是真机那次回复器的内部推理：它写出 33 字的草稿后自己数了一遍字（`Count: … = 15
+    chars`）然后否掉，最终留下的那句只有态度、没有由头。30 字是这条行为的直接成因。
+    """
+
+    sample = "今天有人问我路" + "，我指得还挺准" + "——导航该喊我师父了吧"
+    assert len(sample) <= P.GROUP_INTENT_MAX_CHARS, (
+        f"「由头+态度+落子」实测 {len(sample)} 字，超出 {P.GROUP_INTENT_MAX_CHARS} 字上限"
+    )
+    assert P.GROUP_INTENT_MAX_CHARS >= 36
+
+
+def test_output_only_discipline_reaches_both_registers():
+    """v1.25.4：形态纪律与场合无关——私聊也不许把思考过程写进正文。
+
+    真机那次正文位置出现过英文 CoT（`The proactive task: …` / `Let's craft: …` /
+    `Count: …`）。插件切不开 content 与 reasoning，只能把要求同时写在两档 intent 里。
+    """
+
+    assert P.OUTPUT_ONLY_HINT in P.build_intent(_material(), private_chat=True)
+    assert P.OUTPUT_ONLY_HINT in P.build_intent(_material(), private_chat=False)
+    assert "不要复述以上要求" in P.OUTPUT_ONLY_HINT
 
 
 def test_material_text_is_passed_through_not_paraphrased_away():

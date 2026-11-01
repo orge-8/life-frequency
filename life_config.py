@@ -18,7 +18,7 @@ pydantic 模型 + 展示元数据，与宿主能力（``self.ctx.*``）毫无关
 # --- 标准库 ---
 import math
 from dataclasses import replace as _replace
-from typing import Any
+from typing import Any, Literal
 
 # --- 宿主依赖：maibot_sdk（禁止 import src.*）---
 from maibot_sdk import Field, PluginConfigBase
@@ -39,7 +39,7 @@ except ImportError:  # 平铺兜底（脚本直跑 / 旧测试）
     from life_sim import DEFAULT_CARE_PATTERNS
 
 
-SUPPORTED_CONFIG_VERSION = "1.9.0"
+SUPPORTED_CONFIG_VERSION = "1.10.0"
 """``[plugin].config_version`` 的默认值（宿主硬性要求，缺失即加载失败）。
 
 ⚠ 这是**配置 schema 的版本**，不是插件版本。v1.14.0 递增到 1.1.0（病程字段）、
@@ -1640,8 +1640,26 @@ class SecurityConfig(PluginConfigBase):
         json_schema_extra={"label": "管理员 QQ（每行一个）", "order": 0, "rows": 3,
                            "placeholder": "123456"},
     )
+    webui_write_mode: Literal["login", "strict"] = Field(
+        default="login",
+        description=(
+            "WebUI 写接口（life.pause / life.resume）的鉴权档位。"
+            "login = 只依赖宿主 dashboard 登录态（按钮可用，与 identity-guard 同口径）；"
+            "strict = 要求调用方额外传 admin_id 且在管理员名单里，不传即拒绝"
+            "（页面按钮会失效，需改用 /生活 暂停、/生活 恢复）。"
+            "⚠ 宿主 API 层不携带调用方身份，两条路径在插件侧无法区分，因此这不是"
+            "「WebUI 专用闸门」，而是给脚本/其它插件调用场景的选择项"
+        ),
+        json_schema_extra={"label": "WebUI 写接口鉴权", "order": 1},
+    )
 
     _norm_admin_ids = _str_list_validator("admin_ids")
+
+    @field_validator("webui_write_mode", mode="before")
+    @classmethod
+    def _norm_webui_write_mode(cls, value: object) -> str:
+        raw = str(value or "").strip().lower()
+        return raw if raw in {"login", "strict"} else "login"
 
 
 class EconomyConfig(PluginConfigBase):
@@ -2544,6 +2562,7 @@ class CatchupConfig(PluginConfigBase):
     requote_limit: int = Field(default=0, description="塞给 Planner / 回填时最多引几条原文。**默认 0 = 不复述**：那些消息本来就在宿主的对话历史里，再说一遍会让同一句话出现两次；调大只用于「历史被裁剪」的兜底", json_schema_extra={"label": "引用原文条数", "order": 9, "step": 1})
     stagger_max_seconds: int = Field(default=120, description="多个会话在同一次睡醒命中时按它随机散开（秒），避免同刻给宿主丢多个主动任务；0 = 不散开", json_schema_extra={"label": "触发错开（秒）", "order": 10, "step": 20})
     persona_chars: int = Field(default=200, description="把多少人设摘要塞进补答的任务描述（0 = 不塞）；只影响口吻，不替代宿主的完整人设", json_schema_extra={"label": "人设摘要（字符）", "order": 11, "step": 50})
+    store_text: bool = Field(default=False, description="把消息**原文**落进插件私有 SQLite（sleep_backlog）。默认关 = 只记「谁、几点、私聊还是群里被 @」，补答与回填只用到这些元数据（requote_limit 默认 0 时原文根本不参与输出）。想在补答里复述原文时才需要打开", json_schema_extra={"label": "留存消息原文", "order": 12})
 
 class LifeFrequencyConfig(PluginConfigBase):
     """插件配置根模型。

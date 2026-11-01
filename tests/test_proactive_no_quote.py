@@ -108,6 +108,8 @@ def test_plugin_hint_reuses_the_same_discipline():
 
     module, _plugin, _host = _make_plugin()
     assert P.NO_QUOTE_DISCIPLINE in module.PROACTIVE_NO_QUOTE_HINT
+    # v1.25.4：输出形态纪律也走这一行注入（intent 里那条约束力弱）
+    assert P.OUTPUT_ONLY_HINT in module.PROACTIVE_NO_QUOTE_HINT
     assert module.PROACTIVE_NO_QUOTE_HINT.startswith(module.PROACTIVE_NO_QUOTE_MARKER)
     assert module.PROACTIVE_NO_QUOTE_WINDOW_SECONDS > 0
 

@@ -31,9 +31,17 @@
   ``unscoped``（:func:`looks_like_unsupported_argument`）。
 - **没验证过就从严**：状态还是 ``unknown`` 时强制 ``require_person_mention=True``，
   只接受点名了目标人的条目——宁可这一轮少提一句，也不猜。
+- **「一致」有两种成因（v1.25.2）**：宿主 A_Memorix 的人物过滤
+  （``MemorySearchHitProcessingService._filter_hits``）最后一行是
+  ``return filtered or hits``——**按人筛空就回退全量**。所以哨兵对照的「一致」既可能
+  是参数被忽略，也可能是「这个人在候选里没有命中」。后者对「不存在的人」几乎必然
+  成立，是**假阳性**。判据因此不能只看 ``facts_equal``：对照证据（条数 / 指纹 /
+  是否退化查询）记进 :class:`ScopeProbe`，真机日志据此定性。判据本身尚未改动。
 
 这三条加起来，无论宿主是「接受并生效 / 接受但忽略 / 直接报错」哪一种，都不会把
-别人的记忆说出口；区别只是功能可用、自动停用、还是只在严格模式下可用。
+别人的记忆说出口；区别只是功能可用、自动停用、还是只在严格模式下可用。**仍未闭合的
+缺口**：宿主在「某人查不到自己记忆」时会回退全量，这条路上插件拿到的就是他人在该
+查询下的记忆——第二道闸（下列本地隔离 + 严格模式）是唯一还在起作用的防线。
 
 **隔离的第二道闸在本地**
 服务端过滤只能保证「这条记忆属于这个人」，不能保证「它不会出现在别人的会话里」。
@@ -47,6 +55,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
@@ -66,13 +75,37 @@ MEMORY_SEARCH_MODES: tuple[str, ...] = ("search", "aggregate")
 SCOPE_UNKNOWN = "unknown"
 #: 已验证：服务端确实按 ``person_id`` 圈定了检索范围。
 SCOPE_SCOPED = "scoped"
+#: **存疑**（v1.25.3）：对照拿不到可用证据（没有第二个真人可对照，或对照人查不到任何
+#: 东西）。此状态**不停用**，退到「条目必须点名本人」的严格模式——把「验不出」当成
+#: 「无效」，等于让一次环境缺失永久关掉功能。
+SCOPE_UNCERTAIN = "uncertain"
 #: 已验证：**没有**按人圈定（参数被忽略或不被受理）。此状态下整层停用。
 SCOPE_UNSCOPED = "unscoped"
 
 #: 哨兵 ``person_id``：与 :func:`relation_person_id` 同形却不可能对应真人
-#: （真人的键是 ``md5(platform_user_id)`` 的 32 位十六进制）。拿它发同一条查询，
-#: 若返回与真人查询一致且非空，就证明服务端**没有**按人过滤。
+#: （真人的键是 ``md5(platform_user_id)`` 的 32 位十六进制）。
+#:
+#: ⚠ **v1.25.3 起不再作为判据**：宿主 ``MemorySearchHitProcessingService._filter_hits``
+#: 以 ``return filtered or hits`` 收尾，「不可能的人」必然筛空、必然回退全量，于是它
+#: 与真人结果的一致性只证明「宿主对空命中 fail-open」，不证明参数被忽略。留作常量是
+#: 为了让日志里出现这个值时仍能一眼认出「这是哨兵、不是真人」。
 SCOPE_PROBE_PERSON_ID = "0" * 32
+
+#: 查询词退化成 ``person_id`` 时的替代词（v1.25.3）。向量检索拿 md5 当查询等于乱查，
+#: 候选集会退化成「此人自己的记忆」，对照判据随之失效。用一个语义可用、跨人通用的
+#: 短句取代它——它不是「更好的检索」，只是「不再是垃圾查询」。
+MEMORY_FALLBACK_QUERY = "最近聊过的事"
+
+#: 一条人能不能当「对照真人」的判据失败上限：连续这么多轮都判不出，就停止探测
+#: （每轮探测都是一次额外 RPC，10 分钟一个 tick 会白烧）。
+MAX_SCOPE_PROBES = 3
+
+#: 诊断指纹长度（v1.25.2）：日志里只写 ``sha1(事实)[:8]``，**永不**写原文。
+#: 记忆条目本身就可能是隐私，把对照两侧的原文打进日志等于换个地方泄露一次。
+FACT_DIGEST_CHARS = 8
+
+#: 证据里保留几条指纹：两条足够判断「同一个结果集」还是「撞巧同数量」。
+FACT_DIGEST_SAMPLES = 2
 
 #: 宿主「不接受这些参数」的错误特征（中英文宿主都考虑）。命中即判
 #: :data:`SCOPE_UNSCOPED`——参数不被受理时，继续发等于发一条无作用域的全库检索。
@@ -319,35 +352,129 @@ def looks_like_unsupported_argument(error: Any) -> bool:
     return any(marker in text for marker in _UNSUPPORTED_ARG_MARKERS)
 
 
+def fact_digest(fact: Any) -> str:
+    """一条事实的**指纹**（``sha1[:FACT_DIGEST_CHARS]``），日志里只用它代替原文。"""
+
+    text = str(fact or "").strip()
+    if not text:
+        return ""
+    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:FACT_DIGEST_CHARS]
+
+
+@dataclass(frozen=True)
+class ScopeProbe:
+    """一次哨兵对照的**证据快照**（v1.25.2，只记录，不参与判定）。
+
+    为什么要有这个东西：v1.22.4 的判据是「两侧一致且非空 ⇒ ``person_id`` 被忽略 ⇒
+    停用」。真机日志只留一句「哨兵返回了与真人一致的结果」，看不出**为什么一致**。
+    而宿主 A_Memorix 的人物过滤是：
+
+    .. code-block:: python
+
+        # src/A_memorix/core/runtime/services/search_hit_processing_service.py
+        return filtered or hits     # 筛空 = 回退全量
+
+    也就是说「一致」有两种成因，从返回内容上看**完全同形**：
+
+    1. ``person_id`` 被忽略 → 任何人的查询都拿到同一批候选；
+    2. ``person_id`` 生效，但这位「人」在候选里一条都没有 → ``filtered`` 为空 →
+       回退全量 → 与真人结果撞成一致（宿主 v1.3.19 仍是这一行为，r-dev 分支同样）。
+
+    第 2 种是**假阳性**，而且它对「不存在的人」几乎必然成立。所以这条证据必须带上
+    :attr:`query_degraded`——当查询词退化成 ``person_id``（md5）时，候选集本来就
+    几乎只剩这个人自己的记忆，回退全量与真人结果的差异被抹平，误判概率最高。
+    只加证据、不改判定：先让真机日志能回答「是哪一种」，再谈换判据。
+    """
+
+    #: 真人查询解析出的事实条数 / 哨兵查询解析出的事实条数
+    real_count: int
+    probe_count: int
+    #: 两侧是否**逐条一致**（:func:`facts_equal` 的结论，判定的唯一依据）
+    identical: bool
+    #: 查询词是否就是 ``person_id`` 本身（退化查询，见模块文档契约 1 的注释）
+    query_degraded: bool
+    #: 两侧事实的指纹（不带原文），最多 :data:`FACT_DIGEST_SAMPLES` 条
+    real_digests: tuple[str, ...]
+    probe_digests: tuple[str, ...]
+    #: 本次是否真的有一个「另一个真人」当对照（没有就只能判存疑）
+    decoy_available: bool = True
+
+    def summary(self) -> str:
+        """一行诊断串：够定性，不含任何记忆原文。"""
+
+        def _digests(items: Sequence[str]) -> str:
+            return ",".join(items) or "-"
+
+        return (
+            f"证据: 真人{self.real_count}条/对照{self.probe_count}条"
+            f"/逐条一致={'是' if self.identical else '否'}"
+            f"/对照人可用={'是' if self.decoy_available else '否'}"
+            f"/查询词退化为person_id={'是' if self.query_degraded else '否'}"
+            f"/指纹 真人={_digests(self.real_digests)} 对照={_digests(self.probe_digests)}"
+            + (
+                "（一致有两种成因：参数被忽略，或该人在候选里无命中导致宿主"
+                "「筛空回退全量」——后者是假阳性，退化查询下最易发生）"
+                if self.identical and self.query_degraded
+                else ""
+            )
+        )
+
+
 class MemoryScopeGuard:
     """``knowledge.search`` 作用域自证的状态机（纯逻辑，不碰 IO）。
 
     宿主对 ``person_id`` / ``respect_filter`` 有「接受并生效 / 接受但忽略 / 直接报错」
     三种可能，公开 SDK 无从判断——所以不串人这件事由**这个状态机**负责，不由
-    SDK 签名假设负责。三态见 :data:`SCOPE_UNKNOWN` / :data:`SCOPE_SCOPED` /
-    :data:`SCOPE_UNSCOPED`。
+    SDK 签名假设负责。四态见 :data:`SCOPE_UNKNOWN` / :data:`SCOPE_SCOPED` /
+    :data:`SCOPE_UNCERTAIN` / :data:`SCOPE_UNSCOPED`。
 
     **粘性**：判成 ``unscoped`` 之后不再回头。宿主不支持是契约事实，重试也不会变，
-    而每次重试都是一次无作用域的全库检索。
+    而每次重试都是一次无作用域的全库检索。``uncertain`` 允许再验（最多
+    :data:`MAX_SCOPE_PROBES` 次）：它是「这次没有证据」，不是「宿主不行」。
+
+    **v1.25.3 改四态**：v1.22.4 是二元的——哨兵与真人结果一致就停用整层。核实宿主
+    源码后发现 ``_filter_hits`` 以 ``return filtered or hits`` 收尾，「按人筛空」
+    会回退全量，而哨兵（不存在的人）恰恰必然筛空，于是「一致」并不能证明参数被忽略。
+    现在改成与**另一个真实的真人**对照：另一个人拿到的东西与你不同 ⇒ 真的按人筛过；
+    完全一样 ⇒ 没有作用域；对照人自己一无所获 ⇒ 存疑（**不停用**，退严格模式）。
     """
 
     def __init__(self, *, require_person_mention: bool = False) -> None:
         self._state = SCOPE_UNKNOWN
         self._require_person_mention = bool(require_person_mention)
+        self._report: ScopeProbe | None = None
+        self._attempts = 0
 
     @property
     def state(self) -> str:
         return self._state
 
     @property
+    def report(self) -> ScopeProbe | None:
+        """最近一次对照的证据快照；没对照过是 ``None``。"""
+
+        return self._report
+
+    @property
     def disabled(self) -> bool:
-        """已证实宿主不按人圈定：这一层必须停用。"""
+        """已证实宿主不按人圈定：这一层必须停用。
+
+        **只有 ``unscoped``**——``uncertain`` 照样继续读，只是要求条目点名本人。
+        """
+
         return self._state == SCOPE_UNSCOPED
 
     @property
+    def attempts(self) -> int:
+        """已经做过几次对照（封顶 :data:`MAX_SCOPE_PROBES`）。"""
+
+        return self._attempts
+
+    @property
     def strict_person_mention(self) -> bool:
-        """是否强制「条目必须点名本人」。作用域没验过时恒为 ``True``。"""
-        return self._require_person_mention or self._state == SCOPE_UNKNOWN
+        """是否强制「条目必须点名本人」：只有确认过作用域生效才敢关掉它。"""
+
+        return self._require_person_mention or self._state != SCOPE_SCOPED
 
     def note_rejected(self, error: Any) -> bool:
         """检索抛异常时调用；返回 ``True`` 表示「宿主不认这些参数」→ 已停用。"""
@@ -358,22 +485,56 @@ class MemoryScopeGuard:
         return False
 
     def probe_needed(self, facts: Sequence[str]) -> bool:
-        """拿到 ``facts`` 后要不要再发一条哨兵对照（只在第一次拿到非空结果时）。"""
+        """拿到 ``facts`` 后要不要再做一次对照。
 
-        return bool(facts) and self._state == SCOPE_UNKNOWN
+        未验证 / 存疑都值得再试（存疑可能只是「这次没有对照人」），但总次数封顶，
+        否则每个 tick 都白烧一次额外 RPC。
+        """
 
-    def note_probe(self, real_facts: Sequence[str], probe_facts: Sequence[str]) -> None:
-        """喂进哨兵结果：一致且非空 = 作用域失效，否则视为生效。"""
+        if not facts or self._attempts >= MAX_SCOPE_PROBES:
+            return False
+        return self._state in (SCOPE_UNKNOWN, SCOPE_UNCERTAIN)
 
-        if facts_equal(real_facts, probe_facts):
+    def note_probe(
+        self,
+        real_facts: Sequence[str],
+        probe_facts: Sequence[str],
+        *,
+        query_degraded: bool = False,
+        decoy_available: bool = True,
+    ) -> ScopeProbe:
+        """喂进对照结果并定性。
+
+        - 没有对照人 / 对照人什么都没查到 → ``uncertain``（无证据，**不停用**）
+        - 两边逐条一致且非空 → ``unscoped``（另一个人拿到了同样的东西）
+        - 否则 → ``scoped``（差异只能来自按人过滤）
+        """
+
+        self._attempts += 1
+        identical = facts_equal(real_facts, probe_facts)
+        self._report = ScopeProbe(
+            real_count=len([item for item in real_facts if str(item or "").strip()]),
+            probe_count=len([item for item in probe_facts if str(item or "").strip()]),
+            identical=identical,
+            query_degraded=bool(query_degraded),
+            real_digests=tuple(fact_digest(item) for item in real_facts[:FACT_DIGEST_SAMPLES]),
+            probe_digests=tuple(fact_digest(item) for item in probe_facts[:FACT_DIGEST_SAMPLES]),
+            decoy_available=bool(decoy_available),
+        )
+        if not decoy_available or not self._report.probe_count:
+            self._state = SCOPE_UNCERTAIN
+        elif identical:
             self._state = SCOPE_UNSCOPED
-            return
-        self._state = SCOPE_SCOPED
+        else:
+            self._state = SCOPE_SCOPED
+        return self._report
 
     def reset(self) -> None:
         """重新自证（配置关掉又打开时用：宿主可能已经换过）。"""
 
         self._state = SCOPE_UNKNOWN
+        self._report = None
+        self._attempts = 0
 
 
 class MemoryLog:
@@ -571,24 +732,35 @@ async def fetch_person_facts(
     max_chars: int = DEFAULT_FACT_MAX_CHARS,
     bot_tokens: Iterable[object] = (),
     require_person_mention: bool = False,
+    decoy_person_id: str = "",
 ) -> tuple[str, ...] | None:
     """这个人的记忆事实；``None`` = 这次不能用（停用 / 失败），**不写缓存**。
 
     把「作用域自证 + 检索 + 解析 + 身份过滤」收在一处，``plugin.py`` 只留「取配置 +
     委托」——入口模块的结构预算是门禁化的，一层可选接线不该把它继续撑大。
 
-    **串行**：一次只发一条 RPC（自证那次也严格前后相继），调用方不许 gather——并行
+    **串行**：一次只发一条 RPC（对照那次也严格前后相继），调用方不许 gather——并行
     会撞 A_Memorix 的 SQLite 写锁。
+
+    ``decoy_person_id`` 是「另一个**真实的**人」的 ``person_id``（v1.25.3）。为什么
+    不能再用「不存在的人」：宿主按人筛空会回退全量，不存在的人必然筛空，于是它的
+    结果永远与真人一致，判据恒假。
     """
 
     pid = str(person_id or "").strip()
     if not pid or guard.disabled:
         return None
     limit_i = max(1, int(limit))
+    raw_query = str(query or "").strip()
+    #: 调用方不给查询词时会传 ``pid``（md5）。拿它当向量检索词等于乱查：候选集会退化成
+    #: 「此人自己的记忆」，对照判据随之失效。所以这里换成一句可用的短句，**并且照样
+    #: 记下「原本退化了」这件事**，供日志定性。
+    query_degraded = not raw_query or raw_query == pid
+    search_query = MEMORY_FALLBACK_QUERY if query_degraded else raw_query
     try:
         content = await call_capability(
             "knowledge.search",
-            query=query,
+            query=search_query,
             person_id=pid,
             limit=limit_i,
             mode=MEMORY_SEARCH_MODES[0],
@@ -605,24 +777,31 @@ async def fetch_person_facts(
         return None
 
     raw = facts_from_content(content, max_items=limit_i, max_chars=int(max_chars))
+    decoy = str(decoy_person_id or "").strip()
     if guard.probe_needed(raw):
         await _verify_scope(
-            call_capability, query=query, limit=limit_i, max_chars=max_chars,
-            real_facts=raw, guard=guard, log=log,
+            call_capability, query=search_query, limit=limit_i, max_chars=max_chars,
+            real_facts=raw, guard=guard, log=log, query_degraded=query_degraded,
+            decoy_person_id=decoy if decoy != pid else "",
         )
         if guard.disabled:
-            _disable(cache, log, "哨兵 person_id 返回了与真人一致的结果")
+            report = guard.report
+            reason = "与「另一个真人」的对照结果逐条一致（宿主未按人筛）"
+            if report is not None:
+                reason = f"{reason}；{report.summary()}"
+            _disable(cache, log, reason)
             return None
     facts = filter_facts(
         raw,
-        # 查询词就是人名时才当身份词；退化成 person_id 的查询不能当身份词用
-        person_tokens=(query,) if query != pid else (),
+        # 只有调用方真给了查询词、且它不是 person_id 时才当身份词用
+        person_tokens=(raw_query,) if not query_degraded else (),
         bot_tokens=bot_tokens,
         require_person_mention=require_person_mention or guard.strict_person_mention,
     )
     log.debug(
-        "长期记忆 person_id=%s 查询=%r 原始=%d 过滤后=%d 作用域=%s",
-        pid, query, len(raw), len(facts), guard.state,
+        "长期记忆 person_id=%s 查询=%r(退化=%s) 对照人=%s 原始=%d 过滤后=%d 作用域=%s",
+        pid, search_query, query_degraded, "有" if decoy and decoy != pid else "无",
+        len(raw), len(facts), guard.state,
     )
     return facts
 
@@ -636,33 +815,48 @@ async def _verify_scope(
     real_facts: Sequence[str],
     guard: MemoryScopeGuard,
     log: MemoryLog,
+    query_degraded: bool = False,
+    decoy_person_id: str = "",
 ) -> None:
-    """哨兵对照：同一条查询、只把 ``person_id`` 换成一个不可能属于真人的值。
+    """对照一个**真实的另一个人**：同一条查询，只换 ``person_id``。
 
-    两边结果的差异只能来自服务端有没有按人过滤：一致且非空 → 参数被忽略；不一致
-    （哨兵通常查不到东西）→ 参数生效。**探测自己失败不算证据**（可能只是抖动），
-    维持严格模式，下一次拿到非空结果时再验。
+    判据（v1.25.3）：另一个人拿到的东西与你**不同** ⇒ 服务端确实按人筛过；完全
+    一样 ⇒ 没有作用域。对照人自己查不到任何东西 ⇒ **存疑**，不是「无效」——宿主
+    ``_filter_hits`` 的 ``return filtered or hits`` 会让「按人筛空」回退全量，这时
+    两边的「一致」只说明对方没命中，不能反推参数被忽略。
+
+    **对照不可用 / 探测自己失败都不算证据**：不发 RPC，维持当前状态（未验证或存疑
+    ⇒ 严格模式），下一次再验。
     """
 
+    decoy = str(decoy_person_id or "").strip()
+    if not decoy:
+        log.debug("长期记忆作用域未验证：本次没有可用的「另一个真人」当对照")
+        return
     try:
         probe = await call_capability(
             "knowledge.search",
             query=query,
-            person_id=SCOPE_PROBE_PERSON_ID,
+            person_id=decoy,
             limit=limit,
             mode=MEMORY_SEARCH_MODES[0],
             respect_filter=True,
         )
     except Exception as exc:  # noqa: BLE001
-        log.debug("长期记忆作用域探测失败（维持严格模式，下次再验）：%s", exc)
+        log.debug("长期记忆作用域对照失败（维持当前状态，下次再验）：%s", exc)
         return
     if isinstance(probe, Mapping) and probe.get("success") is False:
-        log.debug("长期记忆作用域探测被宿主拒绝：%s", probe.get("error"))
+        log.debug("长期记忆作用域对照被宿主拒绝：%s", probe.get("error"))
         return
     guard.note_probe(
         real_facts,
         facts_from_content(probe, max_items=limit, max_chars=int(max_chars)),
+        query_degraded=query_degraded,
+        decoy_available=True,
     )
+    report = guard.report
+    if report is not None:
+        log.debug("长期记忆作用域对照 → %s", report.summary())
 
 
 def _note_failure(log: MemoryLog, error: Any) -> None:
@@ -674,23 +868,35 @@ def _note_failure(log: MemoryLog, error: Any) -> None:
 
 
 def _disable(cache: FactCache, log: MemoryLog, reason: str) -> None:
-    """停用整层：已缓存的事实一并作废（它们是在无作用域的前提下取回来的）。"""
+    """停用整层：已缓存的事实一并作废（它们是在无作用域的前提下取回来的）。
+
+    只有两种情况会走到这里：**与另一个真人的对照完全一致**，或**宿主直接不认参
+    数**。「没有对照人」「对照人查不到东西」都判存疑，不停用——把「验不出」当成
+    「无效」，等于让一次环境缺失永久关掉功能。
+    """
 
     cache.clear()
     log.warn_once(
         "memory_scope",
         "长期记忆已停用：宿主 knowledge.search 未兑现 person_id / respect_filter 的"
-        "作用域（%s）。无作用域的检索会把别人的记忆捞回来，因此本进程不再读取；"
-        "请确认宿主 A_Memorix 支持这两个参数，或关掉 [memory] enabled", reason,
+        "作用域（%s）。无作用域的检索会把别人的记忆捞回来，因此本进程不再读取。"
+        "如果是「与另一个真人对照逐条一致」判出来的，说明服务端确实没按人筛；"
+        "确认宿主支持这两个参数后可重新打开 [memory] enabled", reason,
     )
 
 
 __all__ = [
     "DEFAULT_FACT_MAX_CHARS",
+    "FACT_DIGEST_CHARS",
+    "FACT_DIGEST_SAMPLES",
     "FactCache",
+    "MAX_SCOPE_PROBES",
+    "MEMORY_FALLBACK_QUERY",
     "MemoryLog",
     "MemoryScopeGuard",
+    "ScopeProbe",
     "fetch_person_facts",
+    "fact_digest",
     "MAX_MATERIAL_CHARS",
     "MEMORY_INTRO",
     "MEMORY_LABEL",
@@ -699,6 +905,7 @@ __all__ = [
     "MEMORY_SEARCH_MODES",
     "SCOPE_PROBE_PERSON_ID",
     "SCOPE_SCOPED",
+    "SCOPE_UNCERTAIN",
     "SCOPE_UNKNOWN",
     "SCOPE_UNSCOPED",
     "fact_to_material",

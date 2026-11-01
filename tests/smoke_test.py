@@ -22,9 +22,31 @@ bd-repo 踩过这个坑——平铺加载能过、真机却报 ``No module named
 import asyncio
 import importlib.util
 import logging
+import os
 import pathlib
 import sys
 import time
+
+
+def _pin_clock() -> float:
+    """把 ``time.time()`` 钉在当天 14:00（醒着、不在静默时段）。
+
+    第 4 段断言「LLM 被调用 / 活动来自模型」，而生活循环有「睡眠中 → 倍率 0」的硬闸
+    （见 life_factors 模块文档第 16 行）。于是这套断言**依赖跑门禁的时刻**：晚上跑过、
+    凌晨跑挂（真机 2026-10-31 00:05 实测 PASS 57 / FAIL 8，全部因为硬闸判「睡眠中」）。
+    门禁不该有作息。只替换 ``time.time()``：monotonic 不动，asyncio 超时照常。
+
+    ⚠ **只能在 ``main()`` 里调用，不能在 import 时执行**：pytest 会把本文件当测试模块
+    收集（``*_test.py``），import 期冻结时钟会污染整个 pytest 进程——``test_llm_stats``
+    的「冻结时钟用例必须还原真实时钟」当场失败，紧随其后的用例因为时间不再前进而卡死。
+    """
+
+    fixed = float(os.environ.get("LF_SMOKE_NOW") or 0.0) or time.mktime(
+        time.strptime(f"{time.strftime('%Y-%m-%d')} 14:00", "%Y-%m-%d %H:%M")
+    )
+    time.time = lambda: fixed  # type: ignore[assignment]
+    return fixed
+
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -79,6 +101,8 @@ def main() -> int:
     except Exception:
         print("SKIP: 未安装 maibot-plugin-sdk，跳过冒烟测试（这不代表通过）")
         return 0
+
+    _pin_clock()
 
     from fakehost import FakeHost, FakePaths, bind_context, build_context, get_default_config
 

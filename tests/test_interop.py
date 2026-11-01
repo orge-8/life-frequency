@@ -1478,6 +1478,64 @@ def test_private_chat_uses_private_talk_value():
     asyncio.run(run())
 
 
+def test_private_chat_paused_rule_replaces_frequency_on_1_3_15():
+    """v1.25.5：宿主 1.3.15 起「暂停」替代「频率」，私聊倍率不参与，卡面必须说实话。
+
+    源码证据（v1.3.19 ``runtime.py:1070-1074``）：私聊直接早退，返回
+    ``get_talk_value(is_group_chat=False)``，而它只有 0（暂停）/ 1（正常）两个值 ⇒
+    插件下发的倍率被整段丢弃；配置键 ``private_talk_value`` 同时消失（1.3.14 有、1.3.19 无）。
+    探测方式：读 ``chat.reply_timing.private_reply_paused`` —— 这个键只在 1.3.15 及以后存在。
+    """
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        host.config_values["chat.reply_timing.talk_value"] = 0.6
+        host.config_values["chat.reply_timing.private_reply_paused"] = False  # 键存在 ⇒ 新口径
+        host.sessions = [
+            {"session_id": "group-1", "stream_id": "group-1", "platform": "qq",
+             "group_id": "123456", "user_id": "10001", "is_group_session": True,
+             "chat_type": "group"},
+            {"session_id": "private-1", "stream_id": "private-1", "platform": "qq",
+             "user_id": "10001", "is_group_session": False, "chat_type": "private"},
+        ]
+        host.live = {"group-1", "private-1"}
+        await plugin.note_session(message={"session_id": "private-1", "user_id": "10001"})
+        await plugin._list_sessions()
+        await plugin._refresh_host_context()
+        plugin.config.apply.only_active_sessions = False
+
+        assert plugin._host_private_paused_rule is True
+        assert plugin._talk_value_for("private-1") == (
+            pytest.approx(1.0),
+            "私聊（宿主 1.3.15+ 只认暂停开关）",
+        ), "私聊恒为 1.0，且标签要点明是新口径"
+        assert plugin._talk_value_for("group-1")[0] == pytest.approx(0.6), "群聊仍读 talk_value"
+
+        status = plugin._render_status(time.time(), "private-1")
+        assert "只认暂停开关" in status, status
+        assert "私聊不设频率门控" in status, "不能拿计数门去预览私聊（真机是来一条就进）"
+
+        await plugin._apply_sweep(time.time())
+        freq = await plugin._render_frequency(time.time(), "private-1")
+        assert "插件倍率在私聊" in freq, "频率卡必须明说私聊倍率不生效"
+
+        # 旧宿主（≤1.3.14）没有这个键 → 仍按 private_talk_value 口径，行为不变
+        _m2, old_plugin, old_host = _make_plugin()
+        old_host.config_values["chat.reply_timing.talk_value"] = 0.6
+        old_host.config_values["chat.reply_timing.private_talk_value"] = 0.826
+        old_host.sessions = [
+            {"session_id": "private-1", "stream_id": "private-1", "platform": "qq",
+             "user_id": "10001", "is_group_session": False, "chat_type": "private"},
+        ]
+        old_host.live = {"private-1"}
+        await old_plugin._list_sessions()
+        await old_plugin._refresh_host_context()
+        assert old_plugin._host_private_paused_rule is False
+        assert old_plugin._talk_value_for("private-1") == (pytest.approx(0.826), "私聊基础频率")
+
+    asyncio.run(run())
+
+
 def test_persona_injection_is_capped_by_config():
     """人设注入上限可配（v1.3.2）：读取时不截断，截断发生在拼活动提示词时。"""
 

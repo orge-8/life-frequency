@@ -89,18 +89,22 @@ def _seed_friend(plugin, uid: str = "123456", familiarity: float = 60.0) -> str:
     return pid
 
 
-def _real_calls(host) -> list[dict]:
-    """真实检索调用（**排除**哨兵对照）。
+def _calls_for(host, pid: str) -> list[dict]:
+    """某个 ``person_id`` 的检索调用（对照人那次自然被分到另一组）。"""
 
-    v1.22.4 起第一次拿到非空结果时会多发一条 ``person_id`` 为全 0 的哨兵查询做
-    作用域自证，所以「调用次数」必须按人分开数，否则这条探测会把所有计数断言
-    顶成 +1（看起来像缓存失效）。
+    return [kw for kw in host.calls_of("knowledge.search")
+            if str(kw.get("person_id") or "") == str(pid)]
+
+
+def _mark_scoped(plugin) -> None:
+    """把作用域标记成「已验证按人筛」。
+
+    只给那些**不测作用域**的用例用（缓存 / 串行 / 失败重试）：否则它们要么被严格
+    模式的「必须点名」过滤光，要么被迫多发一次对照 RPC，把要测的计数顶乱。
     """
 
-    return [
-        kw for kw in host.calls_of("knowledge.search")
-        if str(kw.get("person_id") or "") != M.SCOPE_PROBE_PERSON_ID
-    ]
+    plugin._memory_scope.note_probe(("这条属于某个人",), ("这条属于另一个人",))
+    assert plugin._memory_scope.state == M.SCOPE_SCOPED
 
 
 # ---------------------------------------------------------------- 纯模块
@@ -193,30 +197,35 @@ def test_build_intent_uses_intro_without_changing_old_wording():
 
 
 def test_knowledge_search_sends_person_id_and_respect_filter():
-    """契约 1：少 ``respect_filter`` 就是全库检索串人。"""
+    """契约 1：少 ``respect_filter`` 就是全库检索串人；对照那次也一样。"""
 
     async def run():
         _module, plugin, host = _make_plugin()
         pid = _seed_friend(plugin)
+        decoy = _seed_friend(plugin, uid="654321")
         host.returns["knowledge.search"] = "1. 提过要考公\n"
+        # 按人筛的宿主：两个人拿到不同的记忆 → 判 scoped
+        host.knowledge_by_person = {pid: "1. 提过要考公\n", decoy: "1. 养了只狗\n"}
+
         facts = await plugin._memory_facts_for_person(pid, query="张三")
         assert facts == ("提过要考公",)
 
-        calls = _real_calls(host)
+        calls = _calls_for(host, pid)
         assert len(calls) == 1
         args = calls[0]
         assert args["person_id"] == pid
         assert args["respect_filter"] is True
         assert args["mode"] in M.MEMORY_SEARCH_MODES
         assert args["limit"] >= 1
-        # 同一轮还发过一次哨兵对照（作用域自证），且哨兵也带着完整的作用域参数
-        probe = [
-            kw for kw in host.calls_of("knowledge.search")
-            if str(kw.get("person_id") or "") == M.SCOPE_PROBE_PERSON_ID
-        ]
+        assert args["query"] == "张三"
+
+        # 同一轮还发过一次对照（另一个真人），且同样带着完整的作用域参数
+        probe = _calls_for(host, decoy)
         assert len(probe) == 1
         assert probe[0]["respect_filter"] is True
+        assert probe[0]["query"] == "张三", "对照必须用同一条查询，否则差异不归因"
         assert plugin._memory_scope.state == M.SCOPE_SCOPED
+        assert plugin._memory_scope.strict_person_mention is False
 
     asyncio.run(run())
 
@@ -238,10 +247,12 @@ def test_failure_degrades_to_empty_and_is_not_cached():
     async def run():
         _module, plugin, _host = _make_plugin()
         pid = P_id("123456")
+        _mark_scoped(plugin)
         attempts = {"count": 0}
 
         async def boom(capability, **kwargs):
-            attempts["count"] += 1
+            if capability == "knowledge.search":
+                attempts["count"] += 1
             raise RuntimeError("A_Memorix unavailable")
 
         plugin.ctx.call_capability = boom
@@ -259,17 +270,18 @@ def test_cache_hit_skips_rpc_and_ttl_expiry_refetches():
     async def run():
         _module, plugin, host = _make_plugin()
         pid = _seed_friend(plugin)
+        _mark_scoped(plugin)
         host.returns["knowledge.search"] = "提过要考公"
 
         await plugin._memory_facts_for_person(pid)
         await plugin._memory_facts_for_person(pid)
-        assert len(_real_calls(host)) == 1
-        # 自证只做一次：第二次命中缓存，不该再发哨兵
-        assert len(_real_calls(host)) == 1
+        assert len(_calls_for(host, pid)) == 1
+        # 自证只做一次：第二次命中缓存，不该再发对照
+        assert len(_calls_for(host, pid)) == 1
 
         plugin._memory_cache.ttl_seconds = 0.0
         await plugin._memory_facts_for_person(pid)
-        assert len(_real_calls(host)) == 2
+        assert len(_calls_for(host, pid)) == 2
 
     asyncio.run(run())
 
@@ -279,6 +291,7 @@ def test_relation_archive_fetch_is_strictly_sequential():
 
     async def run():
         _module, plugin, host = _make_plugin()
+        _mark_scoped(plugin)
         host.returns["knowledge.search"] = "提过要考公"
         records = [
             {"person_id": P_id("111"), "user_id": "111", "familiarity": 60.0},
@@ -395,20 +408,170 @@ def test_looks_like_unsupported_argument_is_conservative():
     assert not M.looks_like_unsupported_argument(TimeoutError())
 
 
-def test_scope_probe_disables_layer_when_person_id_is_ignored():
-    """宿主「接受但忽略」：哨兵与真人结果一致 → 停用，且不再当作抖动去重试。"""
+def test_scope_probe_disables_layer_when_another_person_sees_the_same():
+    """宿主「接受但忽略」：**另一个真人**拿到一模一样的东西 → 停用，且不再重试。
+
+    v1.25.3 起判据换了对照组：不再是「不存在的人」（它必然筛空、必然撞上宿主
+    ``filtered or hits`` 的回退全量），而是另一个真实的人。
+    """
 
     async def run():
         _module, plugin, host = _make_plugin()
         host.knowledge_ignores_person_id = True
         host.returns["knowledge.search"] = "提过要考公"
         pid = _seed_friend(plugin)
+        _seed_friend(plugin, uid="654321")  # 提供对照人
 
         assert await plugin._memory_facts_for_person(pid, query="张三") == ()
         assert plugin._memory_scope.state == M.SCOPE_UNSCOPED
         # 粘性：之后再查连 RPC 都不发（发一次就是一次无作用域的全库检索）
         assert await plugin._memory_facts_for_person(pid, query="张三") == ()
-        assert len(_real_calls(host)) == 1
+        assert len(_calls_for(host, pid)) == 1
+
+    asyncio.run(run())
+
+
+def test_no_decoy_means_uncertain_not_disabled():
+    """没有对照人 ⇒ **存疑不停用**（v1.25.3）：把「验不出」当成「无效」等于白丢功能。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        pid = _seed_friend(plugin)  # 只有他一个人
+        host.returns["knowledge.search"] = "提过要考公"
+
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert plugin._memory_scope.state == M.SCOPE_UNKNOWN
+        assert plugin._memory_scope.disabled is False
+        assert plugin._memory_scope.strict_person_mention is True
+        assert len(host.calls_of("knowledge.search")) == 1, "没有对照人就不该多发 RPC"
+
+        # 存疑也允许再验，但次数封顶（每轮一次额外 RPC 会白烧）
+        for _ in range(M.MAX_SCOPE_PROBES + 1):
+            plugin._memory_cache.clear()
+            await plugin._memory_facts_for_person(pid, query="张三")
+        assert plugin._memory_scope.attempts == 0, "没有对照人时 note_probe 根本不该被调用"
+
+    asyncio.run(run())
+
+
+def test_uncertain_when_decoy_has_no_memory():
+    """对照人自己一无所获 ⇒ 存疑，**不能**据此判停用（宿主筛空会回退全量）。"""
+
+    async def run():
+        _module, plugin, host = _make_plugin()
+        pid = _seed_friend(plugin)
+        decoy = _seed_friend(plugin, uid="654321")
+        host.knowledge_by_person = {pid: "提过要考公", decoy: []}
+
+        assert await plugin._memory_facts_for_person(pid, query="张三") == ()
+        assert plugin._memory_scope.state == M.SCOPE_UNCERTAIN
+        assert plugin._memory_scope.disabled is False
+        assert plugin._memory_scope.report is not None
+        assert plugin._memory_scope.report.probe_count == 0
+
+    asyncio.run(run())
+
+
+def test_scope_probe_report_records_evidence_without_raw_text():
+    """v1.25.2 起留证据（条数、指纹、是否退化查询）；v1.25.3 起判据换对照组。
+
+    证据的作用是让真机日志能定性：宿主 ``_filter_hits`` 的 ``filtered or hits``
+    会让「按人筛空」回退全量，光看「一致」判不出结论。
+    """
+
+    guard = M.MemoryScopeGuard()
+    report = guard.note_probe(("提过要考公", "养了只猫"), ("提过要考公", "养了只猫"))
+
+    assert report.identical is True
+    assert (report.real_count, report.probe_count) == (2, 2)
+    assert guard.state == M.SCOPE_UNSCOPED and guard.disabled
+    assert report is guard.report
+
+    text = report.summary()
+    assert "真人2条/对照2条" in text and "逐条一致=是" in text
+    # 指纹是 8 位十六进制；原文一个字都不能出现在日志里
+    assert M.FACT_DIGEST_CHARS == 8
+    assert all(len(item) == 8 and item.isalnum() for item in report.real_digests)
+    assert "考公" not in text and "养了只猫" not in text
+
+    # 退化查询才追加那句解释（非退化时不该制造噪音）
+    assert "一致有两种成因" in M.MemoryScopeGuard().note_probe(
+        ("a",), ("a",), query_degraded=True
+    ).summary()
+    assert "一致有两种成因" not in M.MemoryScopeGuard().note_probe(("a",), ("a",)).summary()
+
+    # 不一致 → 判 scoped，证据照样留
+    other = M.MemoryScopeGuard()
+    scoped = other.note_probe(("提过要考公",), ("养了只猫",))
+    assert scoped.identical is False and other.state == M.SCOPE_SCOPED
+
+
+def test_scope_reset_clears_stale_evidence():
+    """配置关掉又打开时要重新自证：旧证据不能留着当结论。"""
+
+    guard = M.MemoryScopeGuard()
+    guard.note_probe(("a",), ("a",))
+    assert guard.report is not None
+    guard.reset()
+    assert guard.report is None and guard.state == M.SCOPE_UNKNOWN
+
+
+def test_disable_warning_carries_probe_evidence():
+    """真机可见的那条告警必须自带证据，且标明这次是不是退化查询。"""
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.lines: list[tuple[str, str]] = []
+
+        def debug(self, message, *args):
+            self.lines.append(("debug", message % args if args else message))
+
+        def warning(self, message, *args):
+            self.lines.append(("warning", message % args if args else message))
+
+    async def run():
+        async def call(_capability, **_kwargs):
+            return "你知道这些知识：\n1. 提过要考公"
+
+        recorder = _Recorder()
+        guard = M.MemoryScopeGuard()
+        cache = M.FactCache(ttl_seconds=60.0)
+        pid = "a" * 32
+        out = await M.fetch_person_facts(
+            call, person_id=pid, query=pid, guard=guard, cache=cache,
+            log=M.MemoryLog(recorder, "life"), decoy_person_id="b" * 32,
+        )
+        assert out is None and guard.disabled
+        warns = [line for level, line in recorder.lines if level == "warning"]
+        assert len(warns) == 1
+        assert "证据: 真人1条/对照1条" in warns[0]
+        assert "查询词退化为person_id=是" in warns[0]
+        assert "提过要考公" not in warns[0], "告警不得回显记忆原文"
+
+    asyncio.run(run())
+
+
+def test_degraded_query_is_replaced_by_a_content_phrase():
+    """查询词不能是 ``person_id``（md5）：换成人话，且不改判定（v1.25.3）。"""
+
+    async def run():
+        seen: list[str] = []
+
+        async def call(_capability, **kwargs):
+            seen.append(str(kwargs.get("query") or ""))
+            return "1. 提过要考公"
+
+        pid = "c" * 32
+        guard = M.MemoryScopeGuard()
+        out = await M.fetch_person_facts(
+            call, person_id=pid, query=pid, guard=guard,
+            cache=M.FactCache(ttl_seconds=60.0), log=M.MemoryLog(None),
+        )
+        assert M.MEMORY_FALLBACK_QUERY in seen[0]
+        assert seen[0] != pid, "拿 md5 当向量检索词等于乱查"
+        # 退化时没有可用的身份词 ⇒ 未验证作用域的严格模式把条目全丢掉。
+        # 这是刻意的：宁可这一轮不提，也不拿一条不知道属于谁的记忆去开口。
+        assert out == ()
 
     asyncio.run(run())
 
@@ -422,7 +585,8 @@ def test_unsupported_kwargs_disable_the_layer_without_retry():
         attempts = {"n": 0}
 
         async def reject(capability, **kwargs):
-            attempts["n"] += 1
+            if capability == "knowledge.search":
+                attempts["n"] += 1
             raise TypeError("search() got an unexpected keyword argument 'person_id'")
 
         plugin.ctx.call_capability = reject
@@ -441,9 +605,11 @@ def test_unverified_scope_forces_person_mention():
     async def run():
         _module, plugin, _host = _make_plugin()
         pid = _seed_friend(plugin)
+        _seed_friend(plugin, uid="654321")  # 提供对照人
 
         def flaky(capability, **kwargs):
-            if str(kwargs.get("person_id") or "") == M.SCOPE_PROBE_PERSON_ID:
+            # 对照人那次失败（只要不是目标本人就当对照，避免依赖对照人的选取顺序）
+            if str(kwargs.get("person_id") or "") != pid:
                 raise RuntimeError("A_Memorix busy")
 
         async def call(capability, **kwargs):
@@ -472,6 +638,7 @@ def test_disabling_scope_drops_already_cached_facts():
     async def run():
         _module, plugin, host = _make_plugin()
         pid = _seed_friend(plugin)
+        _seed_friend(plugin, uid="654321")  # 对照人
         plugin._memory_cache.put(pid, ("提过要考公",), time.time())
         host.knowledge_ignores_person_id = True
         host.returns["knowledge.search"] = "提过要考公"
